@@ -1,0 +1,40 @@
+[package]
+name = "millrace-sessions"
+version = "0.1.0"
+description = "Durable local PTY-backed session layer for Millrace daemons and agent processes"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+readme = "../../README.md"
+keywords = ["millrace", "session", "pty", "daemon", "agent"]
+categories = ["command-line-utilities", "development-tools"]
+
+[dependencies]
+clap.workspace = true
+millrace-sessions-core = { path = "../millrace-sessions-core", version = "0.1.0" }
+millrace-sessions-host = { path = "../millrace-sessions-host", version = "0.1.0" }
+millrace-sessions-worker = { path = "../millrace-sessions-worker", version = "0.1.0" }
+nix.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+
+[[bin]]
+name = "millmux"
+path = "src/main.rs"
+
+[[bin]]
+name = "millrace-sessiond"
+path = "src/bin/millrace-sessiond.rs"
+
+[[bin]]
+name = "millrace-session-worker"
+path = "src/bin/millrace-session-worker.rs"
+
+[dev-dependencies]
+assert_cmd.workspace = true
+nix.workspace = true
+serde_json.workspace = true
+tempfile.workspace = true

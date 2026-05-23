@@ -1,0 +1,434 @@
+use std::{
+    fs,
+    os::unix::fs::{FileTypeExt, PermissionsExt},
+    path::{Path, PathBuf},
+};
+
+use millrace_sessions_core::{
+    events::{append_event, SessionEvent, SessionEventKind},
+    paths::StatePaths,
+    protocol::{
+        DoctorIssue, DoctorRepair, DoctorRepairMode, DoctorRepairStatus, DoctorRequest,
+        DoctorResponse, DoctorSeverity, DoctorStatus, M1_PROTOCOL_VERSION,
+    },
+    state::{HostMeta, ProcessState},
+    storage::create_private_dir_all,
+};
+use serde_json::json;
+use thiserror::Error;
+
+use crate::{
+    reconcile::{collect_record_pids, is_active_process_state, pid_status, PidStatus},
+    registry::{HostRegistry, RegistryError, SessionRecord},
+};
+
+#[derive(Debug, Error)]
+pub enum DoctorError {
+    #[error(transparent)]
+    Registry(#[from] RegistryError),
+    #[error(transparent)]
+    Io(#[from] std::io::Error),
+    #[error(transparent)]
+    Core(#[from] millrace_sessions_core::error::MillmuxError),
+}
+
+pub fn run_doctor(
+    paths: &StatePaths,
+    host: Option<&HostMeta>,
+    request: &DoctorRequest,
+) -> Result<DoctorResponse, DoctorError> {
+    let mut issues = Vec::new();
+    check_state_root(paths, &mut issues);
+    check_host_socket(paths, host, &mut issues);
+
+    let registry = HostRegistry::load(paths.clone())?;
+    for load_issue in registry.load_issues() {
+        let code =
+            if load_issue.path.file_name().and_then(|name| name.to_str()) == Some("meta.json") {
+                "corrupted_meta_json"
+            } else {
+                "corrupted_worker_json"
+            };
+        issues.push(issue(
+            code,
+            DoctorSeverity::Critical,
+            format!("could not decode {}", load_issue.path.display()),
+            None,
+            Some(load_issue.path.clone()),
+            false,
+            Some("preserve the file and inspect or repair it manually".to_string()),
+            Some(json!({ "error": load_issue.error })),
+        ));
+    }
+
+    for record in registry.sessions().values() {
+        check_session_record(record, &mut issues);
+    }
+
+    let repairs = match request.repair {
+        Some(DoctorRepairMode::ArchiveStale) => archive_stale(paths, &registry)?,
+        None => Vec::new(),
+    };
+
+    Ok(DoctorResponse {
+        schema_version: M1_PROTOCOL_VERSION,
+        protocol_version: M1_PROTOCOL_VERSION,
+        status: doctor_status(&issues),
+        issues,
+        repairs,
+    })
+}
+
+fn check_state_root(paths: &StatePaths, issues: &mut Vec<DoctorIssue>) {
+    let Ok(metadata) = fs::metadata(&paths.root) else {
+        issues.push(issue(
+            "state_dir_missing",
+            DoctorSeverity::Critical,
+            format!("state directory is missing: {}", paths.root.display()),
+            None,
+            Some(paths.root.clone()),
+            false,
+            Some("create the Millmux state directory with user-private permissions".to_string()),
+            None,
+        ));
+        return;
+    };
+
+    if !metadata.is_dir() {
+        issues.push(issue(
+            "state_dir_not_directory",
+            DoctorSeverity::Critical,
+            format!("state path is not a directory: {}", paths.root.display()),
+            None,
+            Some(paths.root.clone()),
+            false,
+            Some("move the file away and recreate the Millmux state directory".to_string()),
+            None,
+        ));
+        return;
+    }
+
+    let mode = metadata.permissions().mode() & 0o777;
+    if mode & 0o077 != 0 {
+        issues.push(issue(
+            "bad_state_dir_permissions",
+            DoctorSeverity::Critical,
+            format!(
+                "state directory permissions are {:o}; expected no group/other access",
+                mode
+            ),
+            None,
+            Some(paths.root.clone()),
+            false,
+            Some("run an explicit permission repair once one is available".to_string()),
+            Some(json!({ "mode": format!("{mode:o}") })),
+        ));
+    } else {
+        issues.push(issue(
+            "state_dir_permissions_ok",
+            DoctorSeverity::Info,
+            "state directory permissions are user-private".to_string(),
+            None,
+            Some(paths.root.clone()),
+            false,
+            None,
+            Some(json!({ "mode": format!("{mode:o}") })),
+        ));
+    }
+}
+
+fn check_host_socket(paths: &StatePaths, host: Option<&HostMeta>, issues: &mut Vec<DoctorIssue>) {
+    let Ok(metadata) = fs::symlink_metadata(&paths.control_sock) else {
+        return;
+    };
+
+    if !metadata.file_type().is_socket() {
+        issues.push(issue(
+            "host_socket_not_socket",
+            DoctorSeverity::Critical,
+            format!(
+                "host control socket path is not a socket: {}",
+                paths.control_sock.display()
+            ),
+            None,
+            Some(paths.control_sock.clone()),
+            false,
+            Some("move the path aside before starting Millmux".to_string()),
+            None,
+        ));
+        return;
+    }
+
+    let mode = metadata.permissions().mode() & 0o777;
+    if mode != 0o600 {
+        issues.push(issue(
+            "bad_socket_permissions",
+            DoctorSeverity::Critical,
+            format!("host socket permissions are {:o}; expected 600", mode),
+            None,
+            Some(paths.control_sock.clone()),
+            false,
+            Some("run an explicit socket permission repair once one is available".to_string()),
+            Some(json!({ "mode": format!("{mode:o}") })),
+        ));
+    }
+
+    if let Some(host) = host {
+        issues.push(issue(
+            "host_socket_responsive",
+            DoctorSeverity::Info,
+            format!("host socket is responsive for pid {}", host.pid),
+            None,
+            Some(paths.control_sock.clone()),
+            false,
+            None,
+            Some(json!({ "pid": host.pid })),
+        ));
+        return;
+    }
+
+    match std::os::unix::net::UnixStream::connect(&paths.control_sock) {
+        Ok(_) => issues.push(issue(
+            "host_socket_responsive",
+            DoctorSeverity::Info,
+            "host socket accepted a local connection".to_string(),
+            None,
+            Some(paths.control_sock.clone()),
+            false,
+            None,
+            None,
+        )),
+        Err(error) => issues.push(issue(
+            "stale_host_socket",
+            DoctorSeverity::Critical,
+            format!("host socket exists but no responsive host accepted a connection: {error}"),
+            None,
+            Some(paths.control_sock.clone()),
+            true,
+            Some(
+                "restart the host or remove the stale socket after confirming no host is running"
+                    .to_string(),
+            ),
+            Some(json!({ "error": error.to_string() })),
+        )),
+    }
+}
+
+fn check_session_record(record: &SessionRecord, issues: &mut Vec<DoctorIssue>) {
+    if !record.archived && !record.paths.pty_log.exists() {
+        issues.push(issue(
+            "missing_pty_log",
+            DoctorSeverity::Warning,
+            format!("session {} is missing pty.log", record.meta.id),
+            Some(record.meta.id),
+            Some(record.paths.pty_log.clone()),
+            false,
+            Some("preserve the session directory and inspect worker events".to_string()),
+            None,
+        ));
+    }
+
+    if record.archived || !is_active_process_state(&record.meta.process_state) {
+        return;
+    }
+
+    let pids = collect_record_pids(record);
+    if pids.is_empty() {
+        issues.push(issue(
+            "missing_pid",
+            DoctorSeverity::Critical,
+            format!(
+                "running session {} has no recorded worker or child pid",
+                record.meta.id
+            ),
+            Some(record.meta.id),
+            Some(record.paths.meta_json.clone()),
+            false,
+            Some("run startup reconciliation or inspect metadata manually".to_string()),
+            None,
+        ));
+        return;
+    }
+
+    let statuses = pids
+        .iter()
+        .map(|pid| (*pid, pid_status(*pid)))
+        .collect::<Vec<_>>();
+    if statuses
+        .iter()
+        .all(|(_, status)| *status == PidStatus::Dead)
+    {
+        issues.push(issue(
+            "stale_worker_record",
+            DoctorSeverity::Warning,
+            format!(
+                "session {} is active in metadata but all recorded pids are gone",
+                record.meta.id
+            ),
+            Some(record.meta.id),
+            Some(record.paths.meta_json.clone()),
+            true,
+            Some(
+                "run millmux doctor --repair ARCHIVE_STALE if the session is no longer needed"
+                    .to_string(),
+            ),
+            Some(json!({ "pids": pids })),
+        ));
+    }
+}
+
+fn archive_stale(
+    paths: &StatePaths,
+    registry: &HostRegistry,
+) -> Result<Vec<DoctorRepair>, DoctorError> {
+    let mut repairs = Vec::new();
+
+    for record in registry.sessions().values() {
+        if !archive_eligible(record) {
+            continue;
+        }
+
+        let archive_path = paths.archive_dir.join(record.meta.id.to_string());
+        if archive_path.exists() {
+            repairs.push(repair(
+                DoctorRepairMode::ArchiveStale,
+                DoctorRepairStatus::Failed,
+                Some(record.meta.id),
+                Some(record.paths.root.clone()),
+                Some(archive_path),
+                Some("archive target already exists".to_string()),
+                None,
+            ));
+            continue;
+        }
+
+        append_doctor_repair_event(record, &archive_path);
+        create_private_dir_all(&paths.archive_dir)?;
+        fs::rename(&record.paths.root, &archive_path)?;
+        remove_worker_socket(&record.paths.worker_sock)?;
+        repairs.push(repair(
+            DoctorRepairMode::ArchiveStale,
+            DoctorRepairStatus::Applied,
+            Some(record.meta.id),
+            Some(record.paths.root.clone()),
+            Some(archive_path),
+            Some("archived stale or lost session".to_string()),
+            None,
+        ));
+    }
+
+    if repairs.is_empty() {
+        repairs.push(repair(
+            DoctorRepairMode::ArchiveStale,
+            DoctorRepairStatus::Skipped,
+            None,
+            None,
+            None,
+            Some("no stale or lost sessions were eligible for archive".to_string()),
+            None,
+        ));
+    }
+
+    Ok(repairs)
+}
+
+fn archive_eligible(record: &SessionRecord) -> bool {
+    if record.archived {
+        return false;
+    }
+
+    if matches!(
+        record.meta.process_state,
+        ProcessState::Lost | ProcessState::Stale
+    ) {
+        return true;
+    }
+
+    if !is_active_process_state(&record.meta.process_state) {
+        return false;
+    }
+
+    let pids = collect_record_pids(record);
+    !pids.is_empty() && pids.iter().all(|pid| pid_status(*pid) == PidStatus::Dead)
+}
+
+fn append_doctor_repair_event(record: &SessionRecord, archive_path: &Path) {
+    let mut event = SessionEvent::new(record.meta.id, SessionEventKind::DoctorRepair);
+    event.process_state = Some(record.meta.process_state.clone());
+    event.message = Some("doctor archived stale session".to_string());
+    event
+        .fields
+        .insert("mode".to_string(), "ARCHIVE_STALE".to_string());
+    event.fields.insert(
+        "archive_path".to_string(),
+        archive_path.display().to_string(),
+    );
+    let _ = append_event(&record.paths.events_jsonl, &event);
+}
+
+fn remove_worker_socket(path: &Path) -> Result<(), std::io::Error> {
+    match fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn issue(
+    code: impl Into<String>,
+    severity: DoctorSeverity,
+    message: impl Into<String>,
+    session_id: Option<millrace_sessions_core::ids::SessionId>,
+    path: Option<PathBuf>,
+    repairable: bool,
+    suggested_action: Option<String>,
+    details: Option<serde_json::Value>,
+) -> DoctorIssue {
+    DoctorIssue {
+        code: code.into(),
+        severity,
+        message: message.into(),
+        session_id,
+        path,
+        repairable,
+        suggested_action,
+        details,
+    }
+}
+
+fn repair(
+    mode: DoctorRepairMode,
+    status: DoctorRepairStatus,
+    session_id: Option<millrace_sessions_core::ids::SessionId>,
+    source_path: Option<PathBuf>,
+    archive_path: Option<PathBuf>,
+    message: Option<String>,
+    details: Option<serde_json::Value>,
+) -> DoctorRepair {
+    DoctorRepair {
+        mode,
+        status,
+        session_id,
+        source_path,
+        archive_path,
+        message,
+        details,
+    }
+}
+
+fn doctor_status(issues: &[DoctorIssue]) -> DoctorStatus {
+    if issues
+        .iter()
+        .any(|issue| issue.severity == DoctorSeverity::Critical)
+    {
+        DoctorStatus::Critical
+    } else if issues
+        .iter()
+        .any(|issue| issue.severity == DoctorSeverity::Warning)
+    {
+        DoctorStatus::Warning
+    } else {
+        DoctorStatus::Ok
+    }
+}

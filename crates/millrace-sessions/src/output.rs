@@ -1,0 +1,349 @@
+use millrace_sessions_core::{
+    protocol::{
+        DoctorResponse, EventStreamFrame, HostStatusResponse, LogStreamFrame,
+        SessionDeleteResponse, SessionEventsResponse, SessionInspectResponse, SessionKillResponse,
+        SessionListResponse, SessionLogsResponse, SessionResizeResponse, SessionSendResponse,
+        SessionStartResponse, SessionStopResponse, SessionSummary,
+    },
+    state::{AttentionState, ProcessState, SessionRole},
+};
+use serde::Serialize;
+use serde_json::Value;
+use thiserror::Error;
+
+pub fn render_json<T: Serialize>(result: &T) -> Result<String, OutputError> {
+    let mut output = serde_json::to_string(result)?;
+    output.push('\n');
+    Ok(output)
+}
+
+pub fn render_list(result: &SessionListResponse) -> String {
+    if result.sessions.is_empty() {
+        return "no sessions\n".to_string();
+    }
+
+    let mut lines = String::new();
+    for session in &result.sessions {
+        lines.push_str(&format!(
+            "{} {} role={} name={} cwd={}\n",
+            session.session_id,
+            process_state(&session.process_state),
+            role(&session.role),
+            session.name.as_deref().unwrap_or("-"),
+            session.cwd.display()
+        ));
+    }
+    lines
+}
+
+pub fn render_host_status(result: &HostStatusResponse) -> String {
+    match &result.host {
+        Some(host) => format!(
+            "host running pid={} sessions={} socket={}\n",
+            host.pid,
+            result.session_count,
+            host.control_socket.display()
+        ),
+        None => format!("host unavailable sessions={}\n", result.session_count),
+    }
+}
+
+pub fn render_doctor(result: &DoctorResponse) -> String {
+    if result.issues.is_empty() {
+        return format!("doctor status={:?}\n", result.status).to_ascii_lowercase();
+    }
+
+    let mut output = String::new();
+    output.push_str(&format!("doctor status={:?}\n", result.status).to_ascii_lowercase());
+    for issue in &result.issues {
+        output.push_str(&format!(
+            "{} {} {}\n",
+            json_string(&issue.severity),
+            issue.code,
+            issue.message
+        ));
+    }
+    for repair in &result.repairs {
+        output.push_str(&format!(
+            "repair {} {} {}\n",
+            json_string(&repair.mode),
+            json_string(&repair.status),
+            repair.message.as_deref().unwrap_or("")
+        ));
+    }
+    output
+}
+
+pub fn render_start(result: &SessionStartResponse) -> String {
+    let session = &result.session;
+    format!(
+        "session {} {} role={} name={} attached_existing={}\n",
+        session.session_id,
+        process_state(&session.process_state),
+        role(&session.role),
+        session.name.as_deref().unwrap_or("-"),
+        result.attached_existing
+    )
+}
+
+pub fn render_session_status(result: &SessionInspectResponse) -> String {
+    let session = &result.session;
+    format!(
+        "session {} {} role={} name={} clients={}\n",
+        session.session_id,
+        process_state(&session.process_state),
+        role(&session.role),
+        session.name.as_deref().unwrap_or("-"),
+        session.attached_clients
+    )
+}
+
+pub fn render_logs(result: &SessionLogsResponse) -> String {
+    let mut output = String::new();
+    for line in &result.lines {
+        output.push_str(&line.line);
+        output.push('\n');
+    }
+    output
+}
+
+pub fn render_events(result: &SessionEventsResponse) -> String {
+    let mut output = String::new();
+    for event in &result.events {
+        push_event_line(&mut output, event);
+    }
+    output
+}
+
+pub fn render_log_stream_frame(frame: &LogStreamFrame) -> String {
+    match frame {
+        LogStreamFrame::Line { line } => format!("{}\n", line.line),
+        LogStreamFrame::Closed => String::new(),
+    }
+}
+
+pub fn render_event_stream_frame(frame: &EventStreamFrame) -> String {
+    let mut output = String::new();
+    if let EventStreamFrame::Event { event } = frame {
+        push_event_line(&mut output, event);
+    }
+    output
+}
+
+pub fn render_send(result: &SessionSendResponse) -> String {
+    format!(
+        "sent {} bytes to {}\n",
+        result.bytes_sent, result.session_id
+    )
+}
+
+pub fn render_resize(result: &SessionResizeResponse) -> String {
+    format!(
+        "resized {} to {}x{}\n",
+        result.session_id, result.rows, result.cols
+    )
+}
+
+pub fn render_stop(result: &SessionStopResponse) -> String {
+    format!(
+        "stop requested for {} state={}\n",
+        result.session_id,
+        process_state(&result.process_state)
+    )
+}
+
+pub fn render_kill(result: &SessionKillResponse) -> String {
+    format!(
+        "kill requested for {} state={}\n",
+        result.session_id,
+        process_state(&result.process_state)
+    )
+}
+
+pub fn render_delete(result: &SessionDeleteResponse) -> String {
+    format!(
+        "deleted {} archived={} purged={}\n",
+        result.session_id, result.archived, result.purged
+    )
+}
+
+pub fn render_inspect(result: &SessionInspectResponse) -> String {
+    let session = &result.session;
+    let mut lines = String::new();
+    lines.push_str(&format!("session {}\n", session.session_id));
+    push_field(&mut lines, "name", session.name.as_deref().unwrap_or("-"));
+    push_field(&mut lines, "role", &role(&session.role));
+    push_field(
+        &mut lines,
+        "process",
+        &process_state(&session.process_state),
+    );
+    push_field(
+        &mut lines,
+        "attention",
+        &attention_state(&session.attention_state),
+    );
+    push_field(&mut lines, "cwd", &session.cwd.display().to_string());
+    if let Some(workspace) = &session.workspace {
+        push_field(
+            &mut lines,
+            "workspace",
+            &workspace.canonical_path.display().to_string(),
+        );
+    }
+    push_field(&mut lines, "argv", &argv(session));
+    push_field(&mut lines, "root", &result.paths.root.display().to_string());
+    if let Some(worker) = &result.worker {
+        push_field(
+            &mut lines,
+            "worker",
+            &format!(
+                "pid={} state={}",
+                worker.pid,
+                process_state(&worker.process_state)
+            ),
+        );
+    }
+    lines
+}
+
+fn push_field(lines: &mut String, label: &str, value: &str) {
+    lines.push_str(label);
+    lines.push_str(": ");
+    lines.push_str(value);
+    lines.push('\n');
+}
+
+fn push_event_line(output: &mut String, event: &millrace_sessions_core::events::SessionEvent) {
+    output.push_str(&format!(
+        "{} {} {}\n",
+        event.timestamp,
+        json_string(&event.kind),
+        event.message.as_deref().unwrap_or("")
+    ));
+}
+
+fn argv(session: &SessionSummary) -> String {
+    if session.argv.is_empty() {
+        "-".to_string()
+    } else {
+        session.argv.join(" ")
+    }
+}
+
+fn role(value: &SessionRole) -> String {
+    match value {
+        SessionRole::Shell => "shell".to_string(),
+        SessionRole::MillraceDaemon => "millrace_daemon".to_string(),
+        SessionRole::Agent => "agent".to_string(),
+        SessionRole::Generic => "generic".to_string(),
+        SessionRole::Worker => "worker".to_string(),
+        SessionRole::Other(value) => value.clone(),
+    }
+}
+
+fn process_state(value: &ProcessState) -> String {
+    json_string(value)
+}
+
+fn attention_state(value: &AttentionState) -> String {
+    json_string(value)
+}
+
+fn json_string<T: Serialize>(value: &T) -> String {
+    serde_json::to_value(value)
+        .ok()
+        .and_then(|value| match value {
+            Value::String(value) => Some(value),
+            _ => None,
+        })
+        .unwrap_or_else(|| "unknown".to_string())
+}
+
+#[derive(Debug, Error)]
+pub enum OutputError {
+    #[error(transparent)]
+    Json(#[from] serde_json::Error),
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+
+    use millrace_sessions_core::{
+        ids::SessionId,
+        protocol::{SessionInspectResponse, M1_PROTOCOL_VERSION},
+        state::{AttentionState, ProcessState, SessionPaths},
+    };
+    use serde_json::Value;
+
+    use super::*;
+
+    fn summary() -> SessionSummary {
+        SessionSummary {
+            session_id: SessionId::new(),
+            name: Some("shell".to_string()),
+            role: SessionRole::Shell,
+            process_state: ProcessState::Running,
+            attention_state: AttentionState::Active,
+            workspace: None,
+            cwd: PathBuf::from("/tmp"),
+            argv: vec!["sh".to_string()],
+            created_at: "2026-05-20T18:00:00Z".to_string(),
+            updated_at: "2026-05-20T18:01:00Z".to_string(),
+            attached_clients: 0,
+        }
+    }
+
+    #[test]
+    fn output_renders_raw_json_without_protocol_envelope() {
+        let result = SessionListResponse {
+            schema_version: M1_PROTOCOL_VERSION,
+            protocol_version: M1_PROTOCOL_VERSION,
+            sessions: Vec::new(),
+        };
+
+        let output = render_json(&result).unwrap();
+        let value: Value = serde_json::from_str(&output).unwrap();
+
+        assert!(value.get("sessions").is_some());
+        assert!(value.get("id").is_none());
+        assert!(value.get("ok").is_none());
+    }
+
+    #[test]
+    fn output_renders_empty_list_compactly() {
+        let result = SessionListResponse {
+            schema_version: M1_PROTOCOL_VERSION,
+            protocol_version: M1_PROTOCOL_VERSION,
+            sessions: Vec::new(),
+        };
+
+        assert_eq!(render_list(&result), "no sessions\n");
+    }
+
+    #[test]
+    fn output_renders_inspect_without_optional_worker() {
+        let session = summary();
+        let result = SessionInspectResponse {
+            schema_version: M1_PROTOCOL_VERSION,
+            protocol_version: M1_PROTOCOL_VERSION,
+            paths: SessionPaths {
+                root: PathBuf::from("/state/sessions/id"),
+                meta_json: PathBuf::from("/state/sessions/id/meta.json"),
+                worker_json: PathBuf::from("/state/sessions/id/worker.json"),
+                pty_log: PathBuf::from("/state/sessions/id/pty.log"),
+                events_jsonl: PathBuf::from("/state/sessions/id/events.jsonl"),
+                scrollback_snapshot: PathBuf::from("/state/sessions/id/scrollback.snapshot"),
+                worker_sock: PathBuf::from("/state/sessions/id/worker.sock"),
+            },
+            session,
+            worker: None,
+        };
+
+        let output = render_inspect(&result);
+
+        assert!(output.contains("role: shell\n"));
+        assert!(output.contains("process: running\n"));
+    }
+}
