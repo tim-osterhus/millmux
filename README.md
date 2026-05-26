@@ -92,17 +92,24 @@ millmux cockpit \
 Closing a Millmux client detaches from the session. It does not stop the hosted
 process.
 
+For active sessions, `millmux list --json`, `millmux status --json`, and
+`millmux inspect --json` expose `attached_clients` and `input_owner` from the
+worker so operators can tell whether a session is only being observed or has an
+active PTY input owner.
+
 ## What Millmux Owns
 
 Millmux owns session and terminal truth:
 
 - session id, name, role, cwd, argv, and optional workspace binding;
 - per-session worker process and child process lifecycle;
-- PTY input ownership, attach streams, resize, raw output, and bounded
-  scrollback;
+- PTY input ownership, attach streams, resize, raw output, bounded scrollback,
+  terminal snapshots, and bounded raw replay;
 - local session artifacts: `meta.json`, `worker.json`, `pty.log`,
-  `events.jsonl`, and `scrollback.snapshot`;
-- UI context records for console and cockpit clients.
+  `events.jsonl`, `scrollback.snapshot`, `terminal.snapshot.json`, and
+  `pty.replay`;
+- UI context records for console and cockpit clients, including daemon health
+  for visible and managed daemons.
 
 Millmux does not own the application-level truth of the process it hosts. For
 example, when the hosted process is a Millrace daemon, Millrace remains the
@@ -126,6 +133,9 @@ to the user account; Millmux does not expose a network API.
 ## Core Commands
 
 Most inspection and lifecycle commands support `--json` for agents and scripts.
+Session list, status, and inspect output includes the active attach client
+count and input-owner stream id when the worker reports one; terminal records
+do not keep stale owner values.
 
 | Command | Purpose |
 | --- | --- |
@@ -141,6 +151,11 @@ Most inspection and lifecycle commands support `--json` for agents and scripts.
 | `millmux delete <session>` | Archive or purge stopped session artifacts. |
 | `millmux context --json` | Read the current UI context. |
 | `millmux doctor --json` | Diagnose state, socket, session, worker, and UI context health. |
+
+Commands that write session lists, status, inspect data, logs, events, or
+doctor output treat a closed stdout reader as normal CLI termination. Short
+reader pipelines such as `millmux events <session> --json | head -c 20000`
+exit without a Rust panic while still surfacing non-pipe command failures.
 
 Selectors can be a session id/name:
 
@@ -188,7 +203,22 @@ millmux cockpit --workspace "$WORKSPACE" --layout wide --agent-argv -- codex exe
 
 The agent pane is a real terminal. Normal input goes to the focused agent pane
 when Millmux owns PTY input. If another client owns input, cockpit attaches
-read-only and marks the agent pane accordingly.
+read-only and marks the agent pane accordingly. When the owning attach closes
+or detaches, cockpit can reopen a writable attach and clear the read-only pane
+state without stopping the hosted agent or daemon session.
+
+Cockpit avoids legacy line scrollback when rendering agent panes. Reattach and
+one-shot snapshots use TUI-safe terminal snapshot/raw replay seed paths, show an
+explicit initializing state when no safe frame is available, and keep
+agent-pane scroll/page/jump controls inside Millmux state so scroll keys are
+not sent to the agent process. The cockpit prefix is `Ctrl-]`; `Ctrl-] [`
+enters scroll mode, `G` jumps back to the live bottom, and `Ctrl-] d` detaches.
+Jump-to-bottom resumes live follow.
+
+Cockpit daemon panes distinguish degraded daemon states such as `failed_start`,
+exited, killed, and stale. Failed or exited daemon auto-starts show failure
+detail and recovery choices, and the global status does not render `ready` for a
+degraded selected daemon.
 
 When Millmux launches the agent, it sets:
 
@@ -216,6 +246,11 @@ after the agent starts.
 
 Millmux has first-class behavior for Millrace daemon sessions because that is
 the main production use case.
+
+When console or cockpit auto-starts a Millrace daemon, it resolves `millrace`
+from the invoking client's current `PATH` and forwards only that allowlisted
+`PATH` by default. Failed starts remain inspectable as session records with
+failure detail.
 
 Start a Millrace daemon explicitly:
 
@@ -278,15 +313,20 @@ sessions/<session-id>/worker.json
 sessions/<session-id>/pty.log
 sessions/<session-id>/events.jsonl
 sessions/<session-id>/scrollback.snapshot
+sessions/<session-id>/terminal.snapshot.json
+sessions/<session-id>/pty.replay
 views/<ui-id>/context.json
 views/<ui-id>/events.jsonl
 archive/<session-id>/...
 ```
 
-Raw PTY logs and UI context files are local-sensitive diagnostics. They can
-contain prompts, command output, paths, tokens printed by child processes, and
-workspace details. Millmux uses private Unix permissions for state artifacts,
-but it does not sanitize PTY output.
+Raw PTY logs, terminal snapshots, replay rings, and UI context files are
+local-sensitive diagnostics. They can contain prompts, command output, paths,
+tokens printed by child processes, and workspace details. Millmux uses private
+Unix permissions for state artifacts, but it does not sanitize PTY output.
+Active `worker.json` records may also include attach client counts and the
+current input-owner stream id; lifecycle paths clear those fields for terminal
+records.
 
 ## Lifecycle Safety
 
@@ -322,6 +362,12 @@ metadata and local process checks. `CLOSE_STALE_UI_CONTEXTS` closes stale UI
 context records that reference no live sessions. Neither repair silently purges
 session logs.
 
+Doctor also reports `unsafe_legacy_line_scrollback` when agent-like sessions
+still have legacy `scrollback.snapshot` lines containing likely full-screen TUI
+control sequences. The guidance is to ignore that line scrollback for agent TUI
+replay, or archive the session only when it is stale or no longer needed, while
+preserving `pty.log`, `events.jsonl`, and other raw evidence.
+
 ## What Millmux Is Not
 
 Millmux is not a tmux clone, remote terminal server, web dashboard, restart
@@ -337,7 +383,12 @@ The repository includes dogfood notes for the core release path:
   duplicate handling, input send, graceful stop, preserved records, and doctor.
 - `docs/m2c-agent-cockpit.md`: Agent Cockpit behavior and context contract.
 - `docs/m2e-hardening-release-dogfood.md`: console/cockpit dogfood, daemon
-  switching, detach/crash/reattach, host restart, and cleanup.
+  switching, detach/crash/reattach, host restart, cleanup, and cockpit QA
+  addenda for terminal replay plus attach ownership.
+- `docs/r7-cockpit-release-qa.md`: final cockpit terminal remediation release
+  gate with deterministic fixtures, live PTY dogfood, degraded daemon/PATH
+  recovery, doctor output, broken-pipe checks, and cross-terminal evidence
+  limits.
 
 The main verification baseline is:
 
@@ -350,7 +401,11 @@ cargo install --path crates/millrace-sessions --locked --root <tmp-root>
 ```
 
 Before publishing a TUI-capable release, capture fresh dogfood evidence for
-`millmux console` and `millmux cockpit` against disposable workspaces.
+`millmux console` and `millmux cockpit` against disposable workspaces. For the
+cockpit gate, record criterion-by-criterion evidence for repeated full-screen
+agent questions, resize, internal scroll/jump-to-bottom, detach, reattach,
+degraded daemon recovery, attach ownership, broken-pipe CLI behavior, doctor
+output, and any unavailable cross-terminal checks.
 
 ## License
 

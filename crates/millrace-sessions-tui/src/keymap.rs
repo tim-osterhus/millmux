@@ -88,7 +88,7 @@ impl PrefixKeymap {
     }
 
     pub fn is_prefix(&self, event: KeyEvent) -> bool {
-        KeyChord::from(event) == self.prefix
+        KeyChord::from(event) == self.prefix || self.is_raw_control_prefix(event)
     }
 
     pub fn prefix_action(&self, event: KeyEvent) -> Option<KeyAction> {
@@ -107,6 +107,15 @@ impl PrefixKeymap {
 
     pub fn prefix_event(&self) -> KeyEvent {
         KeyEvent::new(self.prefix.code, self.prefix.modifiers)
+    }
+
+    fn is_raw_control_prefix(&self, event: KeyEvent) -> bool {
+        matches!(self.prefix.code, KeyCode::Char(']'))
+            && self.prefix.modifiers.contains(KeyModifiers::CONTROL)
+            && ((matches!(event.code, KeyCode::Char('\u{1d}'))
+                && (event.modifiers.is_empty() || event.modifiers == KeyModifiers::CONTROL))
+                || (matches!(event.code, KeyCode::Char('5'))
+                    && event.modifiers == KeyModifiers::CONTROL))
     }
 }
 
@@ -134,9 +143,13 @@ impl KeyChord {
 
 impl From<KeyEvent> for KeyChord {
     fn from(event: KeyEvent) -> Self {
+        let mut modifiers = event.modifiers;
+        if matches!(event.code, KeyCode::Char(_)) {
+            modifiers.remove(KeyModifiers::SHIFT);
+        }
         Self {
             code: event.code,
-            modifiers: event.modifiers,
+            modifiers,
         }
     }
 }
@@ -149,6 +162,8 @@ mod tests {
     fn default_prefix_is_ctrl_right_bracket() {
         let keymap = PrefixKeymap::default();
         assert!(keymap.is_prefix(KeyEvent::new(KeyCode::Char(']'), KeyModifiers::CONTROL)));
+        assert!(keymap.is_prefix(KeyEvent::new(KeyCode::Char('\u{1d}'), KeyModifiers::NONE)));
+        assert!(keymap.is_prefix(KeyEvent::new(KeyCode::Char('5'), KeyModifiers::CONTROL)));
         assert!(!keymap.is_prefix(KeyEvent::new(KeyCode::Char(']'), KeyModifiers::NONE)));
     }
 
@@ -167,6 +182,24 @@ mod tests {
         assert_eq!(
             keymap.prefix_action(KeyEvent::new(KeyCode::Char('?'), KeyModifiers::NONE)),
             Some(KeyAction::ToggleHelp)
+        );
+        assert_eq!(
+            keymap.prefix_action(KeyEvent::new(KeyCode::Char('?'), KeyModifiers::SHIFT)),
+            Some(KeyAction::ToggleHelp)
+        );
+    }
+
+    #[test]
+    fn keymap_decodes_shifted_scroll_bindings_from_real_terminals() {
+        let keymap = PrefixKeymap::default();
+
+        assert_eq!(
+            keymap.scroll_action(KeyEvent::new(KeyCode::Char('G'), KeyModifiers::SHIFT)),
+            Some(KeyAction::JumpBottom)
+        );
+        assert_eq!(
+            keymap.scroll_action(KeyEvent::new(KeyCode::Char('N'), KeyModifiers::SHIFT)),
+            Some(KeyAction::PreviousSearch)
         );
     }
 }

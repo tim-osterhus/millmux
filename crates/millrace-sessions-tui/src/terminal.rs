@@ -23,6 +23,40 @@ impl TerminalEmulator {
         self.parser.screen_mut().set_size(rows.max(1), cols.max(1));
     }
 
+    pub fn scroll_up(&mut self, rows: usize) {
+        let offset = self.parser.screen().scrollback().saturating_add(rows);
+        self.parser.screen_mut().set_scrollback(offset);
+    }
+
+    pub fn scroll_down(&mut self, rows: usize) {
+        let offset = self.parser.screen().scrollback().saturating_sub(rows);
+        self.parser.screen_mut().set_scrollback(offset);
+    }
+
+    pub fn page_up(&mut self, rows: u16) {
+        self.scroll_up(usize::from(rows).max(1));
+    }
+
+    pub fn page_down(&mut self, rows: u16) {
+        self.scroll_down(usize::from(rows).max(1));
+    }
+
+    pub fn jump_top(&mut self) {
+        self.parser.screen_mut().set_scrollback(usize::MAX);
+    }
+
+    pub fn jump_bottom(&mut self) {
+        self.parser.screen_mut().set_scrollback(0);
+    }
+
+    pub fn is_scrolled(&self) -> bool {
+        self.parser.screen().scrollback() > 0
+    }
+
+    pub fn is_following(&self) -> bool {
+        !self.is_scrolled()
+    }
+
     pub fn snapshot(&self) -> TerminalSnapshot {
         let screen = self.parser.screen();
         let (rows, cols) = screen.size();
@@ -164,5 +198,82 @@ impl TerminalColor {
             vt100::Color::Idx(index) => Self::Indexed(index),
             vt100::Color::Rgb(red, green, blue) => Self::Rgb(red, green, blue),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn terminal_fixture_handles_full_screen_agent_protocol_and_resize() {
+        let mut terminal = TerminalEmulator::new(8, 48, 200);
+
+        terminal.process(
+            concat!(
+                "fixture-agent ready\r\n",
+                "\x1b[?1049h",
+                "\x1b[?2026h",
+                "\x1b[2J",
+                "\x1b[3J",
+                "\x1b[H",
+                "question one\r\n",
+                "\x1b[4;9Hanswer one complete\r\n",
+                "\x1b[2Kanswer two chunk 1",
+                "\ranswer two chunk 2",
+                "\ranswer two chunk 3\r\n",
+                "\x1b[?2026l",
+            )
+            .as_bytes(),
+        );
+        let alternate = terminal.snapshot();
+
+        assert!(alternate.alternate_screen);
+        assert!(alternate.contains_text("question one"));
+        assert!(alternate.contains_text("answer one complete"));
+        assert!(alternate.contains_text("answer two chunk 3"));
+        assert!(!alternate.contains_text("fixture-agent ready"));
+
+        terminal.resize(12, 64);
+        terminal.process(b"resize rows=12 cols=64\r\n\x1b[?1049lanswer two complete\r\n");
+        let main = terminal.snapshot();
+
+        assert_eq!((main.rows, main.cols), (12, 64));
+        assert!(!main.alternate_screen);
+        assert!(main.contains_text("fixture-agent ready"));
+        assert!(main.contains_text("answer two complete"));
+        assert!(!main.contains_text("answer two chunk 1"));
+    }
+
+    #[test]
+    fn terminal_internal_scrollback_exposes_prior_visible_rows() {
+        let mut terminal = TerminalEmulator::new(4, 24, 20);
+        for index in 0..8 {
+            terminal.process_text(&format!("line-{index}\r\n"));
+        }
+
+        assert!(terminal.snapshot().contains_text("line-7"));
+        assert!(!terminal.snapshot().contains_text("line-1"));
+        assert!(terminal.is_following());
+
+        terminal.scroll_up(4);
+        let scrolled = terminal.snapshot();
+
+        assert!(terminal.is_scrolled());
+        assert!(
+            scrolled.contains_text("line-1"),
+            "{:?}",
+            scrolled.plain_lines()
+        );
+        assert!(
+            scrolled.contains_text("line-4"),
+            "{:?}",
+            scrolled.plain_lines()
+        );
+
+        terminal.jump_bottom();
+
+        assert!(terminal.is_following());
+        assert!(terminal.snapshot().contains_text("line-7"));
     }
 }

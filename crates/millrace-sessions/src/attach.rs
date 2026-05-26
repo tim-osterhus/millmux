@@ -34,6 +34,7 @@ pub async fn run_attach(
                 match frame? {
                     Some(AttachStreamFrame::Scrollback { lines }) => write_scrollback(&lines)?,
                     Some(AttachStreamFrame::Output { text }) => write_stdout(text.as_bytes())?,
+                    Some(AttachStreamFrame::RawOutput { data }) => write_stdout(data.as_slice())?,
                     Some(AttachStreamFrame::Error { error }) => return Err(AttachError::Stream(error.message)),
                     Some(AttachStreamFrame::Closed) | None => break,
                     Some(_) => {}

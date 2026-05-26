@@ -13,7 +13,8 @@ use millrace_sessions_core::{
         DoctorIssue, DoctorRepair, DoctorRepairMode, DoctorRepairStatus, DoctorRequest,
         DoctorResponse, DoctorSeverity, DoctorStatus, M1_PROTOCOL_VERSION,
     },
-    state::{HostMeta, ProcessState, UiContext, UiContextPaths, UiEvent, UiEventKind},
+    scrollback::{legacy_line_scrollback_tui_sequence_name, ScrollbackBuffer},
+    state::{HostMeta, ProcessState, SessionRole, UiContext, UiContextPaths, UiEvent, UiEventKind},
     storage::{append_json_line, create_private_dir_all, read_json},
 };
 use serde_json::json;
@@ -234,6 +235,7 @@ fn check_session_record(record: &SessionRecord, issues: &mut Vec<DoctorIssue>) {
             None,
         ));
     }
+    check_legacy_line_scrollback(record, issues);
 
     if record.archived || !is_active_process_state(&record.meta.process_state) {
         return;
@@ -282,6 +284,69 @@ fn check_session_record(record: &SessionRecord, issues: &mut Vec<DoctorIssue>) {
             Some(json!({ "pids": pids })),
         ));
     }
+}
+
+fn check_legacy_line_scrollback(record: &SessionRecord, issues: &mut Vec<DoctorIssue>) {
+    if record.archived || !agent_like_session(record) || !record.paths.scrollback_snapshot.exists()
+    {
+        return;
+    }
+
+    let Ok(scrollback) = ScrollbackBuffer::restore_snapshot(&record.paths.scrollback_snapshot)
+    else {
+        return;
+    };
+    let lines = scrollback.lines();
+    let Some(sequence_name) = legacy_line_scrollback_tui_sequence_name(&lines) else {
+        return;
+    };
+
+    let repairable = archive_eligible(record);
+    issues.push(issue(
+        "unsafe_legacy_line_scrollback",
+        DoctorSeverity::Warning,
+        format!(
+            "session {} has legacy line scrollback with likely TUI control sequences",
+            record.meta.id
+        ),
+        Some(record.meta.id),
+        Some(record.paths.scrollback_snapshot.clone()),
+        repairable,
+        Some(
+            "ignore legacy line scrollback for agent TUI replay; archive with ARCHIVE_STALE only when the session is stale or no longer needed; preserve pty.log and events.jsonl as raw evidence"
+                .to_string(),
+        ),
+        Some(json!({
+            "detected_sequence": sequence_name,
+            "line_count": lines.len(),
+            "pty_log": record.paths.pty_log.display().to_string(),
+            "events_jsonl": record.paths.events_jsonl.display().to_string(),
+            "scrollback_snapshot": record.paths.scrollback_snapshot.display().to_string(),
+        })),
+    ));
+}
+
+fn agent_like_session(record: &SessionRecord) -> bool {
+    match &record.meta.role {
+        SessionRole::Agent => return true,
+        SessionRole::Other(value) if value.to_ascii_lowercase().contains("agent") => return true,
+        _ => {}
+    }
+
+    record
+        .meta
+        .name
+        .as_ref()
+        .is_some_and(|name| has_agent_hint(name))
+        || record.meta.argv.iter().any(|arg| has_agent_hint(arg))
+}
+
+fn has_agent_hint(value: &str) -> bool {
+    let normalized = value.to_ascii_lowercase();
+    normalized.contains("agent")
+        || normalized.contains("codex")
+        || normalized.contains("claude")
+        || normalized.contains("millracer")
 }
 
 fn check_ui_contexts(

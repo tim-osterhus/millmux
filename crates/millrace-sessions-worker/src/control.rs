@@ -1,4 +1,5 @@
 use std::{
+    collections::BTreeSet,
     fs,
     io::{BufRead, BufReader, Write},
     os::unix::net::{UnixListener, UnixStream},
@@ -9,14 +10,17 @@ use std::{
 
 use millrace_sessions_core::{
     error::{MillmuxError, MillmuxResult},
+    events::current_timestamp,
     protocol::{
-        AttachStreamFrame, ControlErrorBody, ControlErrorCode, WorkerAckResponse,
-        WorkerAttachRequest, WorkerAttachResponse, WorkerControlMethod, WorkerControlRequest,
+        AttachReplayMode, AttachStreamFrame, ControlErrorBody, ControlErrorCode,
+        TerminalDimensions, WorkerAckResponse, WorkerAttachRequest, WorkerAttachResponse,
+        WorkerAttachStateResponse, WorkerControlMethod, WorkerControlRequest,
         WorkerControlResponse, WorkerReleaseAttachRequest, WorkerResizeRequest,
         WorkerResizeResponse, WorkerSendRequest, WorkerSendResponse,
     },
-    scrollback::ScrollbackBuffer,
-    state::SessionPaths,
+    scrollback::{restore_terminal_replay, ScrollbackBuffer, TerminalStateBuffer},
+    state::{SessionPaths, WorkerMeta},
+    storage::{read_json, write_json_atomic},
 };
 use nix::{
     errno::Errno,
@@ -35,11 +39,11 @@ impl WorkerControlHandle {
         if bytes.is_empty() {
             return;
         }
-        let text = String::from_utf8_lossy(bytes).to_string();
+        let bytes = bytes.to_vec();
         let mut state = self.state.lock().expect("control state poisoned");
         state
             .observers
-            .retain(|observer| observer.send(text.clone()).is_ok());
+            .retain(|observer| observer.send(bytes.clone()).is_ok());
     }
 }
 
@@ -48,6 +52,7 @@ pub struct WorkerControlConfig {
     pub paths: SessionPaths,
     pub writer: Arc<Mutex<Box<dyn Write + Send>>>,
     pub master: Arc<Mutex<Box<dyn MasterPty + Send>>>,
+    pub terminal_state: Arc<Mutex<TerminalStateBuffer>>,
     pub child_pid: Option<u32>,
     pub child_pgid: Option<u32>,
 }
@@ -70,6 +75,7 @@ pub fn start_control_server(config: WorkerControlConfig) -> MillmuxResult<Worker
         paths: config.paths,
         writer: config.writer,
         master: config.master,
+        terminal_state: config.terminal_state,
         child_pid: config.child_pid,
         child_pgid: config.child_pgid,
         state,
@@ -106,6 +112,7 @@ struct ControlRuntime {
     paths: SessionPaths,
     writer: Arc<Mutex<Box<dyn Write + Send>>>,
     master: Arc<Mutex<Box<dyn MasterPty + Send>>>,
+    terminal_state: Arc<Mutex<TerminalStateBuffer>>,
     child_pid: Option<u32>,
     child_pgid: Option<u32>,
     state: Arc<Mutex<ControlState>>,
@@ -114,10 +121,32 @@ struct ControlRuntime {
 #[derive(Default)]
 struct ControlState {
     input_owner: Option<String>,
-    observers: Vec<mpsc::Sender<String>>,
+    attaches: BTreeSet<String>,
+    observers: Vec<mpsc::Sender<Vec<u8>>>,
 }
 
 impl ControlState {
+    fn acquire_attach(
+        &mut self,
+        stream_id: &str,
+        read_only: bool,
+    ) -> Result<WorkerAttachResponse, ControlErrorBody> {
+        let input_owner = self.acquire_input(stream_id, read_only)?;
+        self.attaches.insert(stream_id.to_string());
+        Ok(WorkerAttachResponse {
+            stream_id: stream_id.to_string(),
+            read_only,
+            input_owner,
+        })
+    }
+
+    fn release_attach(&mut self, stream_id: &str) {
+        if self.input_owner.as_deref() == Some(stream_id) {
+            self.input_owner = None;
+        }
+        self.attaches.remove(stream_id);
+    }
+
     fn acquire_input(
         &mut self,
         stream_id: &str,
@@ -140,9 +169,10 @@ impl ControlState {
         Ok(true)
     }
 
-    fn release_input(&mut self, stream_id: &str) {
-        if self.input_owner.as_deref() == Some(stream_id) {
-            self.input_owner = None;
+    fn attach_state(&self) -> WorkerAttachStateResponse {
+        WorkerAttachStateResponse {
+            attached_clients: self.attaches.len().try_into().unwrap_or(u32::MAX),
+            input_owner: self.input_owner.clone(),
         }
     }
 
@@ -215,29 +245,24 @@ fn dispatch_request(
             let params = request
                 .params_as::<WorkerAttachRequest>()
                 .map_err(invalid_params)?;
-            let input_owner = runtime
-                .state
-                .lock()
-                .expect("control state poisoned")
-                .acquire_input(&params.stream_id, params.read_only)?;
-            let result = WorkerAttachResponse {
-                stream_id: params.stream_id,
-                read_only: params.read_only,
-                input_owner,
-            };
+            let result = acquire_attach(runtime, &params)?;
             WorkerControlResponse::success(request.id, &result).map_err(internal_error)
         }
         WorkerControlMethod::ReleaseAttach => {
             let params = request
                 .params_as::<WorkerReleaseAttachRequest>()
                 .map_err(invalid_params)?;
-            runtime
+            release_attach(runtime, &params.stream_id)?;
+            WorkerControlResponse::success(request.id, &WorkerAckResponse { accepted: true })
+                .map_err(internal_error)
+        }
+        WorkerControlMethod::AttachState => {
+            let result = runtime
                 .state
                 .lock()
                 .expect("control state poisoned")
-                .release_input(&params.stream_id);
-            WorkerControlResponse::success(request.id, &WorkerAckResponse { accepted: true })
-                .map_err(internal_error)
+                .attach_state();
+            WorkerControlResponse::success(request.id, &result).map_err(internal_error)
         }
         WorkerControlMethod::PrepareStopInterrupt => {
             let result = prepare_stop_interrupt(runtime)?;
@@ -249,6 +274,52 @@ fn dispatch_request(
         }
         WorkerControlMethod::ObserveAttach => unreachable!("handled before one-shot dispatch"),
     }
+}
+
+fn acquire_attach(
+    runtime: &ControlRuntime,
+    params: &WorkerAttachRequest,
+) -> Result<WorkerAttachResponse, ControlErrorBody> {
+    let (result, state) = {
+        let mut state = runtime.state.lock().expect("control state poisoned");
+        let result = state.acquire_attach(&params.stream_id, params.read_only)?;
+        let attach_state = state.attach_state();
+        (result, attach_state)
+    };
+    if let Err(error) = persist_attach_state(runtime, &state) {
+        let rolled_back = {
+            let mut state = runtime.state.lock().expect("control state poisoned");
+            state.release_attach(&params.stream_id);
+            state.attach_state()
+        };
+        let _ = persist_attach_state(runtime, &rolled_back);
+        return Err(error);
+    }
+    Ok(result)
+}
+
+fn release_attach(
+    runtime: &ControlRuntime,
+    stream_id: &str,
+) -> Result<WorkerAttachStateResponse, ControlErrorBody> {
+    let state = {
+        let mut state = runtime.state.lock().expect("control state poisoned");
+        state.release_attach(stream_id);
+        state.attach_state()
+    };
+    persist_attach_state(runtime, &state)?;
+    Ok(state)
+}
+
+fn persist_attach_state(
+    runtime: &ControlRuntime,
+    state: &WorkerAttachStateResponse,
+) -> Result<(), ControlErrorBody> {
+    let mut worker: WorkerMeta = read_json(&runtime.paths.worker_json).map_err(core_error)?;
+    worker.attached_clients = state.attached_clients;
+    worker.input_owner = state.input_owner.clone();
+    worker.updated_at = current_timestamp();
+    write_json_atomic(&runtime.paths.worker_json, &worker).map_err(core_error)
 }
 
 fn send_text(
@@ -293,6 +364,20 @@ fn resize_pty(
                 format!("failed to resize pty: {error}"),
             )
         })?;
+
+    let mut terminal_state = runtime.terminal_state.lock().map_err(|_| {
+        ControlErrorBody::new(
+            ControlErrorCode::InternalError,
+            "terminal state lock poisoned",
+        )
+    })?;
+    terminal_state.resize(params.rows, params.cols);
+    terminal_state
+        .persist(
+            &runtime.paths.terminal_snapshot,
+            &runtime.paths.raw_replay_ring,
+        )
+        .map_err(core_error)?;
 
     Ok(WorkerResizeResponse {
         rows: params.rows,
@@ -366,13 +451,8 @@ fn handle_observe_attach(
         }
     };
 
-    let input_owner = match runtime
-        .state
-        .lock()
-        .expect("control state poisoned")
-        .acquire_input(&params.stream_id, params.read_only)
-    {
-        Ok(input_owner) => input_owner,
+    let attach = match acquire_attach(&runtime, &params) {
+        Ok(attach) => attach,
         Err(error) => {
             return write_worker_response(stream, WorkerControlResponse::failure(request.id, error))
         }
@@ -389,26 +469,18 @@ fn handle_observe_attach(
 
     write_worker_response(
         stream.try_clone()?,
-        WorkerControlResponse::success(
-            request.id,
-            &WorkerAttachResponse {
-                stream_id: params.stream_id.clone(),
-                read_only: params.read_only,
-                input_owner,
-            },
-        )
-        .map_err(MillmuxError::Json)?,
+        WorkerControlResponse::success(request.id, &attach).map_err(MillmuxError::Json)?,
     )?;
 
-    if params.include_scrollback {
-        for frame in scrollback_frames(&runtime.paths) {
-            stream.write_all(frame.to_json_line()?.as_bytes())?;
-            stream.flush()?;
-        }
-    }
+    write_initial_replay(
+        &mut stream,
+        &runtime.paths,
+        params.replay,
+        params.requested_terminal_size,
+    )?;
 
-    for text in receiver {
-        let frame = AttachStreamFrame::Output { text };
+    for bytes in receiver {
+        let frame = attach_output_frame(params.replay, bytes);
         if stream.write_all(frame.to_json_line()?.as_bytes()).is_err() {
             break;
         }
@@ -436,11 +508,7 @@ impl InputReleaseGuard {
 
     fn release(mut self) {
         if let Some(stream_id) = self.stream_id.take() {
-            self.runtime
-                .state
-                .lock()
-                .expect("control state poisoned")
-                .release_input(&stream_id);
+            let _ = release_attach(&self.runtime, &stream_id);
         }
     }
 }
@@ -448,11 +516,7 @@ impl InputReleaseGuard {
 impl Drop for InputReleaseGuard {
     fn drop(&mut self) {
         if let Some(stream_id) = self.stream_id.take() {
-            self.runtime
-                .state
-                .lock()
-                .expect("control state poisoned")
-                .release_input(&stream_id);
+            let _ = release_attach(&self.runtime, &stream_id);
         }
     }
 }
@@ -465,6 +529,77 @@ fn scrollback_frames(paths: &SessionPaths) -> Vec<AttachStreamFrame> {
             }]
         }
         _ => Vec::new(),
+    }
+}
+
+fn write_initial_replay(
+    stream: &mut UnixStream,
+    paths: &SessionPaths,
+    replay: AttachReplayMode,
+    requested_terminal_size: Option<TerminalDimensions>,
+) -> MillmuxResult<()> {
+    match replay {
+        AttachReplayMode::LineScrollback => {
+            for frame in scrollback_frames(paths) {
+                stream.write_all(frame.to_json_line()?.as_bytes())?;
+                stream.flush()?;
+            }
+        }
+        AttachReplayMode::RawReplay | AttachReplayMode::TerminalSnapshot => {
+            let current_offset = file_len(&paths.pty_log);
+            if let Some(restored) = restore_terminal_replay(
+                &paths.terminal_snapshot,
+                &paths.raw_replay_ring,
+                current_offset,
+            )
+            .unwrap_or(None)
+            {
+                if !replay_matches_requested_size(
+                    replay,
+                    requested_terminal_size,
+                    &restored.snapshot,
+                ) || restored.bytes.is_empty()
+                {
+                    return Ok(());
+                }
+                let frame = AttachStreamFrame::raw_output(restored.bytes);
+                stream.write_all(frame.to_json_line()?.as_bytes())?;
+                stream.flush()?;
+            }
+        }
+        AttachReplayMode::None => {}
+    }
+    Ok(())
+}
+
+fn replay_matches_requested_size(
+    replay: AttachReplayMode,
+    requested_terminal_size: Option<TerminalDimensions>,
+    snapshot: &millrace_sessions_core::scrollback::TerminalSnapshot,
+) -> bool {
+    match (replay, requested_terminal_size) {
+        (AttachReplayMode::RawReplay, None) => true,
+        (AttachReplayMode::RawReplay | AttachReplayMode::TerminalSnapshot, Some(size)) => {
+            snapshot.same_size(size.rows, size.cols)
+        }
+        (AttachReplayMode::TerminalSnapshot, None) => false,
+        _ => true,
+    }
+}
+
+fn file_len(path: &Path) -> u64 {
+    fs::metadata(path)
+        .map(|metadata| metadata.len())
+        .unwrap_or(0)
+}
+
+fn attach_output_frame(replay: AttachReplayMode, bytes: Vec<u8>) -> AttachStreamFrame {
+    if replay.uses_raw_payloads() {
+        AttachStreamFrame::raw_output(bytes)
+    } else {
+        AttachStreamFrame::Output {
+            text: String::from_utf8_lossy(&bytes).to_string(),
+        }
     }
 }
 
@@ -495,27 +630,38 @@ fn io_error(error: std::io::Error) -> ControlErrorBody {
     ControlErrorBody::new(ControlErrorCode::IoError, error.to_string())
 }
 
+fn core_error(error: MillmuxError) -> ControlErrorBody {
+    let code = match error {
+        MillmuxError::Io(_) => ControlErrorCode::IoError,
+        MillmuxError::Permission(_) => ControlErrorCode::PermissionError,
+        _ => ControlErrorCode::InternalError,
+    };
+    ControlErrorBody::new(code, error.to_string())
+}
+
 #[cfg(test)]
 mod tests {
+    use millrace_sessions_core::scrollback::TerminalSnapshot;
+
     use super::*;
 
     #[test]
     fn control_state_allows_one_read_write_owner() {
         let mut state = ControlState::default();
 
-        assert!(state.acquire_input("a", false).unwrap());
-        let error = state.acquire_input("b", false).unwrap_err();
+        assert!(state.acquire_attach("a", false).unwrap().input_owner);
+        let error = state.acquire_attach("b", false).unwrap_err();
 
         assert_eq!(error.code, ControlErrorCode::InputOwnerConflict);
-        state.release_input("a");
-        assert!(state.acquire_input("b", false).unwrap());
+        state.release_attach("a");
+        assert!(state.acquire_attach("b", false).unwrap().input_owner);
     }
 
     #[test]
     fn control_state_allows_read_only_observers_without_ownership() {
         let mut state = ControlState::default();
 
-        assert!(!state.acquire_input("observer", true).unwrap());
+        assert!(!state.acquire_attach("observer", true).unwrap().input_owner);
         assert!(state.input_owner.is_none());
         assert!(state.send_is_allowed(None).is_ok());
     }
@@ -523,13 +669,34 @@ mod tests {
     #[test]
     fn control_state_rejects_one_shot_send_while_owned() {
         let mut state = ControlState::default();
-        state.acquire_input("attach", false).unwrap();
+        state.acquire_attach("attach", false).unwrap();
 
         assert_eq!(
             state.send_is_allowed(None).unwrap_err().code,
             ControlErrorCode::InputOwnerConflict
         );
         assert!(state.send_is_allowed(Some("attach")).is_ok());
+    }
+
+    #[test]
+    fn control_state_reports_attached_clients_and_input_owner() {
+        let mut state = ControlState::default();
+
+        let owner = state.acquire_attach("owner", false).unwrap();
+        let observer = state.acquire_attach("observer", true).unwrap();
+
+        assert!(owner.input_owner);
+        assert!(!observer.input_owner);
+        assert_eq!(state.attach_state().attached_clients, 2);
+        assert_eq!(state.attach_state().input_owner.as_deref(), Some("owner"));
+
+        state.release_attach("observer");
+        assert_eq!(state.attach_state().attached_clients, 1);
+        assert_eq!(state.attach_state().input_owner.as_deref(), Some("owner"));
+
+        state.release_attach("owner");
+        assert_eq!(state.attach_state().attached_clients, 0);
+        assert_eq!(state.attach_state().input_owner, None);
     }
 
     #[test]
@@ -551,5 +718,46 @@ mod tests {
             decoded.params_as::<WorkerSendRequest>().unwrap().text,
             "hello\n"
         );
+    }
+
+    #[test]
+    fn worker_terminal_snapshot_replay_requires_requested_matching_size() {
+        let snapshot = TerminalSnapshot {
+            schema_version: 1,
+            rows: 24,
+            cols: 80,
+            cursor_row: 0,
+            cursor_col: 0,
+            alternate_screen: true,
+            pty_log_offset: 10,
+            raw_replay_start_offset: 0,
+            raw_replay_end_offset: 10,
+            captured_at: "2026-05-26T00:00:00Z".to_string(),
+            screen: vec!["ready".to_string()],
+        };
+
+        assert!(replay_matches_requested_size(
+            AttachReplayMode::TerminalSnapshot,
+            Some(TerminalDimensions { rows: 24, cols: 80 }),
+            &snapshot
+        ));
+        assert!(!replay_matches_requested_size(
+            AttachReplayMode::TerminalSnapshot,
+            Some(TerminalDimensions {
+                rows: 30,
+                cols: 100
+            }),
+            &snapshot
+        ));
+        assert!(!replay_matches_requested_size(
+            AttachReplayMode::TerminalSnapshot,
+            None,
+            &snapshot
+        ));
+        assert!(replay_matches_requested_size(
+            AttachReplayMode::RawReplay,
+            None,
+            &snapshot
+        ));
     }
 }

@@ -60,6 +60,7 @@ fn cli_smoke_send_logs_events_resize_and_stream_through_host() {
         "printf 'ready\\n'; while IFS= read -r line; do printf 'got:%s\\n' \"$line\"; done",
     );
     wait_for_logs(&host, &session_id, "ready");
+    assert_cli_json_attach_state_consistency(&host, &session_id, 0, Value::Null);
 
     millmux_command(&host)
         .args(["send", &session_id, "--text", "ping\n"])
@@ -186,6 +187,51 @@ fn cli_follow_logs_and_events_stream_late_output() {
             .any(|frame| { frame["type"] == "event" && frame["event"]["kind"] == "output" }),
         "{events}"
     );
+}
+
+fn assert_cli_json_attach_state_consistency(
+    host: &TempHost,
+    session_id: &str,
+    attached_clients: u64,
+    input_owner: Value,
+) {
+    let listed = millmux_command(host)
+        .args(["list", "--json"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let listed: Value = serde_json::from_slice(&listed).expect("list json");
+    let listed_session = listed["sessions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|session| session["session_id"] == session_id)
+        .unwrap_or_else(|| panic!("missing session {session_id} in {listed:#}"));
+
+    let status = millmux_command(host)
+        .args(["status", session_id, "--json"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let status: Value = serde_json::from_slice(&status).expect("status json");
+
+    let inspect = millmux_command(host)
+        .args(["inspect", session_id, "--json"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let inspect: Value = serde_json::from_slice(&inspect).expect("inspect json");
+
+    for session in [listed_session, &status["session"], &inspect["session"]] {
+        assert_eq!(session["attached_clients"], attached_clients, "{session:#}");
+        assert_eq!(session["input_owner"], input_owner, "{session:#}");
+    }
 }
 
 fn start_session(host: &TempHost, workspace: &Path, name: &str, script: &str) -> String {

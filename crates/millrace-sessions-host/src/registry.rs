@@ -99,7 +99,7 @@ impl HostRegistry {
                         .is_some_and(|stored| workspace_identity_matches(stored, identity))
                 })
             })
-            .map(|record| summary_from_meta(&record.meta))
+            .map(summary_from_record)
             .collect()
     }
 
@@ -108,7 +108,7 @@ impl HostRegistry {
         Some(SessionInspectResponse {
             schema_version: M1_PROTOCOL_VERSION,
             protocol_version: M1_PROTOCOL_VERSION,
-            session: summary_from_meta(&record.meta),
+            session: summary_from_record(record),
             paths: record.paths.clone(),
             worker: record.worker.clone(),
         })
@@ -137,7 +137,7 @@ impl HostRegistry {
         let identity = WorkspaceIdentity::capture(workspace)?;
         Ok(self
             .find_active_millrace_daemon(&identity)
-            .map(|record| summary_from_meta(&record.meta)))
+            .map(summary_from_record))
     }
 
     fn resolve(&self, selector: &SessionSelector) -> Option<&SessionRecord> {
@@ -231,20 +231,34 @@ fn load_optional_worker(path: &Path, registry: &mut HostRegistry) -> Option<Work
     }
 }
 
-fn summary_from_meta(meta: &SessionMeta) -> SessionSummary {
+fn summary_from_record(record: &SessionRecord) -> SessionSummary {
+    summary_from_meta(&record.meta, record.worker.as_ref())
+}
+
+fn summary_from_meta(meta: &SessionMeta, worker: Option<&WorkerMeta>) -> SessionSummary {
+    let active = is_active_process_state(&meta.process_state);
+    let attached_clients = worker
+        .filter(|_| active)
+        .map_or(0, |worker| worker.attached_clients);
+    let input_owner = worker
+        .filter(|_| active)
+        .and_then(|worker| worker.input_owner.clone());
+
     SessionSummary {
         session_id: meta.id,
         name: meta.name.clone(),
         role: meta.role.clone(),
         process_state: meta.process_state.clone(),
         attention_state: meta.attention_state.clone(),
+        failure_message: meta.failure_message.clone(),
         workspace: meta.workspace.clone(),
         cwd: meta.cwd.clone(),
         argv: meta.argv.clone(),
         monitor_profile: monitor_profile_from_meta(meta),
         created_at: meta.created_at.clone(),
         updated_at: meta.updated_at.clone(),
-        attached_clients: 0,
+        attached_clients,
+        input_owner,
     }
 }
 

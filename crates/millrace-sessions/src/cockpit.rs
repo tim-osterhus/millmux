@@ -1,7 +1,7 @@
 use std::{
     collections::BTreeMap,
     env,
-    io::{self, IsTerminal, Stdout},
+    io::{self, IsTerminal, Stdout, Write},
     path::{Path, PathBuf},
     time::{Duration, Instant},
 };
@@ -21,8 +21,9 @@ use millrace_sessions_core::{
     ids::{SessionId, UiId},
     paths::{state_paths, CONTROL_SOCK_ENV, STATE_DIR_ENV, UI_ID_ENV},
     protocol::{
-        AttachStreamFrame, ControlErrorCode, SessionAttachRequest, SessionListRequest,
-        SessionLogsRequest, SessionSelector, SessionStartRequest, UiContextSetRequest,
+        AttachReplayMode, AttachStreamFrame, ControlErrorCode, SessionAttachRequest,
+        SessionListRequest, SessionLogsRequest, SessionSelector, SessionStartRequest,
+        TerminalDimensions, UiContextSetRequest,
     },
     state::{MonitorProfile, ProcessState, SessionRole, UiEvent, UiEventKind},
 };
@@ -43,6 +44,13 @@ const LOG_TAIL: usize = 4000;
 const SNAPSHOT_WIDTH: u16 = 120;
 const SNAPSHOT_HEIGHT: u16 = 28;
 const REFRESH_INTERVAL: Duration = Duration::from_millis(300);
+const REDRAW_INTERVAL: Duration = Duration::from_millis(33);
+const ATTACH_POLL_INTERVAL: Duration = Duration::from_millis(5);
+const ATTACH_DRAIN_INTERVAL: Duration = Duration::from_millis(1);
+const SNAPSHOT_SEED_TIMEOUT: Duration = Duration::from_millis(3_000);
+const SNAPSHOT_SEED_FRAME_WAIT: Duration = Duration::from_millis(50);
+const SNAPSHOT_SEED_OUTPUT_QUIET: Duration = Duration::from_millis(75);
+const SNAPSHOT_SEED_RETRY_INTERVAL: Duration = Duration::from_millis(25);
 const TERMINAL_SCROLLBACK: usize = 4000;
 const CONTEXT_FILE_ENV: &str = "MILLMUX_CONTEXT_FILE";
 const AGENT_SESSION_ID_ENV: &str = "MILLMUX_AGENT_SESSION_ID";
@@ -80,7 +88,9 @@ pub async fn run_cockpit(args: CockpitArgs) -> Result<(), CockpitError> {
     .await?;
 
     if args.once || !io::stdin().is_terminal() || !io::stdout().is_terminal() {
-        seed_agent_terminal_from_logs(&client, &mut app).await?;
+        seed_agent_terminal_from_attach(&client, &mut app).await?;
+        refresh_daemon_sessions(&client, &mut app).await?;
+        refresh_logs(&client, &mut app).await?;
         record_ui_event(
             &client,
             &app,
@@ -89,10 +99,7 @@ pub async fn run_cockpit(args: CockpitArgs) -> Result<(), CockpitError> {
             BTreeMap::new(),
         )
         .await?;
-        print!(
-            "{}",
-            render_to_string(&app, SNAPSHOT_WIDTH, SNAPSHOT_HEIGHT)
-        );
+        write_snapshot(&render_to_string(&app, SNAPSHOT_WIDTH, SNAPSHOT_HEIGHT))?;
         return Ok(());
     }
 
@@ -323,44 +330,108 @@ async fn ensure_agent_session(
         .session)
 }
 
-async fn seed_agent_terminal_from_logs(
+async fn seed_agent_terminal_from_attach(
     client: &SessionControlClient,
     app: &mut AppModel,
 ) -> Result<(), CockpitError> {
     let Some(agent_session_id) = app.agent_session_id else {
         return Ok(());
     };
-    let mut emulator = TerminalEmulator::new(16, 72, TERMINAL_SCROLLBACK);
-    let mut response = client
-        .logs(&SessionLogsRequest {
-            selector: SessionSelector::Id {
-                session_id: agent_session_id,
-            },
-            tail: Some(LOG_TAIL),
-            follow: false,
-        })
-        .await?;
-    for _ in 0..10 {
-        if !response.lines.is_empty() {
+    let (rows, cols) = (24, 80);
+    let mut emulator = TerminalEmulator::new(rows, cols, TERMINAL_SCROLLBACK);
+    let deadline = Instant::now() + SNAPSHOT_SEED_TIMEOUT;
+    while Instant::now() < deadline && !agent_terminal_seeded(app) {
+        let Some(connection) = open_seed_agent_attach(client, agent_session_id, deadline).await?
+        else {
+            return Ok(());
+        };
+        if drain_seed_agent_attach(connection, &mut emulator, app, deadline).await? {
+            return Ok(());
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
             break;
         }
-        tokio::time::sleep(Duration::from_millis(25)).await;
-        response = client
-            .logs(&SessionLogsRequest {
-                selector: SessionSelector::Id {
-                    session_id: agent_session_id,
-                },
-                tail: Some(LOG_TAIL),
-                follow: false,
-            })
-            .await?;
+        tokio::time::sleep(remaining.min(SNAPSHOT_SEED_RETRY_INTERVAL)).await;
     }
-    for line in response.lines {
-        emulator.process_text(&line.line);
-        emulator.process_text("\r\n");
-    }
-    app.update_agent_terminal(emulator.snapshot());
     Ok(())
+}
+
+async fn drain_seed_agent_attach(
+    connection: AttachConnection,
+    emulator: &mut TerminalEmulator,
+    app: &mut AppModel,
+    deadline: Instant,
+) -> Result<bool, CockpitError> {
+    let (_, mut reader, mut writer) = connection.split();
+    let mut last_frame_at = None;
+
+    while Instant::now() < deadline {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        let wait = seed_frame_wait(app, last_frame_at).min(remaining);
+        match tokio::time::timeout(wait, reader.next_frame()).await {
+            Ok(Ok(Some(frame))) => {
+                if !apply_agent_attach_frame(frame, emulator, app) {
+                    break;
+                }
+                last_frame_at = Some(Instant::now());
+            }
+            Ok(Ok(None)) => break,
+            Ok(Err(error)) => {
+                let _ = writer.write_frame(&AttachStreamFrame::Close).await;
+                return Err(error.into());
+            }
+            Err(_) => break,
+        }
+    }
+
+    let _ = writer.write_frame(&AttachStreamFrame::Close).await;
+    Ok(agent_terminal_seeded(app))
+}
+
+fn seed_frame_wait(app: &AppModel, last_frame_at: Option<Instant>) -> Duration {
+    if agent_terminal_seeded(app) {
+        let Some(last_frame_at) = last_frame_at else {
+            return Duration::ZERO;
+        };
+        return SNAPSHOT_SEED_OUTPUT_QUIET
+            .saturating_sub(last_frame_at.elapsed())
+            .min(SNAPSHOT_SEED_OUTPUT_QUIET);
+    }
+    SNAPSHOT_SEED_FRAME_WAIT
+}
+
+fn agent_terminal_seeded(app: &AppModel) -> bool {
+    app.agent_terminal
+        .as_ref()
+        .is_some_and(|terminal| !terminal.initializing)
+}
+
+async fn open_seed_agent_attach(
+    client: &SessionControlClient,
+    session_id: SessionId,
+    deadline: Instant,
+) -> Result<Option<AttachConnection>, CockpitError> {
+    loop {
+        match client
+            .attach(&agent_raw_replay_attach_request(session_id, true))
+            .await
+        {
+            Ok(connection) => return Ok(Some(connection)),
+            Err(ClientError::Control(error))
+                if error.code == ControlErrorCode::SessionNotRunning
+                    && Instant::now() < deadline =>
+            {
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+            Err(ClientError::Control(error))
+                if error.code == ControlErrorCode::SessionNotRunning =>
+            {
+                return Ok(None);
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
 }
 
 async fn fetch_log_lines(
@@ -377,6 +448,14 @@ async fn fetch_log_lines(
     Ok(response.lines.into_iter().map(|line| line.line).collect())
 }
 
+async fn refresh_daemon_sessions(
+    client: &SessionControlClient,
+    app: &mut AppModel,
+) -> Result<(), CockpitError> {
+    app.replace_daemon_sessions(discover_daemons(client).await?);
+    Ok(())
+}
+
 async fn run_interactive_cockpit(
     client: SessionControlClient,
     mut app: AppModel,
@@ -390,61 +469,69 @@ async fn run_interactive_cockpit(
         .agent_terminal_size_for(size.width, size.height)
         .unwrap_or((16, 72));
     let mut emulator = TerminalEmulator::new(rows, cols, TERMINAL_SCROLLBACK);
-    let mut attach = open_agent_attach(&client, agent_session_id).await?;
-    if attach.read_only {
-        app.set_agent_input_read_only();
-    }
+    let mut attach = open_agent_attach(&client, agent_session_id, rows, cols).await?;
+    apply_agent_input_ownership(&mut app, attach.read_only);
     let mut last_refresh = Instant::now();
+    let mut redraw = RedrawGate::new(Instant::now());
     let mut last_size = (rows, cols);
+    terminal.terminal.draw(|frame| render_app(frame, &app))?;
 
     loop {
-        terminal.terminal.draw(|frame| render_app(frame, &app))?;
-
-        match tokio::time::timeout(Duration::from_millis(5), attach.reader.next_frame()).await {
-            Ok(Ok(Some(frame))) => match frame {
-                AttachStreamFrame::Scrollback { lines } => {
-                    let _ = lines;
+        match tokio::time::timeout(ATTACH_POLL_INTERVAL, attach.reader.next_frame()).await {
+            Ok(Ok(Some(frame))) => {
+                if !apply_agent_attach_frame(frame, &mut emulator, &mut app) {
+                    break;
                 }
-                AttachStreamFrame::Output { text } => {
-                    emulator.process_text(&text);
-                    app.update_agent_terminal(emulator.snapshot());
-                }
-                AttachStreamFrame::Error { error } => {
-                    if error.code == ControlErrorCode::InputOwnerConflict {
-                        app.set_agent_input_read_only();
-                    } else {
-                        app.set_command_failure(
-                            vec!["agent attach".to_string()],
-                            "agent terminal",
-                            vec![error.to_string()],
-                        );
+                redraw.mark_dirty();
+                let mut stream_closed = false;
+                for _ in 0..64 {
+                    match tokio::time::timeout(ATTACH_DRAIN_INTERVAL, attach.reader.next_frame())
+                        .await
+                    {
+                        Ok(Ok(Some(frame))) => {
+                            if !apply_agent_attach_frame(frame, &mut emulator, &mut app) {
+                                stream_closed = true;
+                                break;
+                            }
+                        }
+                        Ok(Ok(None)) => break,
+                        Ok(Err(error)) => {
+                            app.set_host_reconnecting(1, error.to_string());
+                            break;
+                        }
+                        Err(_) => break,
                     }
                 }
-                AttachStreamFrame::Closed => break,
-                _ => {}
-            },
+                if stream_closed {
+                    break;
+                }
+            }
             Ok(Ok(None)) => {
                 app.set_host_reconnecting(1, "agent attach stream closed");
-                match reopen_agent_attach(&client, agent_session_id, &mut app).await {
+                match reopen_agent_attach(&client, agent_session_id, last_size, &mut app).await {
                     Ok(new_attach) => {
                         attach = new_attach;
                         app.set_host_connected();
+                        redraw.mark_dirty();
                     }
                     Err(error) => {
                         app.set_host_disconnected(error.to_string());
+                        redraw.mark_dirty();
                         tokio::time::sleep(REFRESH_INTERVAL).await;
                     }
                 }
             }
             Ok(Err(error)) => {
                 app.set_host_reconnecting(1, error.to_string());
-                match reopen_agent_attach(&client, agent_session_id, &mut app).await {
+                match reopen_agent_attach(&client, agent_session_id, last_size, &mut app).await {
                     Ok(new_attach) => {
                         attach = new_attach;
                         app.set_host_connected();
+                        redraw.mark_dirty();
                     }
                     Err(reopen_error) => {
                         app.set_host_disconnected(reopen_error.to_string());
+                        redraw.mark_dirty();
                         tokio::time::sleep(REFRESH_INTERVAL).await;
                     }
                 }
@@ -452,12 +539,19 @@ async fn run_interactive_cockpit(
             Err(_) => {}
         }
 
-        if event::poll(Duration::from_millis(30))? {
+        if event::poll(redraw.event_wait())? {
             match event::read()? {
                 Event::Key(event) => {
-                    let should_exit =
-                        handle_cockpit_key(&client, &mut app, &mut attach, &mut terminal, event)
-                            .await?;
+                    let should_exit = handle_cockpit_key(
+                        &client,
+                        &mut app,
+                        &mut attach,
+                        &mut terminal,
+                        &mut emulator,
+                        event,
+                    )
+                    .await?;
+                    redraw.mark_dirty();
                     if should_exit {
                         break;
                     }
@@ -467,12 +561,16 @@ async fn run_interactive_cockpit(
                         if (rows, cols) != last_size {
                             emulator.resize(rows, cols);
                             app.resize_agent_terminal(rows, cols);
-                            app.update_agent_terminal(emulator.snapshot());
+                            app.update_agent_terminal_view(
+                                emulator.snapshot(),
+                                emulator.is_following(),
+                            );
                             attach
                                 .writer
                                 .write_frame(&AttachStreamFrame::Resize { rows, cols })
                                 .await?;
                             last_size = (rows, cols);
+                            redraw.mark_dirty();
                         }
                     }
                 }
@@ -481,8 +579,16 @@ async fn run_interactive_cockpit(
         }
 
         if last_refresh.elapsed() >= REFRESH_INTERVAL {
+            refresh_daemon_sessions(&client, &mut app).await?;
             refresh_logs(&client, &mut app).await?;
             last_refresh = Instant::now();
+            redraw.mark_dirty();
+        }
+
+        let now = Instant::now();
+        if redraw.should_draw(now) {
+            terminal.terminal.draw(|frame| render_app(frame, &app))?;
+            redraw.mark_drawn(now);
         }
     }
 
@@ -498,16 +604,25 @@ async fn run_interactive_cockpit(
     Ok(())
 }
 
+fn write_snapshot(output: &str) -> Result<(), CockpitError> {
+    let mut stdout = io::stdout().lock();
+    stdout.write_all(output.as_bytes())?;
+    stdout.flush()?;
+    Ok(())
+}
+
 async fn open_agent_attach(
     client: &SessionControlClient,
     session_id: SessionId,
+    rows: u16,
+    cols: u16,
 ) -> Result<OpenedAgentAttach, CockpitError> {
-    let request = agent_attach_request(session_id, false);
+    let request = agent_attach_request(session_id, false, rows, cols);
     match client.attach(&request).await {
         Ok(connection) => Ok(opened_agent_attach(connection, false)),
         Err(ClientError::Control(error)) if error.code == ControlErrorCode::InputOwnerConflict => {
             let connection = client
-                .attach(&agent_attach_request(session_id, true))
+                .attach(&agent_attach_request(session_id, true, rows, cols))
                 .await?;
             Ok(opened_agent_attach(connection, true))
         }
@@ -515,24 +630,38 @@ async fn open_agent_attach(
     }
 }
 
-fn agent_attach_request(session_id: SessionId, read_only: bool) -> SessionAttachRequest {
+fn agent_attach_request(
+    session_id: SessionId,
+    read_only: bool,
+    rows: u16,
+    cols: u16,
+) -> SessionAttachRequest {
     SessionAttachRequest {
         selector: SessionSelector::Id { session_id },
         read_only,
-        include_scrollback: false,
+        replay: AttachReplayMode::TerminalSnapshot,
+        requested_terminal_size: Some(TerminalDimensions::new(rows, cols)),
+    }
+}
+
+fn agent_raw_replay_attach_request(session_id: SessionId, read_only: bool) -> SessionAttachRequest {
+    SessionAttachRequest {
+        selector: SessionSelector::Id { session_id },
+        read_only,
+        replay: AttachReplayMode::RawReplay,
+        requested_terminal_size: None,
     }
 }
 
 async fn reopen_agent_attach(
     client: &SessionControlClient,
     session_id: SessionId,
+    terminal_size: (u16, u16),
     app: &mut AppModel,
 ) -> Result<OpenedAgentAttach, CockpitError> {
     client.ensure_host_ready().await?;
-    let attach = open_agent_attach(client, session_id).await?;
-    if attach.read_only {
-        app.set_agent_input_read_only();
-    }
+    let attach = open_agent_attach(client, session_id, terminal_size.0, terminal_size.1).await?;
+    apply_agent_input_ownership(app, attach.read_only);
     Ok(attach)
 }
 
@@ -551,11 +680,86 @@ struct OpenedAgentAttach {
     read_only: bool,
 }
 
+fn apply_agent_input_ownership(app: &mut AppModel, read_only: bool) {
+    app.set_agent_input_owner(!read_only);
+}
+
+#[derive(Debug, Clone)]
+struct RedrawGate {
+    last_draw: Instant,
+    dirty: bool,
+}
+
+impl RedrawGate {
+    fn new(now: Instant) -> Self {
+        Self {
+            last_draw: now,
+            dirty: false,
+        }
+    }
+
+    fn mark_dirty(&mut self) {
+        self.dirty = true;
+    }
+
+    fn event_wait(&self) -> Duration {
+        if self.dirty {
+            Duration::ZERO
+        } else {
+            Duration::from_millis(30)
+        }
+    }
+
+    fn should_draw(&self, now: Instant) -> bool {
+        self.dirty && now.duration_since(self.last_draw) >= REDRAW_INTERVAL
+    }
+
+    fn mark_drawn(&mut self, now: Instant) {
+        self.last_draw = now;
+        self.dirty = false;
+    }
+}
+
+fn apply_agent_attach_frame(
+    frame: AttachStreamFrame,
+    emulator: &mut TerminalEmulator,
+    app: &mut AppModel,
+) -> bool {
+    match frame {
+        AttachStreamFrame::Scrollback { lines } => {
+            let _ = lines;
+        }
+        AttachStreamFrame::Output { text } => {
+            emulator.process_text(&text);
+            app.update_agent_terminal_view(emulator.snapshot(), emulator.is_following());
+        }
+        AttachStreamFrame::RawOutput { data } => {
+            emulator.process(data.as_slice());
+            app.update_agent_terminal_view(emulator.snapshot(), emulator.is_following());
+        }
+        AttachStreamFrame::Error { error } => {
+            if error.code == ControlErrorCode::InputOwnerConflict {
+                app.set_agent_input_read_only();
+            } else {
+                app.set_command_failure(
+                    vec!["agent attach".to_string()],
+                    "agent terminal",
+                    vec![error.to_string()],
+                );
+            }
+        }
+        AttachStreamFrame::Closed => return false,
+        _ => {}
+    }
+    true
+}
+
 async fn handle_cockpit_key(
     client: &SessionControlClient,
     app: &mut AppModel,
     attach: &mut OpenedAgentAttach,
     terminal: &mut TerminalSession,
+    emulator: &mut TerminalEmulator,
     event: KeyEvent,
 ) -> Result<bool, CockpitError> {
     if app.daemon_switcher.open {
@@ -568,7 +772,17 @@ async fn handle_cockpit_key(
     }
 
     let previous_daemon = app.active_daemon_session_id;
-    let action = app.handle_key(event, 20);
+    let agent_was_focused = app.focused_agent_terminal();
+    let viewport_height = terminal
+        .terminal
+        .size()
+        .ok()
+        .and_then(|size| {
+            app.agent_terminal_size_for(size.width, size.height)
+                .map(|(rows, _)| rows)
+        })
+        .unwrap_or(20);
+    let action = app.handle_key(event, viewport_height);
     match action {
         KeyAction::Detach => return Ok(true),
         KeyAction::Redraw => {
@@ -597,7 +811,31 @@ async fn handle_cockpit_key(
             )
             .await?;
         }
+        KeyAction::ScrollUp if agent_was_focused => {
+            emulator.scroll_up(1);
+            app.update_agent_terminal_view(emulator.snapshot(), emulator.is_following());
+        }
+        KeyAction::ScrollDown if agent_was_focused => {
+            emulator.scroll_down(1);
+            app.update_agent_terminal_view(emulator.snapshot(), emulator.is_following());
+        }
+        KeyAction::PageUp if agent_was_focused => {
+            emulator.page_up(viewport_height);
+            app.update_agent_terminal_view(emulator.snapshot(), emulator.is_following());
+        }
+        KeyAction::PageDown if agent_was_focused => {
+            emulator.page_down(viewport_height);
+            app.update_agent_terminal_view(emulator.snapshot(), emulator.is_following());
+        }
+        KeyAction::JumpTop if agent_was_focused => {
+            emulator.jump_top();
+            app.update_agent_terminal_view(emulator.snapshot(), emulator.is_following());
+        }
         KeyAction::ExitScrollMode | KeyAction::JumpBottom | KeyAction::Escape => {
+            if agent_was_focused {
+                emulator.jump_bottom();
+                app.update_agent_terminal_view(emulator.snapshot(), emulator.is_following());
+            }
             record_ui_event(
                 client,
                 app,
@@ -800,22 +1038,56 @@ mod tests {
     fn cockpit_agent_attach_does_not_request_line_scrollback() {
         let session_id = SessionId::new();
 
-        let request = agent_attach_request(session_id, false);
+        let request = agent_attach_request(session_id, false, 31, 99);
 
         assert_eq!(request.selector, SessionSelector::Id { session_id });
         assert!(!request.read_only);
-        assert!(
-            !request.include_scrollback,
-            "line scrollback cannot be replayed safely into an embedded full-screen TUI"
+        assert_eq!(request.replay, AttachReplayMode::TerminalSnapshot);
+        assert_eq!(
+            request.requested_terminal_size,
+            Some(TerminalDimensions { rows: 31, cols: 99 })
         );
     }
 
     #[test]
     fn cockpit_agent_read_only_attach_also_avoids_line_scrollback() {
-        let request = agent_attach_request(SessionId::new(), true);
+        let request = agent_attach_request(SessionId::new(), true, 18, 72);
 
         assert!(request.read_only);
-        assert!(!request.include_scrollback);
+        assert_eq!(request.replay, AttachReplayMode::TerminalSnapshot);
+        assert_eq!(
+            request.requested_terminal_size,
+            Some(TerminalDimensions { rows: 18, cols: 72 })
+        );
+    }
+
+    #[test]
+    fn cockpit_snapshot_seed_uses_raw_replay_not_legacy_line_scrollback() {
+        let request = agent_raw_replay_attach_request(SessionId::new(), true);
+
+        assert!(request.read_only);
+        assert_eq!(request.replay, AttachReplayMode::RawReplay);
+        assert_eq!(request.requested_terminal_size, None);
+    }
+
+    #[test]
+    fn redraw_gate_coalesces_dirty_draws_until_interval() {
+        let start = Instant::now();
+        let mut gate = RedrawGate::new(start);
+
+        assert_eq!(gate.event_wait(), Duration::from_millis(30));
+        assert!(!gate.should_draw(start + REDRAW_INTERVAL));
+
+        gate.mark_dirty();
+
+        assert_eq!(gate.event_wait(), Duration::ZERO);
+        assert!(!gate.should_draw(start + REDRAW_INTERVAL / 2));
+        assert!(gate.should_draw(start + REDRAW_INTERVAL));
+
+        gate.mark_drawn(start + REDRAW_INTERVAL);
+
+        assert_eq!(gate.event_wait(), Duration::from_millis(30));
+        assert!(!gate.should_draw(start + REDRAW_INTERVAL * 2));
     }
 }
 

@@ -170,8 +170,33 @@ pub struct UiContext {
     pub agent_session_id: Option<SessionId>,
     pub managed_daemon_session_ids: Vec<SessionId>,
     pub monitor_profile: MonitorProfile,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub daemon_health: Vec<UiDaemonHealth>,
     #[serde(with = "time::serde::rfc3339")]
     pub updated_at: OffsetDateTime,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UiDaemonHealth {
+    pub session_id: SessionId,
+    pub process_state: ProcessState,
+    pub attention_state: AttentionState,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure_message: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub recovery_actions: Vec<UiDaemonRecoveryAction>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UiDaemonRecoveryAction {
+    Inspect,
+    Logs,
+    Doctor,
+    Stop,
+    Kill,
+    Archive,
+    Delete,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -220,6 +245,8 @@ pub struct SessionPaths {
     pub pty_log: PathBuf,
     pub events_jsonl: PathBuf,
     pub scrollback_snapshot: PathBuf,
+    pub terminal_snapshot: PathBuf,
+    pub raw_replay_ring: PathBuf,
     pub worker_sock: PathBuf,
 }
 
@@ -272,6 +299,10 @@ pub struct WorkerMeta {
     pub exit_code: Option<i32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub exit_signal: Option<String>,
+    #[serde(default)]
+    pub attached_clients: u32,
+    #[serde(default)]
+    pub input_owner: Option<String>,
     pub updated_at: String,
 }
 

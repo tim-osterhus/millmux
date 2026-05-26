@@ -19,22 +19,22 @@ use millrace_sessions_core::{
     ids::{SessionId, UiId},
     paths::{state_paths, StatePaths},
     protocol::{
-        AttachStreamFrame, ControlErrorBody, ControlErrorCode, ControlResponse, DoctorRequest,
-        EventStreamFrame, HostStatusRequest, HostStatusResponse, LogLine, LogStreamFrame,
-        SessionAttachRequest, SessionAttachResponse, SessionDeleteRequest, SessionDeleteResponse,
-        SessionEventsRequest, SessionEventsResponse, SessionInspectRequest, SessionInspectResponse,
-        SessionKillRequest, SessionKillResponse, SessionListRequest, SessionListResponse,
-        SessionLogsRequest, SessionLogsResponse, SessionResizeRequest, SessionResizeResponse,
-        SessionSendRequest, SessionSendResponse, SessionStartRequest, SessionStartResponse,
-        SessionStopRequest, SessionStopResponse, SessionSummary, StreamKind, StreamSetup,
-        UiContextCloseRequest, UiContextCloseResponse, UiContextGetRequest, UiContextGetResponse,
-        UiContextListEntry, UiContextListRequest, UiContextListResponse, UiContextSetRequest,
-        UiContextSetResponse, WorkerAckResponse, WorkerAttachRequest, WorkerAttachResponse,
-        WorkerControlMethod, WorkerControlRequest, WorkerControlResponse,
-        WorkerReleaseAttachRequest, WorkerResizeRequest, WorkerResizeResponse, WorkerSendRequest,
-        WorkerSendResponse, M1_PROTOCOL_VERSION,
+        AttachReplayMode, AttachStreamFrame, ControlErrorBody, ControlErrorCode, ControlResponse,
+        DoctorRequest, EventStreamFrame, HostStatusRequest, HostStatusResponse, LogLine,
+        LogStreamFrame, SessionAttachRequest, SessionAttachResponse, SessionDeleteRequest,
+        SessionDeleteResponse, SessionEventsRequest, SessionEventsResponse, SessionInspectRequest,
+        SessionInspectResponse, SessionKillRequest, SessionKillResponse, SessionListRequest,
+        SessionListResponse, SessionLogsRequest, SessionLogsResponse, SessionResizeRequest,
+        SessionResizeResponse, SessionSendRequest, SessionSendResponse, SessionStartRequest,
+        SessionStartResponse, SessionStopRequest, SessionStopResponse, SessionSummary, StreamKind,
+        StreamSetup, TerminalDimensions, UiContextCloseRequest, UiContextCloseResponse,
+        UiContextGetRequest, UiContextGetResponse, UiContextListEntry, UiContextListRequest,
+        UiContextListResponse, UiContextSetRequest, UiContextSetResponse, WorkerAckResponse,
+        WorkerAttachRequest, WorkerAttachResponse, WorkerControlMethod, WorkerControlRequest,
+        WorkerControlResponse, WorkerReleaseAttachRequest, WorkerResizeRequest,
+        WorkerResizeResponse, WorkerSendRequest, WorkerSendResponse, M1_PROTOCOL_VERSION,
     },
-    scrollback::ScrollbackBuffer,
+    scrollback::{restore_terminal_replay, ScrollbackBuffer},
     state::{
         AttentionState, HostMeta, MonitorProfile, ProcessState, SessionMeta, SessionPaths,
         SessionRole, UiContext, UiContextPaths, UiEvent, UiEventKind, WorkerMeta,
@@ -387,7 +387,7 @@ fn start_session(
                 return Ok(SessionStartResponse {
                     schema_version: M1_PROTOCOL_VERSION,
                     protocol_version: M1_PROTOCOL_VERSION,
-                    session: summary_from_meta(&record.meta),
+                    session: summary_from_meta(&record.meta, record.worker.as_ref()),
                     attached_existing: true,
                 });
             }
@@ -493,7 +493,7 @@ fn start_session(
     Ok(SessionStartResponse {
         schema_version: M1_PROTOCOL_VERSION,
         protocol_version: M1_PROTOCOL_VERSION,
-        session: summary_from_meta(&meta),
+        session: summary_from_meta(&meta, None),
         attached_existing: false,
     })
 }
@@ -554,7 +554,7 @@ fn probe_millrace_status(
                 Err(error) => MillraceStatusProbe::Issue(MillraceStatusProbeIssue {
                     outcome: "unusable_json",
                     message: format!("millrace status returned unusable JSON: {error}"),
-                    stderr: Some(String::from_utf8_lossy(&output.stderr).trim().to_string()),
+                    stderr: redacted_stderr(&output.stderr),
                 }),
             }
         }
@@ -568,7 +568,7 @@ fn probe_millrace_status(
                     .map(|code| code.to_string())
                     .unwrap_or_else(|| "signal".to_string())
             ),
-            stderr: Some(String::from_utf8_lossy(&output.stderr).trim().to_string()),
+            stderr: redacted_stderr(&output.stderr),
         }),
         Err(error) => MillraceStatusProbe::Issue(MillraceStatusProbeIssue {
             outcome: "unavailable",
@@ -576,6 +576,46 @@ fn probe_millrace_status(
             stderr: None,
         }),
     }
+}
+
+fn redacted_stderr(stderr: &[u8]) -> Option<String> {
+    let stderr = String::from_utf8_lossy(stderr).trim().to_string();
+    if stderr.is_empty() {
+        None
+    } else {
+        Some(redact_diagnostic(&stderr))
+    }
+}
+
+fn redact_diagnostic(value: &str) -> String {
+    value
+        .split_whitespace()
+        .map(redact_diagnostic_token)
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn redact_diagnostic_token(token: &str) -> String {
+    let Some((key, _value)) = token.split_once('=') else {
+        return token.to_string();
+    };
+    if is_secret_env_key(key) {
+        format!("{key}=<redacted>")
+    } else {
+        token.to_string()
+    }
+}
+
+fn is_secret_env_key(key: &str) -> bool {
+    let upper = key
+        .trim_matches(|ch: char| !ch.is_ascii_alphanumeric() && ch != '_')
+        .to_ascii_uppercase();
+    upper.contains("TOKEN")
+        || upper.contains("SECRET")
+        || upper.contains("PASSWORD")
+        || upper.ends_with("_KEY")
+        || upper == "KEY"
+        || upper.contains("PRIVATE_KEY")
 }
 
 fn value_process_running(value: &Value) -> bool {
@@ -1403,6 +1443,8 @@ fn mark_session_killed(paths: &SessionPaths) -> Result<(), ControlErrorBody> {
     update_worker_meta(paths, |worker, now| {
         worker.process_state = ProcessState::Killed;
         worker.ended_at.get_or_insert_with(|| now.to_string());
+        worker.attached_clients = 0;
+        worker.input_owner = None;
         worker.updated_at = now.to_string();
     })?;
 
@@ -1868,23 +1910,14 @@ async fn handle_attach_stream(
         .await?;
     writer.flush().await?;
 
-    let mut offset = if params.include_scrollback {
-        0
-    } else {
-        file_len(&cleanup.opened().paths.pty_log)
-    };
-    if params.include_scrollback {
-        if let Ok(scrollback) =
-            ScrollbackBuffer::restore_snapshot(&cleanup.opened().paths.scrollback_snapshot)
-        {
-            let frame = AttachStreamFrame::Scrollback {
-                lines: scrollback.lines(),
-            };
-            writer.write_all(frame.to_json_line()?.as_bytes()).await?;
-            writer.flush().await?;
-            offset = file_len(&cleanup.opened().paths.pty_log);
-        }
-    }
+    let replay = params.replay;
+    let mut offset = attach_initial_offset(
+        cleanup.opened(),
+        replay,
+        params.requested_terminal_size,
+        &mut writer,
+    )
+    .await?;
 
     loop {
         tokio::select! {
@@ -1907,9 +1940,7 @@ async fn handle_attach_stream(
                     Err(_) => Vec::new(),
                 };
                 if !next.is_empty() {
-                    let frame = AttachStreamFrame::Output {
-                        text: String::from_utf8_lossy(&next).to_string(),
-                    };
+                    let frame = attach_output_frame(replay, next);
                     if writer.write_all(frame.to_json_line()?.as_bytes()).await.is_err() {
                         break;
                     }
@@ -1967,6 +1998,78 @@ impl Drop for AttachCleanupGuard {
     }
 }
 
+async fn attach_initial_offset(
+    opened: &OpenAttach,
+    replay: AttachReplayMode,
+    requested_terminal_size: Option<TerminalDimensions>,
+    writer: &mut OwnedWriteHalf,
+) -> Result<u64, HostServerError> {
+    match replay {
+        AttachReplayMode::None => Ok(file_len(&opened.paths.pty_log)),
+        AttachReplayMode::LineScrollback => {
+            let mut offset = 0;
+            if let Ok(scrollback) =
+                ScrollbackBuffer::restore_snapshot(&opened.paths.scrollback_snapshot)
+            {
+                let frame = AttachStreamFrame::Scrollback {
+                    lines: scrollback.lines(),
+                };
+                writer.write_all(frame.to_json_line()?.as_bytes()).await?;
+                writer.flush().await?;
+                offset = file_len(&opened.paths.pty_log);
+            }
+            Ok(offset)
+        }
+        AttachReplayMode::RawReplay | AttachReplayMode::TerminalSnapshot => {
+            let offset = file_len(&opened.paths.pty_log);
+            if let Some(restored) = restore_terminal_replay(
+                &opened.paths.terminal_snapshot,
+                &opened.paths.raw_replay_ring,
+                offset,
+            )
+            .unwrap_or(None)
+            {
+                if replay_matches_requested_size(
+                    replay,
+                    requested_terminal_size,
+                    &restored.snapshot,
+                ) && !restored.bytes.is_empty()
+                {
+                    let frame = AttachStreamFrame::raw_output(restored.bytes);
+                    writer.write_all(frame.to_json_line()?.as_bytes()).await?;
+                    writer.flush().await?;
+                }
+            }
+            Ok(offset)
+        }
+    }
+}
+
+fn replay_matches_requested_size(
+    replay: AttachReplayMode,
+    requested_terminal_size: Option<TerminalDimensions>,
+    snapshot: &millrace_sessions_core::scrollback::TerminalSnapshot,
+) -> bool {
+    match (replay, requested_terminal_size) {
+        (AttachReplayMode::RawReplay, None) => true,
+        (AttachReplayMode::RawReplay | AttachReplayMode::TerminalSnapshot, Some(size)) => {
+            snapshot.same_size(size.rows, size.cols)
+        }
+        (AttachReplayMode::TerminalSnapshot, None) => false,
+        _ => true,
+    }
+}
+
+fn attach_output_frame(replay: AttachReplayMode, bytes: Vec<u8>) -> AttachStreamFrame {
+    if replay.uses_raw_payloads() {
+        AttachStreamFrame::raw_output(bytes)
+    } else {
+        AttachStreamFrame::Output {
+            text: String::from_utf8_lossy(&bytes).to_string(),
+        }
+    }
+}
+
 fn open_attach(
     paths: &StatePaths,
     request: &SessionAttachRequest,
@@ -1979,7 +2082,8 @@ fn open_attach(
         &WorkerAttachRequest {
             stream_id: stream_id.clone(),
             read_only: request.read_only,
-            include_scrollback: request.include_scrollback,
+            replay: request.replay,
+            requested_terminal_size: request.requested_terminal_size,
         },
     )?;
 
@@ -1993,6 +2097,17 @@ fn open_attach(
     event
         .fields
         .insert("input_owner".to_string(), worker.input_owner.to_string());
+    event
+        .fields
+        .insert("replay".to_string(), request.replay.to_string());
+    if let Some(size) = request.requested_terminal_size {
+        event
+            .fields
+            .insert("requested_rows".to_string(), size.rows.to_string());
+        event
+            .fields
+            .insert("requested_cols".to_string(), size.cols.to_string());
+    }
     append_event(&inspected.paths.events_jsonl, &event).map_err(control_core_error)?;
 
     let response = SessionAttachResponse {
@@ -2175,20 +2290,30 @@ enum StartSessionError {
     Worker(#[from] WorkerLaunchError),
 }
 
-fn summary_from_meta(meta: &SessionMeta) -> SessionSummary {
+fn summary_from_meta(meta: &SessionMeta, worker: Option<&WorkerMeta>) -> SessionSummary {
+    let active = is_active_process_state(&meta.process_state);
+    let attached_clients = worker
+        .filter(|_| active)
+        .map_or(0, |worker| worker.attached_clients);
+    let input_owner = worker
+        .filter(|_| active)
+        .and_then(|worker| worker.input_owner.clone());
+
     SessionSummary {
         session_id: meta.id,
         name: meta.name.clone(),
         role: meta.role.clone(),
         process_state: meta.process_state.clone(),
         attention_state: meta.attention_state.clone(),
+        failure_message: meta.failure_message.clone(),
         workspace: meta.workspace.clone(),
         cwd: meta.cwd.clone(),
         argv: meta.argv.clone(),
         monitor_profile: monitor_profile_from_meta(meta),
         created_at: meta.created_at.clone(),
         updated_at: meta.updated_at.clone(),
-        attached_clients: 0,
+        attached_clients,
+        input_owner,
     }
 }
 
@@ -2216,7 +2341,7 @@ fn monitor_profile_from_argv(argv: &[String]) -> Option<MonitorProfile> {
 
 #[cfg(test)]
 mod tests {
-    use millrace_sessions_core::state::HostMeta;
+    use millrace_sessions_core::{scrollback::TerminalSnapshot, state::HostMeta};
 
     use super::*;
 
@@ -2239,5 +2364,46 @@ mod tests {
             response.error.expect("error").code,
             ControlErrorCode::InvalidRequest
         );
+    }
+
+    #[test]
+    fn terminal_snapshot_replay_requires_requested_matching_size() {
+        let snapshot = TerminalSnapshot {
+            schema_version: 1,
+            rows: 24,
+            cols: 80,
+            cursor_row: 0,
+            cursor_col: 0,
+            alternate_screen: true,
+            pty_log_offset: 10,
+            raw_replay_start_offset: 0,
+            raw_replay_end_offset: 10,
+            captured_at: "2026-05-26T00:00:00Z".to_string(),
+            screen: vec!["ready".to_string()],
+        };
+
+        assert!(replay_matches_requested_size(
+            AttachReplayMode::TerminalSnapshot,
+            Some(TerminalDimensions { rows: 24, cols: 80 }),
+            &snapshot
+        ));
+        assert!(!replay_matches_requested_size(
+            AttachReplayMode::TerminalSnapshot,
+            Some(TerminalDimensions {
+                rows: 30,
+                cols: 100
+            }),
+            &snapshot
+        ));
+        assert!(!replay_matches_requested_size(
+            AttachReplayMode::TerminalSnapshot,
+            None,
+            &snapshot
+        ));
+        assert!(replay_matches_requested_size(
+            AttachReplayMode::RawReplay,
+            None,
+            &snapshot
+        ));
     }
 }

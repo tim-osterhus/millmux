@@ -1,6 +1,6 @@
 use std::{
     collections::BTreeMap,
-    io::{self, IsTerminal, Stdout},
+    io::{self, IsTerminal, Stdout, Write},
     path::Path,
     time::{Duration, Instant},
 };
@@ -72,10 +72,7 @@ pub async fn run_console(args: ConsoleArgs) -> Result<(), ConsoleError> {
             BTreeMap::new(),
         )
         .await?;
-        print!(
-            "{}",
-            render_to_string(&app, SNAPSHOT_WIDTH, SNAPSHOT_HEIGHT)
-        );
+        write_snapshot(&render_to_string(&app, SNAPSHOT_WIDTH, SNAPSHOT_HEIGHT))?;
         return Ok(());
     }
 
@@ -88,10 +85,7 @@ pub async fn run_console(args: ConsoleArgs) -> Result<(), ConsoleError> {
             BTreeMap::new(),
         )
         .await?;
-        print!(
-            "{}",
-            render_to_string(&app, SNAPSHOT_WIDTH, SNAPSHOT_HEIGHT)
-        );
+        write_snapshot(&render_to_string(&app, SNAPSHOT_WIDTH, SNAPSHOT_HEIGHT))?;
         return Ok(());
     }
 
@@ -264,6 +258,13 @@ async fn run_interactive_console(
         }
     }
 
+    Ok(())
+}
+
+fn write_snapshot(output: &str) -> Result<(), ConsoleError> {
+    let mut stdout = io::stdout().lock();
+    stdout.write_all(output.as_bytes())?;
+    stdout.flush()?;
     Ok(())
 }
 

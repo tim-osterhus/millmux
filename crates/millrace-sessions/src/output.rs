@@ -26,12 +26,14 @@ pub fn render_list(result: &SessionListResponse) -> String {
     let mut lines = String::new();
     for session in &result.sessions {
         lines.push_str(&format!(
-            "{} {} role={} name={} monitor={} cwd={}\n",
+            "{} {} role={} name={} monitor={} clients={} owner={} cwd={}\n",
             session.session_id,
             process_state(&session.process_state),
             role(&session.role),
             session.name.as_deref().unwrap_or("-"),
             session.monitor_profile,
+            session.attached_clients,
+            input_owner(session),
             session.cwd.display()
         ));
     }
@@ -92,13 +94,14 @@ pub fn render_start(result: &SessionStartResponse) -> String {
 pub fn render_session_status(result: &SessionInspectResponse) -> String {
     let session = &result.session;
     format!(
-        "session {} {} role={} name={} monitor={} clients={}\n",
+        "session {} {} role={} name={} monitor={} clients={} owner={}\n",
         session.session_id,
         process_state(&session.process_state),
         role(&session.role),
         session.name.as_deref().unwrap_or("-"),
         session.monitor_profile,
-        session.attached_clients
+        session.attached_clients,
+        input_owner(session)
     )
 }
 
@@ -248,6 +251,12 @@ pub fn render_inspect(result: &SessionInspectResponse) -> String {
     );
     push_field(&mut lines, "cwd", &session.cwd.display().to_string());
     push_field(&mut lines, "monitor", &session.monitor_profile.to_string());
+    push_field(
+        &mut lines,
+        "attached_clients",
+        &session.attached_clients.to_string(),
+    );
+    push_field(&mut lines, "input_owner", input_owner(session));
     if let Some(workspace) = &session.workspace {
         push_field(
             &mut lines,
@@ -293,6 +302,10 @@ fn argv(session: &SessionSummary) -> String {
     } else {
         session.argv.join(" ")
     }
+}
+
+fn input_owner(session: &SessionSummary) -> &str {
+    session.input_owner.as_deref().unwrap_or("-")
 }
 
 fn role(value: &SessionRole) -> String {
@@ -350,6 +363,7 @@ mod tests {
             role: SessionRole::Shell,
             process_state: ProcessState::Running,
             attention_state: AttentionState::Active,
+            failure_message: None,
             workspace: None,
             cwd: PathBuf::from("/tmp"),
             argv: vec!["sh".to_string()],
@@ -357,6 +371,7 @@ mod tests {
             created_at: "2026-05-20T18:00:00Z".to_string(),
             updated_at: "2026-05-20T18:01:00Z".to_string(),
             attached_clients: 0,
+            input_owner: None,
         }
     }
 
@@ -400,6 +415,8 @@ mod tests {
                 pty_log: PathBuf::from("/state/sessions/id/pty.log"),
                 events_jsonl: PathBuf::from("/state/sessions/id/events.jsonl"),
                 scrollback_snapshot: PathBuf::from("/state/sessions/id/scrollback.snapshot"),
+                terminal_snapshot: PathBuf::from("/state/sessions/id/terminal.snapshot.json"),
+                raw_replay_ring: PathBuf::from("/state/sessions/id/pty.replay"),
                 worker_sock: PathBuf::from("/state/sessions/id/worker.sock"),
             },
             session,

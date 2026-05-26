@@ -4,7 +4,9 @@ use crossterm::event::KeyEvent;
 use millrace_sessions_core::{
     ids::{PaneId, SessionId, UiId},
     protocol::SessionSummary,
-    state::{MonitorProfile, UiContext, UiMode},
+    state::{
+        MonitorProfile, ProcessState, UiContext, UiDaemonHealth, UiDaemonRecoveryAction, UiMode,
+    },
     workspace::WorkspaceIdentity,
 };
 use time::OffsetDateTime;
@@ -147,11 +149,7 @@ impl AppModel {
             help_overlay: HelpOverlay::default(),
             command_output: CommandOutput::hidden(),
             host_connection: HostConnectionState::Connected,
-            status_message: if sessions.is_empty() {
-                "no daemons".to_string()
-            } else {
-                "ready".to_string()
-            },
+            status_message: daemon_status_message(&sessions, selected),
         }
     }
 
@@ -221,7 +219,7 @@ impl AppModel {
             help_overlay: HelpOverlay::default(),
             command_output: CommandOutput::hidden(),
             host_connection: HostConnectionState::Connected,
-            status_message: "ready".to_string(),
+            status_message: daemon_status_message(&daemon_sessions, selected),
         }
     }
 
@@ -258,7 +256,11 @@ impl AppModel {
 
     pub fn exit_scroll_mode(&mut self) {
         self.scroll_mode = false;
-        self.jump_active_log_bottom();
+        if self.focused_agent_terminal() {
+            self.set_agent_terminal_following(true);
+        } else {
+            self.jump_active_log_bottom();
+        }
         self.status_message = "live".to_string();
     }
 
@@ -297,11 +299,23 @@ impl AppModel {
     }
 
     pub fn update_agent_terminal(&mut self, snapshot: TerminalSnapshot) {
+        self.update_agent_terminal_view(snapshot, true);
+    }
+
+    pub fn update_agent_terminal_view(&mut self, snapshot: TerminalSnapshot, follow: bool) {
         match &mut self.agent_terminal {
-            Some(terminal) => terminal.set_snapshot(snapshot),
+            Some(terminal) => terminal.set_snapshot_view(snapshot, follow),
             None => {
-                self.agent_terminal = Some(AgentTerminalPane::with_snapshot(snapshot, false, true));
+                let mut terminal = AgentTerminalPane::with_snapshot(snapshot, false, true);
+                terminal.set_following(follow);
+                self.agent_terminal = Some(terminal);
             }
+        }
+    }
+
+    pub fn set_agent_terminal_following(&mut self, follow: bool) {
+        if let Some(terminal) = &mut self.agent_terminal {
+            terminal.set_following(follow);
         }
     }
 
@@ -312,10 +326,27 @@ impl AppModel {
         self.status_message = "agent input read-only".to_string();
     }
 
+    pub fn set_agent_input_owner(&mut self, input_owner: bool) {
+        if let Some(terminal) = &mut self.agent_terminal {
+            terminal.set_input_owner(input_owner);
+        }
+        self.status_message = if input_owner {
+            "agent input owned".to_string()
+        } else {
+            "agent input read-only".to_string()
+        };
+    }
+
     pub fn agent_terminal_can_accept_input(&self) -> bool {
         self.agent_terminal
             .as_ref()
             .is_some_and(|terminal| terminal.input_owner && !terminal.read_only)
+    }
+
+    pub fn agent_terminal_is_following(&self) -> bool {
+        self.agent_terminal
+            .as_ref()
+            .map_or(true, AgentTerminalPane::is_following)
     }
 
     pub fn resize_agent_terminal(&mut self, rows: u16, cols: u16) -> bool {
@@ -415,8 +446,55 @@ impl AppModel {
             }
         }
         self.command_palette.target = self.command_target_label();
-        self.status_message = format!("selected {session_id}");
+        self.status_message =
+            daemon_status_message(&self.daemon_sessions, self.active_daemon_session_id);
         true
+    }
+
+    pub fn replace_daemon_sessions(&mut self, sessions: Vec<SessionSummary>) {
+        let previous = self.active_daemon_session_id;
+        self.daemon_sessions = sessions;
+        self.managed_daemon_session_ids = self
+            .daemon_sessions
+            .iter()
+            .map(|session| session.session_id)
+            .collect();
+        self.active_daemon_session_id = previous
+            .filter(|session_id| {
+                self.daemon_sessions
+                    .iter()
+                    .any(|session| session.session_id == *session_id)
+            })
+            .or_else(|| {
+                self.daemon_sessions
+                    .first()
+                    .map(|session| session.session_id)
+            });
+
+        if let Some(session_id) = self.active_daemon_session_id {
+            if let Some(session) = self
+                .daemon_sessions
+                .iter()
+                .find(|session| session.session_id == session_id)
+            {
+                self.active_workspace = session.workspace.clone();
+                self.monitor_profile = session.monitor_profile.clone();
+            }
+            if let Some(log) = self.daemon_logs.get(&session_id).cloned() {
+                self.line_log = log;
+            }
+            for pane in &mut self.panes {
+                if pane.kind == PaneKind::DaemonMonitor {
+                    pane.session_id = Some(session_id);
+                }
+            }
+        } else {
+            self.active_workspace = None;
+        }
+
+        self.command_palette.target = self.command_target_label();
+        self.status_message =
+            daemon_status_message(&self.daemon_sessions, self.active_daemon_session_id);
     }
 
     pub fn open_daemon_switcher(&mut self) {
@@ -427,7 +505,8 @@ impl AppModel {
 
     pub fn close_daemon_switcher(&mut self) {
         self.daemon_switcher.close();
-        self.status_message = "ready".to_string();
+        self.status_message =
+            daemon_status_message(&self.daemon_sessions, self.active_daemon_session_id);
     }
 
     pub fn move_daemon_switcher_selection(&mut self, delta: isize) -> bool {
@@ -563,7 +642,28 @@ impl AppModel {
             agent_session_id: self.agent_session_id,
             managed_daemon_session_ids: self.managed_daemon_session_ids.clone(),
             monitor_profile: self.monitor_profile.clone(),
+            daemon_health: self
+                .daemon_sessions
+                .iter()
+                .map(daemon_health_from_summary)
+                .collect(),
             updated_at: OffsetDateTime::now_utc(),
+        }
+    }
+
+    pub fn active_view_label(&self) -> &'static str {
+        if self.scroll_mode {
+            "scroll"
+        } else if self.focused_agent_terminal() {
+            if self.agent_terminal_is_following() {
+                "live"
+            } else {
+                "paused"
+            }
+        } else if self.line_log.is_following() {
+            "live"
+        } else {
+            "paused"
         }
     }
 
@@ -581,13 +681,13 @@ impl AppModel {
             }
             KeyAction::ToggleHelp => self.help_overlay.open = !self.help_overlay.open,
             KeyAction::Redraw => self.status_message = "redraw".to_string(),
-            KeyAction::ScrollUp => self.scroll_active_log_up(viewport_height, 1),
-            KeyAction::ScrollDown => self.scroll_active_log_down(1),
-            KeyAction::PageUp => self.page_active_log_up(viewport_height),
-            KeyAction::PageDown => self.page_active_log_down(viewport_height),
-            KeyAction::JumpTop => self.jump_active_log_top(viewport_height),
+            KeyAction::ScrollUp => self.scroll_active_view_up(viewport_height, 1),
+            KeyAction::ScrollDown => self.scroll_active_view_down(1),
+            KeyAction::PageUp => self.page_active_view_up(viewport_height),
+            KeyAction::PageDown => self.page_active_view_down(viewport_height),
+            KeyAction::JumpTop => self.jump_active_view_top(viewport_height),
             KeyAction::JumpBottom => {
-                self.jump_active_log_bottom();
+                self.jump_active_view_bottom();
                 self.scroll_mode = false;
             }
             KeyAction::Escape => self.exit_scroll_mode(),
@@ -600,6 +700,54 @@ impl AppModel {
             | KeyAction::Input(_)
             | KeyAction::Ignored => {}
         }
+    }
+
+    fn scroll_active_view_up(&mut self, viewport_height: u16, lines: usize) {
+        if self.focused_agent_terminal() {
+            self.set_agent_terminal_following(false);
+            return;
+        }
+        self.scroll_active_log_up(viewport_height, lines);
+    }
+
+    fn scroll_active_view_down(&mut self, lines: usize) {
+        if self.focused_agent_terminal() {
+            self.set_agent_terminal_following(false);
+            return;
+        }
+        self.scroll_active_log_down(lines);
+    }
+
+    fn page_active_view_up(&mut self, viewport_height: u16) {
+        if self.focused_agent_terminal() {
+            self.set_agent_terminal_following(false);
+            return;
+        }
+        self.page_active_log_up(viewport_height);
+    }
+
+    fn page_active_view_down(&mut self, viewport_height: u16) {
+        if self.focused_agent_terminal() {
+            self.set_agent_terminal_following(false);
+            return;
+        }
+        self.page_active_log_down(viewport_height);
+    }
+
+    fn jump_active_view_top(&mut self, viewport_height: u16) {
+        if self.focused_agent_terminal() {
+            self.set_agent_terminal_following(false);
+            return;
+        }
+        self.jump_active_log_top(viewport_height);
+    }
+
+    fn jump_active_view_bottom(&mut self) {
+        if self.focused_agent_terminal() {
+            self.set_agent_terminal_following(true);
+            return;
+        }
+        self.jump_active_log_bottom();
     }
 
     fn scroll_active_log_up(&mut self, viewport_height: u16, lines: usize) {
@@ -739,6 +887,88 @@ fn command_target_label_for(session: Option<&SessionSummary>) -> String {
     }
 }
 
+fn daemon_status_message(sessions: &[SessionSummary], selected: Option<SessionId>) -> String {
+    if sessions.is_empty() {
+        return "no daemons".to_string();
+    }
+
+    if let Some(session) = selected.and_then(|session_id| find_session(sessions, session_id)) {
+        if !daemon_state_is_healthy(&session.process_state) {
+            return format!("degraded {}", process_state_label(&session.process_state));
+        }
+    }
+
+    let degraded_count = sessions
+        .iter()
+        .filter(|session| !daemon_state_is_healthy(&session.process_state))
+        .count();
+    if degraded_count == 0 {
+        "ready".to_string()
+    } else {
+        format!("degraded daemons={degraded_count}")
+    }
+}
+
+fn daemon_health_from_summary(session: &SessionSummary) -> UiDaemonHealth {
+    UiDaemonHealth {
+        session_id: session.session_id,
+        process_state: session.process_state.clone(),
+        attention_state: session.attention_state.clone(),
+        failure_message: session.failure_message.clone(),
+        recovery_actions: daemon_recovery_actions(&session.process_state),
+    }
+}
+
+fn daemon_state_is_healthy(state: &ProcessState) -> bool {
+    matches!(state, ProcessState::Starting | ProcessState::Running)
+}
+
+fn daemon_recovery_actions(state: &ProcessState) -> Vec<UiDaemonRecoveryAction> {
+    match state {
+        ProcessState::Starting | ProcessState::Running => vec![
+            UiDaemonRecoveryAction::Inspect,
+            UiDaemonRecoveryAction::Logs,
+            UiDaemonRecoveryAction::Stop,
+            UiDaemonRecoveryAction::Kill,
+        ],
+        ProcessState::FailedStart => vec![
+            UiDaemonRecoveryAction::Inspect,
+            UiDaemonRecoveryAction::Logs,
+            UiDaemonRecoveryAction::Doctor,
+            UiDaemonRecoveryAction::Delete,
+        ],
+        ProcessState::Exited | ProcessState::Killed => vec![
+            UiDaemonRecoveryAction::Inspect,
+            UiDaemonRecoveryAction::Logs,
+            UiDaemonRecoveryAction::Archive,
+            UiDaemonRecoveryAction::Delete,
+        ],
+        ProcessState::Crashed | ProcessState::Failed | ProcessState::Lost | ProcessState::Stale => {
+            vec![
+                UiDaemonRecoveryAction::Inspect,
+                UiDaemonRecoveryAction::Logs,
+                UiDaemonRecoveryAction::Doctor,
+                UiDaemonRecoveryAction::Archive,
+                UiDaemonRecoveryAction::Delete,
+            ]
+        }
+    }
+}
+
+fn process_state_label(state: &ProcessState) -> &'static str {
+    match state {
+        ProcessState::Starting => "starting",
+        ProcessState::Running => "running",
+        ProcessState::Exited => "exited",
+        ProcessState::Crashed => "crashed",
+        ProcessState::Killed => "killed",
+        ProcessState::FailedStart => "failed_start",
+        ProcessState::Failed => "failed",
+        ProcessState::Lost => "lost",
+        ProcessState::Stale => "stale",
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HostConnectionState {
     Connected,
@@ -761,7 +991,9 @@ impl HostConnectionState {
 #[cfg(test)]
 mod tests {
     use crossterm::event::{KeyCode, KeyModifiers};
-    use millrace_sessions_core::state::{AttentionState, ProcessState, SessionRole};
+    use millrace_sessions_core::state::{
+        AttentionState, ProcessState, SessionRole, UiDaemonRecoveryAction,
+    };
 
     use super::*;
 
@@ -878,6 +1110,54 @@ mod tests {
         assert_eq!(context.mode, UiMode::AgentCockpit);
         assert_eq!(context.agent_session_id, Some(agent_id));
         assert_eq!(context.active_daemon_session_id, Some(daemon_id));
+        assert_eq!(
+            context.daemon_health[0].process_state,
+            ProcessState::Running
+        );
+    }
+
+    #[test]
+    fn app_context_and_status_surface_degraded_daemon_states() {
+        let mut failed_start = summary("failed");
+        failed_start.process_state = ProcessState::FailedStart;
+        failed_start.attention_state = AttentionState::NeedsAttention;
+        failed_start.failure_message = Some("failed to spawn pty child".to_string());
+        let mut exited = summary("exited");
+        exited.process_state = ProcessState::Exited;
+        let mut killed = summary("killed");
+        killed.process_state = ProcessState::Killed;
+        let mut stale = summary("stale");
+        stale.process_state = ProcessState::Stale;
+        let failed_id = failed_start.session_id;
+
+        let app = AppModel::daemon_console(
+            UiId::new(),
+            vec![failed_start, exited, killed, stale],
+            Some(failed_id),
+            BTreeMap::new(),
+            DaemonConsoleLayout::List,
+            MonitorProfile::Basic,
+        );
+
+        assert_eq!(app.status_message, "degraded failed_start");
+        let context = app.ui_context();
+        let states = context
+            .daemon_health
+            .iter()
+            .map(|daemon| daemon.process_state.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            states,
+            vec![
+                ProcessState::FailedStart,
+                ProcessState::Exited,
+                ProcessState::Killed,
+                ProcessState::Stale,
+            ]
+        );
+        assert!(context.daemon_health[0]
+            .recovery_actions
+            .contains(&UiDaemonRecoveryAction::Doctor));
     }
 
     #[test]
@@ -904,6 +1184,29 @@ mod tests {
     }
 
     #[test]
+    fn agent_cockpit_can_recover_input_ownership_after_read_only_attach() {
+        let daemon = summary("daemon");
+        let mut agent = summary("agent");
+        agent.role = SessionRole::Agent;
+        let mut app = AppModel::agent_cockpit(
+            UiId::new(),
+            agent,
+            vec![daemon],
+            None,
+            BTreeMap::new(),
+            AgentTerminalPane::new(10, 40, false, true),
+            AgentCockpitLayout::Right,
+            MonitorProfile::Basic,
+        );
+
+        assert!(!app.agent_terminal_can_accept_input());
+        app.set_agent_input_owner(true);
+
+        assert!(app.agent_terminal_can_accept_input());
+        assert_eq!(app.status_message, "agent input owned");
+    }
+
+    #[test]
     fn agent_cockpit_resize_calculates_agent_pane_size() {
         let daemon = summary("daemon");
         let mut agent = summary("agent");
@@ -922,6 +1225,50 @@ mod tests {
         assert_eq!(app.agent_terminal_size_for(120, 30), Some((28, 84)));
         assert!(app.resize_agent_terminal(28, 84));
         assert!(!app.resize_agent_terminal(28, 84));
+    }
+
+    #[test]
+    fn agent_cockpit_scroll_keys_pause_agent_view_without_scrolling_daemon_log() {
+        let daemon = summary("daemon");
+        let daemon_id = daemon.session_id;
+        let mut agent = summary("agent");
+        agent.role = SessionRole::Agent;
+        let mut app = AppModel::agent_cockpit(
+            UiId::new(),
+            agent,
+            vec![daemon],
+            Some(daemon_id),
+            BTreeMap::from([(
+                daemon_id,
+                vec!["daemon one".to_string(), "daemon two".to_string()],
+            )]),
+            AgentTerminalPane::new(10, 40, true, false),
+            AgentCockpitLayout::Right,
+            MonitorProfile::Basic,
+        );
+
+        assert!(app.line_log.is_following());
+        assert_eq!(
+            app.handle_key(KeyEvent::new(KeyCode::Char(']'), KeyModifiers::CONTROL), 2),
+            KeyAction::Prefix
+        );
+        assert_eq!(
+            app.handle_key(KeyEvent::new(KeyCode::Char('['), KeyModifiers::NONE), 2),
+            KeyAction::EnterScrollMode
+        );
+        assert_eq!(
+            app.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE), 2),
+            KeyAction::ScrollUp
+        );
+
+        assert!(app.line_log.is_following());
+        assert!(app.agent_terminal.as_ref().unwrap().is_scrolled());
+
+        assert_eq!(
+            app.handle_key(KeyEvent::new(KeyCode::End, KeyModifiers::NONE), 2),
+            KeyAction::JumpBottom
+        );
+        assert!(app.agent_terminal.as_ref().unwrap().is_following());
     }
 
     #[test]
@@ -972,6 +1319,7 @@ mod tests {
             role: SessionRole::MillraceDaemon,
             process_state: ProcessState::Running,
             attention_state: AttentionState::MillraceIdle,
+            failure_message: None,
             workspace: Some(WorkspaceIdentity {
                 canonical_path: cwd.clone(),
                 unix_device: None,
@@ -987,6 +1335,7 @@ mod tests {
             created_at: "2026-05-26T00:00:00Z".to_string(),
             updated_at: "2026-05-26T00:00:01Z".to_string(),
             attached_clients: 0,
+            input_owner: None,
         }
     }
 }

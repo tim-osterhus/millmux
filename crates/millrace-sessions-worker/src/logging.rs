@@ -1,23 +1,32 @@
-use std::{collections::BTreeMap, fs, path::PathBuf};
+use std::{
+    collections::BTreeMap,
+    fs,
+    path::PathBuf,
+    sync::{Arc, Mutex},
+};
 
 use millrace_sessions_core::{
-    error::MillmuxResult,
+    error::{MillmuxError, MillmuxResult},
     events::{append_event, SessionEvent, SessionEventKind},
     ids::SessionId,
-    scrollback::ScrollbackBuffer,
+    scrollback::{ScrollbackBuffer, TerminalStateBuffer},
     storage::append_raw_pty_log,
 };
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+pub type SharedTerminalState = Arc<Mutex<TerminalStateBuffer>>;
+
+#[derive(Clone)]
 pub struct OutputLoggerConfig {
     pub session_id: SessionId,
     pub pty_log: PathBuf,
     pub events_jsonl: PathBuf,
     pub scrollback_snapshot: PathBuf,
+    pub terminal_snapshot: PathBuf,
+    pub raw_replay_ring: PathBuf,
+    pub terminal_state: SharedTerminalState,
     pub scrollback_capacity: usize,
 }
 
-#[derive(Debug)]
 pub struct OutputLogger {
     config: OutputLoggerConfig,
     scrollback: ScrollbackBuffer,
@@ -44,6 +53,7 @@ impl OutputLogger {
             return Ok(());
         }
         append_raw_pty_log(&self.config.pty_log, bytes)?;
+        self.record_terminal_output(bytes)?;
         self.pending_line.extend_from_slice(bytes);
 
         while let Some(index) = self.pending_line.iter().position(|byte| *byte == b'\n') {
@@ -67,8 +77,19 @@ impl OutputLogger {
         } else if !self.config.scrollback_snapshot.exists() {
             self.scrollback
                 .persist_snapshot(&self.config.scrollback_snapshot)?;
+            self.persist_terminal_state()?;
         }
         Ok(())
+    }
+
+    pub fn record_resize(&mut self, rows: u16, cols: u16) -> MillmuxResult<()> {
+        let mut terminal_state = self
+            .config
+            .terminal_state
+            .lock()
+            .map_err(|_| MillmuxError::Internal("terminal state lock poisoned".to_string()))?;
+        terminal_state.resize(rows, cols);
+        terminal_state.persist(&self.config.terminal_snapshot, &self.config.raw_replay_ring)
     }
 
     fn record_structured_line(&mut self, line: &[u8]) -> MillmuxResult<()> {
@@ -81,6 +102,25 @@ impl OutputLogger {
         self.scrollback
             .persist_snapshot(&self.config.scrollback_snapshot)?;
         Ok(())
+    }
+
+    fn record_terminal_output(&self, bytes: &[u8]) -> MillmuxResult<()> {
+        let mut terminal_state = self
+            .config
+            .terminal_state
+            .lock()
+            .map_err(|_| MillmuxError::Internal("terminal state lock poisoned".to_string()))?;
+        terminal_state.process_output(bytes);
+        terminal_state.persist(&self.config.terminal_snapshot, &self.config.raw_replay_ring)
+    }
+
+    fn persist_terminal_state(&self) -> MillmuxResult<()> {
+        let terminal_state = self
+            .config
+            .terminal_state
+            .lock()
+            .map_err(|_| MillmuxError::Internal("terminal state lock poisoned".to_string()))?;
+        terminal_state.persist(&self.config.terminal_snapshot, &self.config.raw_replay_ring)
     }
 }
 

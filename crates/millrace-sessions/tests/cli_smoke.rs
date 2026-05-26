@@ -1,10 +1,17 @@
 use std::{
-    env, ffi::OsString, fs, os::unix::fs::PermissionsExt, path::Path, process::Command, thread,
-    time::Duration,
+    collections::BTreeMap, env, ffi::OsString, fs, os::unix::fs::PermissionsExt, path::Path,
+    process::Command, thread, time::Duration,
 };
 
 use assert_cmd::prelude::*;
-use millrace_sessions_core::{ids::UiId, paths::StatePaths, storage::write_json_atomic};
+use millrace_sessions_core::{
+    events::{append_event, SessionEvent, SessionEventKind},
+    ids::{SessionId, UiId},
+    paths::StatePaths,
+    scrollback::ScrollbackBuffer,
+    state::{AttentionState, MonitorProfile, ProcessState, SessionMeta, SessionRole},
+    storage::{append_raw_pty_log, write_json_atomic},
+};
 use nix::{
     sys::signal::{kill, Signal},
     unistd::Pid,
@@ -75,6 +82,81 @@ fn host_bin_override() -> Option<std::path::PathBuf> {
     Some(workspace_root.join(path))
 }
 
+fn assert_short_reader_pipeline(host: &TempHost, args: &[&str]) {
+    let millmux_bin = Command::cargo_bin("millmux")
+        .expect("millmux binary")
+        .get_program()
+        .to_os_string();
+    let script = format!("\"$MILLMUX_BIN\" {} | head -c 0 >/dev/null", args.join(" "));
+    let mut command = Command::new("bash");
+    command
+        .arg("-o")
+        .arg("pipefail")
+        .arg("-c")
+        .arg(&script)
+        .env("MILLMUX_BIN", millmux_bin)
+        .env("MILLMUX_STATE_DIR", host.state_dir());
+    if let Some(host_bin) = host_bin_override() {
+        command.env("MILLMUX_HOST_BIN", host_bin);
+    }
+
+    let output = command.output().expect("run short-reader pipeline");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "pipeline failed for `{script}` with status {:?}\nstderr:\n{stderr}",
+        output.status.code()
+    );
+    assert!(
+        !stderr.contains("panicked"),
+        "pipeline should not panic for `{script}`\nstderr:\n{stderr}"
+    );
+}
+
+fn seed_large_output_session(host: &TempHost) -> String {
+    let paths = StatePaths::new(host.state_dir().to_path_buf());
+    let session_id = SessionId::new();
+    let session_paths = paths.session_paths(session_id);
+    let large_text = "pipe-doctor-output ".repeat(70_000);
+    let meta = SessionMeta {
+        id: session_id,
+        name: Some(format!("pipe-doctor-{large_text}")),
+        role: SessionRole::Agent,
+        process_state: ProcessState::Exited,
+        attention_state: AttentionState::Active,
+        workspace: None,
+        cwd: host.state_dir().to_path_buf(),
+        argv: vec!["fixture-agent".to_string(), large_text.clone()],
+        monitor_profile: MonitorProfile::Auto,
+        env: BTreeMap::new(),
+        worker_pid: None,
+        child_pid: None,
+        child_pgid: None,
+        started_at: None,
+        ended_at: Some("2026-05-26T18:00:00Z".to_string()),
+        exit_code: Some(0),
+        exit_signal: None,
+        failure_message: None,
+        created_at: "2026-05-26T18:00:00Z".to_string(),
+        updated_at: "2026-05-26T18:00:01Z".to_string(),
+    };
+    write_json_atomic(&session_paths.meta_json, &meta).expect("seed large session meta");
+    append_raw_pty_log(&session_paths.pty_log, large_text.as_bytes()).expect("seed large pty log");
+    append_raw_pty_log(&session_paths.pty_log, b"\n").expect("terminate large pty log");
+
+    let mut event = SessionEvent::new(session_id, SessionEventKind::Output);
+    event.message = Some(large_text.clone());
+    append_event(&session_paths.events_jsonl, &event).expect("seed large event");
+
+    let mut scrollback = ScrollbackBuffer::new(2);
+    scrollback.push_line(large_text);
+    scrollback
+        .persist_snapshot(&session_paths.scrollback_snapshot)
+        .expect("seed large scrollback");
+
+    session_id.to_string()
+}
+
 #[test]
 fn cli_smoke_list_json_autostarts_host_and_prints_raw_result() {
     let host = TempHost::new();
@@ -142,6 +224,23 @@ fn cli_smoke_concurrent_list_json_calls_share_autostarted_host() {
         assert_eq!(value["sessions"], Value::Array(Vec::new()));
         assert!(value.get("ok").is_none());
     }
+}
+
+#[test]
+fn cli_smoke_short_reader_pipelines_exit_cleanly_for_json_and_line_outputs() {
+    let host = TempHost::new();
+    millmux_command(&host)
+        .args(["list", "--json"])
+        .assert()
+        .success();
+    let session_id = seed_large_output_session(&host);
+
+    assert_short_reader_pipeline(&host, &["list"]);
+    assert_short_reader_pipeline(&host, &["list", "--json"]);
+    assert_short_reader_pipeline(&host, &["status", "--json", &session_id]);
+    assert_short_reader_pipeline(&host, &["inspect", &session_id]);
+    assert_short_reader_pipeline(&host, &["logs", &session_id]);
+    assert_short_reader_pipeline(&host, &["events", "--json", &session_id]);
 }
 
 #[test]
@@ -446,6 +545,267 @@ exit 1
     );
 }
 
+#[test]
+fn cli_smoke_cockpit_once_waits_for_agent_seed_while_daemon_refreshes() {
+    let host = TempHost::new();
+    let temp = tempfile::tempdir().expect("workspace root");
+    let workspace = temp.path().join("workspace");
+    fs::create_dir_all(&workspace).unwrap();
+    let path_env = fake_millrace_path(
+        temp.path(),
+        r#"if [ "$1" = "status" ]; then
+  printf '{"process_running":false}\n'
+  exit 0
+fi
+if [ "$1" = "run" ] && [ "$2" = "daemon" ]; then
+  printf 'daemon concurrent tick 1\n'
+  sleep 0.2
+  printf 'daemon concurrent tick 2\n'
+  sleep 0.2
+  printf 'daemon concurrent tick 3 current\n'
+  sleep 5
+  exit 0
+fi
+printf 'unexpected fake millrace args: %s\n' "$*" >&2
+exit 1
+"#,
+    );
+
+    let output = millmux_command(&host)
+        .env("PATH", &path_env)
+        .args(["cockpit", "--workspace"])
+        .arg(&workspace)
+        .args([
+            "--monitor",
+            "raw",
+            "--once",
+            "--agent",
+            "fixture-agent",
+            "--agent-argv",
+            "--",
+            "sh",
+            "-c",
+            "sleep 1; printf 'agent concurrent current\\n'; sleep 5",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let text = String::from_utf8_lossy(&output);
+
+    assert!(text.contains("Agent Terminal"), "{text}");
+    assert!(text.contains("agent concurrent current"), "{text}");
+    assert!(
+        text.contains("Daemon Monitor | mon=raw | follow=live"),
+        "{text}"
+    );
+    assert!(text.contains("daemon concurrent tick 3 current"), "{text}");
+    assert!(!text.contains("agent terminal initializing"), "{text}");
+}
+
+#[test]
+fn cli_smoke_cockpit_snapshot_ignores_legacy_agent_line_scrollback() {
+    let host = TempHost::new();
+    let temp = tempfile::tempdir().expect("workspace root");
+    let workspace = temp.path().join("workspace");
+    fs::create_dir_all(&workspace).unwrap();
+    start_daemon(
+        &host,
+        &workspace,
+        "printf 'daemon ready\\n'; while true; do sleep 1; done",
+    );
+    let agent_script = full_screen_agent_script();
+    let agent_id = start_agent_with_argv(&host, &workspace, "/bin/sh", agent_script);
+    let agent_paths = host.state_dir().join("sessions").join(&agent_id);
+    wait_for_file_contains(&agent_paths.join("pty.log"), "answer two chunk 3");
+
+    let mut legacy_scrollback = ScrollbackBuffer::new(10);
+    legacy_scrollback.push_line("LEGACY_LINE_SCROLLBACK_SHOULD_NOT_RENDER");
+    legacy_scrollback.push_line("\x1b[?1049h\x1b[2JSTALE_ALTERNATE_FRAME");
+    legacy_scrollback
+        .persist_snapshot(agent_paths.join("scrollback.snapshot"))
+        .unwrap();
+
+    let output = millmux_command(&host)
+        .args(["cockpit", "--workspace"])
+        .arg(&workspace)
+        .args([
+            "--no-start",
+            "--once",
+            "--agent",
+            "fixture-agent",
+            "--agent-argv",
+            "--",
+            "/bin/sh",
+            "-c",
+            agent_script,
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let text = String::from_utf8_lossy(&output);
+
+    assert!(text.contains("Agent Terminal"), "{text}");
+    assert!(text.contains("question one"), "{text}");
+    assert!(text.contains("question two"), "{text}");
+    assert!(text.contains("answer two chunk 3"), "{text}");
+    assert!(
+        !text.contains("LEGACY_LINE_SCROLLBACK_SHOULD_NOT_RENDER"),
+        "{text}"
+    );
+    assert!(!text.contains("STALE_ALTERNATE_FRAME"), "{text}");
+}
+
+#[test]
+fn cli_smoke_cockpit_autostart_uses_client_path_when_host_has_stale_path() {
+    let host = TempHost::new();
+    let temp = tempfile::tempdir().expect("workspace root");
+    let workspace = temp.path().join("workspace");
+    fs::create_dir_all(&workspace).unwrap();
+    let stale_path = path_without_millrace(temp.path());
+
+    millmux_command(&host)
+        .env("PATH", &stale_path)
+        .args(["list", "--json"])
+        .assert()
+        .success();
+
+    let path_env = fake_millrace_path(
+        temp.path(),
+        r#"if [ "$1" = "status" ]; then
+  printf '{"process_running":false}\n'
+  exit 0
+fi
+if [ "$1" = "run" ] && [ "$2" = "daemon" ]; then
+  printf 'stale-path daemon ready\n'
+  sleep 5
+  exit 0
+fi
+printf 'unexpected fake millrace args: %s\n' "$*" >&2
+exit 1
+"#,
+    );
+    let fake_millrace = temp.path().join("fake-bin").join("millrace");
+
+    let output = millmux_command(&host)
+        .env("PATH", &path_env)
+        .args(["cockpit", "--workspace"])
+        .arg(&workspace)
+        .args([
+            "--monitor",
+            "basic",
+            "--once",
+            "--agent",
+            "fixture-agent",
+            "--agent-argv",
+            "--",
+            "/bin/sh",
+            "-c",
+            "printf 'agent ready\\n'; sleep 5",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let text = String::from_utf8_lossy(&output);
+    assert!(text.contains("Agent Terminal"), "{text}");
+    assert!(text.contains("Daemon Monitor"), "{text}");
+
+    let sessions = daemon_sessions(&host, &workspace);
+    let daemon = sessions
+        .iter()
+        .find(|session| {
+            matches!(
+                session["process_state"].as_str(),
+                Some("starting" | "running")
+            )
+        })
+        .unwrap_or_else(|| panic!("missing active daemon session: {sessions:#?}"));
+    let fake_millrace = fake_millrace.to_string_lossy().to_string();
+    assert_eq!(
+        daemon["argv"][0].as_str(),
+        Some(fake_millrace.as_str()),
+        "{daemon:#?}"
+    );
+}
+
+#[test]
+fn cli_smoke_cockpit_autostart_failure_preserves_daemon_artifacts() {
+    let host = TempHost::new();
+    let temp = tempfile::tempdir().expect("workspace root");
+    let workspace = temp.path().join("workspace");
+    fs::create_dir_all(&workspace).unwrap();
+    let path_env = fake_millrace_path(
+        temp.path(),
+        r#"if [ "$1" = "status" ]; then
+  printf '{"process_running":false}\n'
+  exit 0
+fi
+if [ "$1" = "run" ] && [ "$2" = "daemon" ]; then
+  printf 'daemon auto-start failed before ready\n' >&2
+  exit 42
+fi
+printf 'unexpected fake millrace args: %s\n' "$*" >&2
+exit 1
+"#,
+    );
+
+    let output = millmux_command(&host)
+        .env("PATH", &path_env)
+        .args(["cockpit", "--workspace"])
+        .arg(&workspace)
+        .args([
+            "--monitor",
+            "basic",
+            "--once",
+            "--agent",
+            "fixture-agent",
+            "--agent-argv",
+            "--",
+            "/bin/sh",
+            "-c",
+            "printf 'agent ready\\n'; sleep 5",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let text = String::from_utf8_lossy(&output);
+    assert!(text.contains("Agent Terminal"), "{text}");
+    assert!(text.contains("Daemon Monitor"), "{text}");
+
+    let sessions = daemon_sessions(&host, &workspace);
+    let daemon_id = sessions
+        .iter()
+        .find(|session| {
+            session["argv"]
+                .as_array()
+                .is_some_and(|argv| argv.iter().any(|value| value.as_str() == Some("daemon")))
+        })
+        .and_then(|session| session["session_id"].as_str())
+        .unwrap_or_else(|| panic!("missing auto-started daemon session: {sessions:#?}"))
+        .to_string();
+    wait_for_session_state(&host, &daemon_id, "exited");
+
+    let status = session_status(&host, &daemon_id);
+    assert_eq!(status["session"]["process_state"], "exited", "{status:#?}");
+    assert_eq!(status["worker"]["exit_code"], 42, "{status:#?}");
+
+    let daemon_paths = host.state_dir().join("sessions").join(&daemon_id);
+    wait_for_file_contains(
+        &daemon_paths.join("pty.log"),
+        "daemon auto-start failed before ready",
+    );
+    let events = fs::read_to_string(daemon_paths.join("events.jsonl")).unwrap();
+    assert!(events.contains("\"kind\":\"process_exited\""), "{events}");
+    assert!(events.contains("\"exit_code\":\"42\""), "{events}");
+}
+
 fn seed_context(host: &TempHost, ui_id: UiId, mode: &str, updated_at: &str) {
     let paths = StatePaths::new(host.state_dir().to_path_buf());
     let ui_paths = paths.ui_context_paths(ui_id);
@@ -507,9 +867,36 @@ fn start_daemon_command(mut command: Command, workspace: &Path, script: &str) ->
         .to_string()
 }
 
+fn start_agent_with_argv(host: &TempHost, workspace: &Path, command: &str, script: &str) -> String {
+    let output = millmux_command(host)
+        .args([
+            "start",
+            "--json",
+            "--name",
+            "fixture-agent",
+            "--role",
+            "agent",
+        ])
+        .args(["--workspace"])
+        .arg(workspace)
+        .args(["--cwd"])
+        .arg(workspace)
+        .args(["--", command, "-c", script])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let value: Value = serde_json::from_slice(&output).expect("start agent json");
+    value["session"]["session_id"]
+        .as_str()
+        .expect("session id")
+        .to_string()
+}
+
 fn wait_for_session_state(host: &TempHost, session_id: &str, expected: &str) {
     for _ in 0..60 {
-        if session_state(host, session_id).as_deref() == Some(expected) {
+        if session_status(host, session_id)["session"]["process_state"].as_str() == Some(expected) {
             return;
         }
         thread::sleep(Duration::from_millis(50));
@@ -517,7 +904,7 @@ fn wait_for_session_state(host: &TempHost, session_id: &str, expected: &str) {
     panic!("{session_id} did not reach {expected}");
 }
 
-fn session_state(host: &TempHost, session_id: &str) -> Option<String> {
+fn session_status(host: &TempHost, session_id: &str) -> Value {
     let output = millmux_command(host)
         .args(["status", "--json", session_id])
         .assert()
@@ -525,10 +912,7 @@ fn session_state(host: &TempHost, session_id: &str) -> Option<String> {
         .get_output()
         .stdout
         .clone();
-    let value: Value = serde_json::from_slice(&output).expect("status json");
-    value["session"]["process_state"]
-        .as_str()
-        .map(str::to_string)
+    serde_json::from_slice(&output).expect("status json")
 }
 
 fn daemon_sessions(host: &TempHost, workspace: &Path) -> Vec<Value> {
@@ -558,10 +942,46 @@ fn fake_millrace_path(root: &Path, script: &str) -> OsString {
     prepend_path(&bin)
 }
 
+fn path_without_millrace(root: &Path) -> OsString {
+    let bin = root.join("empty-bin");
+    fs::create_dir_all(&bin).unwrap();
+    env::join_paths([bin]).unwrap()
+}
+
 fn prepend_path(dir: &Path) -> OsString {
     let mut paths = vec![dir.to_path_buf()];
     if let Some(existing) = env::var_os("PATH") {
         paths.extend(env::split_paths(&existing));
     }
     env::join_paths(paths).unwrap()
+}
+
+fn wait_for_file_contains(path: &Path, needle: &str) {
+    for _ in 0..200 {
+        if fs::read_to_string(path)
+            .map(|raw| raw.contains(needle))
+            .unwrap_or(false)
+        {
+            return;
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
+    panic!("{} did not contain {needle:?}", path.display());
+}
+
+fn full_screen_agent_script() -> &'static str {
+    r#"printf 'fixture-agent ready\r\n'
+printf '\033[?1049h\033[?2026h\033[2J\033[3J\033[H'
+printf 'question one\r\n'
+printf '\033[4;9Hanswer one complete\r\n'
+printf '\033[2Kanswer two chunk 1'
+printf '\ranswer two chunk 2'
+printf '\ranswer two chunk 3\r\n'
+printf '\033[?2026l\033[?1049l\033[2J\033[H'
+printf 'question one\r\n'
+printf 'answer one complete\r\n'
+printf 'question two\r\n'
+printf 'answer two chunk 3\r\n'
+sleep 5
+"#
 }

@@ -178,6 +178,87 @@ exit 0
     );
 }
 
+#[test]
+fn cockpit_autostart_failure_renders_degraded_state_from_client_path() {
+    let host = TempHost::new();
+    let temp = tempfile::tempdir().expect("workspace root");
+    let workspace = temp.path().join("workspace");
+    fs::create_dir_all(&workspace).unwrap();
+    let stale_path = path_without_millrace(temp.path());
+
+    millmux_command(&host)
+        .env("PATH", &stale_path)
+        .args(["list", "--json"])
+        .assert()
+        .success();
+
+    let path_env = fake_millrace_path(
+        temp.path(),
+        r#"if [ "$1" = "status" ]; then
+  printf '{"process_running":false}\n'
+  exit 0
+fi
+if [ "$1" = "run" ] && [ "$2" = "daemon" ]; then
+  printf 'daemon auto-start failed before ready\n' >&2
+  exit 42
+fi
+printf 'unexpected fake millrace args: %s\n' "$*" >&2
+exit 1
+"#,
+    );
+    let fake_millrace = temp.path().join("fake-bin").join("millrace");
+
+    let output = millmux_command(&host)
+        .env("PATH", &path_env)
+        .args(["cockpit", "--workspace"])
+        .arg(&workspace)
+        .args([
+            "--monitor",
+            "basic",
+            "--once",
+            "--agent",
+            "fixture-agent",
+            "--agent-argv",
+            "--",
+            "/bin/sh",
+            "-c",
+            "printf 'agent ready\\n'; sleep 5",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let text = String::from_utf8_lossy(&output);
+    assert!(text.contains("Daemon Monitor | state=exited"), "{text}");
+    assert!(
+        text.contains("daemon auto-start failed before ready"),
+        "{text}"
+    );
+    assert!(
+        text.contains("recovery: inspect logs archive delete"),
+        "{text}"
+    );
+    assert!(text.contains("status=degraded exited"), "{text}");
+    assert!(!text.contains("status=ready"), "{text}");
+
+    let sessions = daemon_sessions(&host, &workspace);
+    let daemon = sessions
+        .iter()
+        .find(|session| {
+            session["argv"]
+                .as_array()
+                .is_some_and(|argv| argv.iter().any(|value| value.as_str() == Some("daemon")))
+        })
+        .unwrap_or_else(|| panic!("missing auto-started daemon session: {sessions:#?}"));
+    let fake_millrace = fake_millrace.to_string_lossy().to_string();
+    assert_eq!(
+        daemon["argv"][0].as_str(),
+        Some(fake_millrace.as_str()),
+        "{daemon:#?}"
+    );
+}
+
 fn start_role(
     host: &TempHost,
     path_env: &OsString,
@@ -206,6 +287,22 @@ fn active_session_count(host: &TempHost) -> usize {
         .unwrap_or(0)
 }
 
+fn daemon_sessions(host: &TempHost, workspace: &Path) -> Vec<Value> {
+    let output = millmux_command(host)
+        .args(["list", "--json", "--role", "millrace-daemon", "--workspace"])
+        .arg(workspace)
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let value: Value = serde_json::from_slice(&output).expect("list json");
+    value["sessions"]
+        .as_array()
+        .expect("sessions array")
+        .clone()
+}
+
 fn millmux_command(host: &TempHost) -> Command {
     let mut command = Command::cargo_bin("millmux").expect("millmux binary");
     command.env("MILLMUX_STATE_DIR", host.state_dir());
@@ -229,6 +326,12 @@ fn fake_millrace_path(root: &Path, script: &str) -> OsString {
     permissions.set_mode(0o755);
     fs::set_permissions(&millrace, permissions).unwrap();
     prepend_path(&bin)
+}
+
+fn path_without_millrace(root: &Path) -> OsString {
+    let bin = root.join("empty-bin");
+    fs::create_dir_all(&bin).unwrap();
+    env::join_paths([bin]).unwrap()
 }
 
 fn prepend_path(dir: &Path) -> OsString {

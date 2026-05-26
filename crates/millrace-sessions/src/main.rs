@@ -20,6 +20,9 @@ use thiserror::Error;
 #[tokio::main]
 async fn main() {
     if let Err(error) = run().await {
+        if error.is_broken_pipe() {
+            return;
+        }
         eprintln!("millmux: {error}");
         std::process::exit(1);
     }
@@ -52,40 +55,31 @@ async fn run() -> Result<(), MillmuxCliError> {
                     millrace_sessions_host::doctor::run_doctor(&paths, None, &request)?
                 }
             };
-            print!(
-                "{}",
-                if args.json {
-                    output::render_json(&result)?
-                } else {
-                    output::render_doctor(&result)
-                }
-            );
+            write_stdout(if args.json {
+                output::render_json(&result)?
+            } else {
+                output::render_doctor(&result)
+            })?;
             return Ok(());
         }
         CliCommand::Start(args) => {
             let client = ready_client().await?;
             let request = args.request()?;
             let result = client.start(&request).await?;
-            print!(
-                "{}",
-                if args.json {
-                    output::render_json(&result)?
-                } else {
-                    output::render_start(&result)
-                }
-            );
+            write_stdout(if args.json {
+                output::render_json(&result)?
+            } else {
+                output::render_start(&result)
+            })?;
         }
         CliCommand::List(args) => {
             let client = ready_client().await?;
             let result = client.list(&args.request()).await?;
-            print!(
-                "{}",
-                if args.json {
-                    output::render_json(&result)?
-                } else {
-                    output::render_list(&result)
-                }
-            );
+            write_stdout(if args.json {
+                output::render_json(&result)?
+            } else {
+                output::render_list(&result)
+            })?;
         }
         CliCommand::Status(args) => {
             let client = ready_client().await?;
@@ -93,37 +87,28 @@ async fn run() -> Result<(), MillmuxCliError> {
                 let result = client
                     .inspect(&millrace_sessions_core::protocol::SessionInspectRequest { selector })
                     .await?;
-                print!(
-                    "{}",
-                    if args.json {
-                        output::render_json(&result)?
-                    } else {
-                        output::render_session_status(&result)
-                    }
-                );
+                write_stdout(if args.json {
+                    output::render_json(&result)?
+                } else {
+                    output::render_session_status(&result)
+                })?;
             } else {
                 let result = client.host_status().await?;
-                print!(
-                    "{}",
-                    if args.json {
-                        output::render_json(&result)?
-                    } else {
-                        output::render_host_status(&result)
-                    }
-                );
+                write_stdout(if args.json {
+                    output::render_json(&result)?
+                } else {
+                    output::render_host_status(&result)
+                })?;
             }
         }
         CliCommand::Inspect(args) => {
             let client = ready_client().await?;
             let result = client.inspect(&args.request()?).await?;
-            print!(
-                "{}",
-                if args.json {
-                    output::render_json(&result)?
-                } else {
-                    output::render_inspect(&result)
-                }
-            );
+            write_stdout(if args.json {
+                output::render_json(&result)?
+            } else {
+                output::render_inspect(&result)
+            })?;
         }
         CliCommand::Logs(args) => {
             let client = ready_client().await?;
@@ -148,14 +133,11 @@ async fn run() -> Result<(), MillmuxCliError> {
                 }
             } else {
                 let result = client.logs(&request).await?;
-                print!(
-                    "{}",
-                    if args.json {
-                        output::render_json(&result)?
-                    } else {
-                        output::render_logs(&result)
-                    }
-                );
+                write_stdout(if args.json {
+                    output::render_json(&result)?
+                } else {
+                    output::render_logs(&result)
+                })?;
             }
         }
         CliCommand::Events(args) => {
@@ -181,98 +163,74 @@ async fn run() -> Result<(), MillmuxCliError> {
                 }
             } else {
                 let result = client.events(&request).await?;
-                print!(
-                    "{}",
-                    if args.json {
-                        output::render_json(&result)?
-                    } else {
-                        output::render_events(&result)
-                    }
-                );
+                write_stdout(if args.json {
+                    output::render_json(&result)?
+                } else {
+                    output::render_events(&result)
+                })?;
             }
         }
         CliCommand::Send(args) => {
             let client = ready_client().await?;
             let result = client.send(&args.request()?).await?;
-            print!(
-                "{}",
-                if args.json {
-                    output::render_json(&result)?
-                } else {
-                    output::render_send(&result)
-                }
-            );
+            write_stdout(if args.json {
+                output::render_json(&result)?
+            } else {
+                output::render_send(&result)
+            })?;
         }
         CliCommand::Resize(args) => {
             let client = ready_client().await?;
             let result = client.resize(&args.request()?).await?;
-            print!(
-                "{}",
-                if args.json {
-                    output::render_json(&result)?
-                } else {
-                    output::render_resize(&result)
-                }
-            );
+            write_stdout(if args.json {
+                output::render_json(&result)?
+            } else {
+                output::render_resize(&result)
+            })?;
         }
         CliCommand::Stop(args) => {
             let client = ready_client().await?;
             let result = client.stop(&args.request()?).await?;
-            print!(
-                "{}",
-                if args.json {
-                    output::render_json(&result)?
-                } else {
-                    output::render_stop(&result)
-                }
-            );
+            write_stdout(if args.json {
+                output::render_json(&result)?
+            } else {
+                output::render_stop(&result)
+            })?;
         }
         CliCommand::Kill(args) => {
             let client = ready_client().await?;
             let result = client.kill(&args.request()?).await?;
-            print!(
-                "{}",
-                if args.json {
-                    output::render_json(&result)?
-                } else {
-                    output::render_kill(&result)
-                }
-            );
+            write_stdout(if args.json {
+                output::render_json(&result)?
+            } else {
+                output::render_kill(&result)
+            })?;
         }
         CliCommand::Delete(args) => {
             let client = ready_client().await?;
             let result = client.delete(&args.request()?).await?;
-            print!(
-                "{}",
-                if args.json {
-                    output::render_json(&result)?
-                } else {
-                    output::render_delete(&result)
-                }
-            );
+            write_stdout(if args.json {
+                output::render_json(&result)?
+            } else {
+                output::render_delete(&result)
+            })?;
         }
         CliCommand::Context(args) => {
             let client = ready_client().await?;
             if args.list {
                 let result = client.ui_context_list(&args.list_request()).await?;
-                print!(
-                    "{}",
-                    if args.json {
-                        output::render_json(&result)?
-                    } else {
-                        output::render_context_list(&result)
-                    }
-                );
+                write_stdout(if args.json {
+                    output::render_json(&result)?
+                } else {
+                    output::render_context_list(&result)
+                })?;
             } else {
                 let result = client.ui_context_get(&args.get_request()?).await?;
-                print!(
-                    "{}",
-                    if args.json {
-                        output::render_json(&result)?
-                    } else {
-                        output::render_context(&result)
-                    }
-                );
+                write_stdout(if args.json {
+                    output::render_json(&result)?
+                } else {
+                    output::render_context(&result)
+                })?;
             }
         }
         CliCommand::Console(args) => {
@@ -324,4 +282,22 @@ enum MillmuxCliError {
     Cockpit(#[from] cockpit::CockpitError),
     #[error(transparent)]
     Io(#[from] io::Error),
+}
+
+impl MillmuxCliError {
+    fn is_broken_pipe(&self) -> bool {
+        match self {
+            Self::Io(error) => error.kind() == io::ErrorKind::BrokenPipe,
+            Self::Attach(attach::AttachError::Io(error)) => {
+                error.kind() == io::ErrorKind::BrokenPipe
+            }
+            Self::Console(console::ConsoleError::Io(error)) => {
+                error.kind() == io::ErrorKind::BrokenPipe
+            }
+            Self::Cockpit(cockpit::CockpitError::Io(error)) => {
+                error.kind() == io::ErrorKind::BrokenPipe
+            }
+            _ => false,
+        }
+    }
 }

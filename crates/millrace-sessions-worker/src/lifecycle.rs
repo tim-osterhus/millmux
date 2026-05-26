@@ -35,6 +35,8 @@ pub fn write_worker_meta(paths: &SessionPaths, facts: WorkerFacts) -> MillmuxRes
         ended_at: None,
         exit_code: None,
         exit_signal: None,
+        attached_clients: 0,
+        input_owner: None,
         updated_at: now,
     };
     write_json_atomic(&paths.meta_json, &meta)?;
@@ -104,6 +106,8 @@ pub fn record_process_exit(
         worker.ended_at = Some(now.to_string());
         worker.exit_code = Some(exit_code);
         worker.exit_signal = exit_signal.clone();
+        worker.attached_clients = 0;
+        worker.input_owner = None;
         worker.updated_at = now.to_string();
     })?;
 
@@ -129,6 +133,8 @@ pub fn record_failed_start(paths: &SessionPaths, message: impl Into<String>) -> 
     update_worker(paths, |worker, now| {
         worker.process_state = ProcessState::FailedStart;
         worker.ended_at = Some(now.to_string());
+        worker.attached_clients = 0;
+        worker.input_owner = None;
         worker.updated_at = now.to_string();
     })?;
 

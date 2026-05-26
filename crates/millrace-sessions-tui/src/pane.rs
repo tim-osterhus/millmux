@@ -158,6 +158,8 @@ pub struct AgentTerminalPane {
     pub snapshot: TerminalSnapshot,
     pub input_owner: bool,
     pub read_only: bool,
+    pub follow: bool,
+    pub initializing: bool,
     pub rows: u16,
     pub cols: u16,
 }
@@ -168,6 +170,8 @@ impl AgentTerminalPane {
             snapshot: TerminalSnapshot::blank(rows, cols),
             input_owner,
             read_only,
+            follow: true,
+            initializing: true,
             rows: rows.max(1),
             cols: cols.max(1),
         }
@@ -180,18 +184,43 @@ impl AgentTerminalPane {
             snapshot,
             input_owner,
             read_only,
+            follow: true,
+            initializing: false,
         }
     }
 
     pub fn set_snapshot(&mut self, snapshot: TerminalSnapshot) {
+        self.set_snapshot_view(snapshot, true);
+    }
+
+    pub fn set_snapshot_view(&mut self, snapshot: TerminalSnapshot, follow: bool) {
         self.rows = snapshot.rows;
         self.cols = snapshot.cols;
         self.snapshot = snapshot;
+        self.follow = follow;
+        self.initializing = false;
+    }
+
+    pub fn set_following(&mut self, follow: bool) {
+        self.follow = follow;
     }
 
     pub fn set_read_only(&mut self) {
         self.read_only = true;
         self.input_owner = false;
+    }
+
+    pub fn set_input_owner(&mut self, input_owner: bool) {
+        self.input_owner = input_owner;
+        self.read_only = !input_owner;
+    }
+
+    pub fn is_following(&self) -> bool {
+        self.follow
+    }
+
+    pub fn is_scrolled(&self) -> bool {
+        !self.follow
     }
 }
 

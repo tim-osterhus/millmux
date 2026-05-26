@@ -1,6 +1,7 @@
 use std::{collections::BTreeMap, fmt, path::PathBuf};
 
-use serde::{de::DeserializeOwned, Deserialize, Serialize};
+use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
+use serde::{de::DeserializeOwned, Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::Value;
 
 use crate::{
@@ -280,13 +281,102 @@ pub struct SessionInspectRequest {
     pub selector: SessionSelector,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AttachReplayMode {
+    #[default]
+    None,
+    LineScrollback,
+    RawReplay,
+    TerminalSnapshot,
+}
+
+impl AttachReplayMode {
+    pub fn is_none(value: &Self) -> bool {
+        matches!(value, Self::None)
+    }
+
+    pub fn uses_raw_payloads(&self) -> bool {
+        matches!(self, Self::RawReplay | Self::TerminalSnapshot)
+    }
+
+    fn from_legacy_include_scrollback(include_scrollback: bool) -> Self {
+        if include_scrollback {
+            Self::LineScrollback
+        } else {
+            Self::None
+        }
+    }
+}
+
+impl fmt::Display for AttachReplayMode {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let value = match self {
+            Self::None => "none",
+            Self::LineScrollback => "line_scrollback",
+            Self::RawReplay => "raw_replay",
+            Self::TerminalSnapshot => "terminal_snapshot",
+        };
+        f.write_str(value)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TerminalDimensions {
+    pub rows: u16,
+    pub cols: u16,
+}
+
+impl TerminalDimensions {
+    pub fn new(rows: u16, cols: u16) -> Self {
+        Self {
+            rows: rows.max(1),
+            cols: cols.max(1),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct SessionAttachRequest {
     pub selector: SessionSelector,
     #[serde(default, skip_serializing_if = "is_false")]
     pub read_only: bool,
-    #[serde(default, skip_serializing_if = "is_false")]
-    pub include_scrollback: bool,
+    #[serde(default)]
+    pub replay: AttachReplayMode,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub requested_terminal_size: Option<TerminalDimensions>,
+}
+
+impl<'de> Deserialize<'de> for SessionAttachRequest {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        struct Wire {
+            selector: SessionSelector,
+            #[serde(default)]
+            read_only: bool,
+            #[serde(default)]
+            replay: Option<AttachReplayMode>,
+            #[serde(default)]
+            requested_terminal_size: Option<TerminalDimensions>,
+            #[serde(default)]
+            include_scrollback: Option<bool>,
+        }
+
+        let wire = Wire::deserialize(deserializer)?;
+        Ok(Self {
+            selector: wire.selector,
+            read_only: wire.read_only,
+            replay: wire.replay.unwrap_or_else(|| {
+                wire.include_scrollback
+                    .map(AttachReplayMode::from_legacy_include_scrollback)
+                    .unwrap_or_default()
+            }),
+            requested_terminal_size: wire.requested_terminal_size,
+        })
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -441,13 +531,18 @@ pub struct SessionSummary {
     pub role: SessionRole,
     pub process_state: ProcessState,
     pub attention_state: AttentionState,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure_message: Option<String>,
     pub workspace: Option<WorkspaceIdentity>,
     pub cwd: PathBuf,
     pub argv: Vec<String>,
     pub monitor_profile: MonitorProfile,
     pub created_at: String,
     pub updated_at: String,
+    #[serde(default)]
     pub attached_clients: u32,
+    #[serde(default)]
+    pub input_owner: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -611,11 +706,51 @@ pub enum StreamKind {
     Events,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AttachRawBytes(Vec<u8>);
+
+impl AttachRawBytes {
+    pub fn new(bytes: impl Into<Vec<u8>>) -> Self {
+        Self(bytes.into())
+    }
+
+    pub fn as_slice(&self) -> &[u8] {
+        &self.0
+    }
+
+    pub fn into_vec(self) -> Vec<u8> {
+        self.0
+    }
+}
+
+impl Serialize for AttachRawBytes {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(&BASE64_STANDARD.encode(&self.0))
+    }
+}
+
+impl<'de> Deserialize<'de> for AttachRawBytes {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let encoded = String::deserialize(deserializer)?;
+        let bytes = BASE64_STANDARD
+            .decode(encoded.as_bytes())
+            .map_err(serde::de::Error::custom)?;
+        Ok(Self(bytes))
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum AttachStreamFrame {
     Scrollback { lines: Vec<String> },
     Output { text: String },
+    RawOutput { data: AttachRawBytes },
     Input { text: String },
     Resize { rows: u16, cols: u16 },
     Error { error: ControlErrorBody },
@@ -624,6 +759,12 @@ pub enum AttachStreamFrame {
 }
 
 impl AttachStreamFrame {
+    pub fn raw_output(bytes: impl Into<Vec<u8>>) -> Self {
+        Self::RawOutput {
+            data: AttachRawBytes::new(bytes),
+        }
+    }
+
     pub fn to_json_line(&self) -> serde_json::Result<String> {
         to_json_line(self)
     }
@@ -674,6 +815,7 @@ pub enum WorkerControlMethod {
     Resize,
     AcquireAttach,
     ReleaseAttach,
+    AttachState,
     ObserveAttach,
     PrepareStopInterrupt,
     ForwardKill,
@@ -791,13 +933,47 @@ pub struct WorkerResizeResponse {
     pub cols: u16,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct WorkerAttachRequest {
     pub stream_id: String,
     #[serde(default, skip_serializing_if = "is_false")]
     pub read_only: bool,
-    #[serde(default, skip_serializing_if = "is_false")]
-    pub include_scrollback: bool,
+    #[serde(default)]
+    pub replay: AttachReplayMode,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub requested_terminal_size: Option<TerminalDimensions>,
+}
+
+impl<'de> Deserialize<'de> for WorkerAttachRequest {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        struct Wire {
+            stream_id: String,
+            #[serde(default)]
+            read_only: bool,
+            #[serde(default)]
+            replay: Option<AttachReplayMode>,
+            #[serde(default)]
+            requested_terminal_size: Option<TerminalDimensions>,
+            #[serde(default)]
+            include_scrollback: Option<bool>,
+        }
+
+        let wire = Wire::deserialize(deserializer)?;
+        Ok(Self {
+            stream_id: wire.stream_id,
+            read_only: wire.read_only,
+            replay: wire.replay.unwrap_or_else(|| {
+                wire.include_scrollback
+                    .map(AttachReplayMode::from_legacy_include_scrollback)
+                    .unwrap_or_default()
+            }),
+            requested_terminal_size: wire.requested_terminal_size,
+        })
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -805,6 +981,12 @@ pub struct WorkerAttachResponse {
     pub stream_id: String,
     pub read_only: bool,
     pub input_owner: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct WorkerAttachStateResponse {
+    pub attached_clients: u32,
+    pub input_owner: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

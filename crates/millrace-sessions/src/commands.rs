@@ -5,10 +5,11 @@ use millrace_sessions_core::{
     ids::{SessionId, UiId},
     paths::UI_ID_ENV,
     protocol::{
-        DoctorRepairMode, DoctorRequest, SessionAttachRequest, SessionDeleteRequest,
-        SessionEventsRequest, SessionInspectRequest, SessionKillRequest, SessionListRequest,
-        SessionLogsRequest, SessionResizeRequest, SessionSelector, SessionSendRequest,
-        SessionStartRequest, SessionStopRequest, UiContextGetRequest, UiContextListRequest,
+        AttachReplayMode, DoctorRepairMode, DoctorRequest, SessionAttachRequest,
+        SessionDeleteRequest, SessionEventsRequest, SessionInspectRequest, SessionKillRequest,
+        SessionListRequest, SessionLogsRequest, SessionResizeRequest, SessionSelector,
+        SessionSendRequest, SessionStartRequest, SessionStopRequest, UiContextGetRequest,
+        UiContextListRequest,
     },
     state::MonitorProfile,
     state::SessionRole,
@@ -120,7 +121,12 @@ impl AttachArgs {
         Ok(SessionAttachRequest {
             selector: self.selector.required()?,
             read_only: self.read_only,
-            include_scrollback: !self.no_scrollback,
+            replay: if self.no_scrollback {
+                AttachReplayMode::None
+            } else {
+                AttachReplayMode::LineScrollback
+            },
+            requested_terminal_size: None,
         })
     }
 }
@@ -780,7 +786,7 @@ mod tests {
             CliCommand::Attach(args) => {
                 let request = args.request().unwrap();
                 assert!(request.read_only);
-                assert!(request.include_scrollback);
+                assert_eq!(request.replay, AttachReplayMode::LineScrollback);
             }
             other => panic!("unexpected command: {other:?}"),
         }

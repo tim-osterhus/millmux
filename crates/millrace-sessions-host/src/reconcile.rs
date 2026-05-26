@@ -140,6 +140,8 @@ fn mark_record_terminal(
         if is_active_process_state(&worker.process_state) {
             worker.process_state = target_state.clone();
             worker.ended_at.get_or_insert_with(|| now.clone());
+            worker.attached_clients = 0;
+            worker.input_owner = None;
             worker.updated_at = now.clone();
             write_json_atomic(&record.paths.worker_json, &worker)?;
         }

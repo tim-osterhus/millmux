@@ -108,6 +108,8 @@ pub fn session_paths(sessions_dir: impl Into<PathBuf>, session_id: SessionId) ->
         pty_log: root.join("pty.log"),
         events_jsonl: root.join("events.jsonl"),
         scrollback_snapshot: root.join("scrollback.snapshot"),
+        terminal_snapshot: root.join("terminal.snapshot.json"),
+        raw_replay_ring: root.join("pty.replay"),
         worker_sock: root.join("worker.sock"),
         root,
     }
@@ -154,6 +156,11 @@ mod tests {
             session.scrollback_snapshot,
             session.root.join("scrollback.snapshot")
         );
+        assert_eq!(
+            session.terminal_snapshot,
+            session.root.join("terminal.snapshot.json")
+        );
+        assert_eq!(session.raw_replay_ring, session.root.join("pty.replay"));
         assert_eq!(
             session.worker_sock,
             PathBuf::from("/state/w").join(format!("{}.sock", short_session_id(id)))

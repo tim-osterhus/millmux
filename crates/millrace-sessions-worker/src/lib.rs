@@ -1,4 +1,5 @@
 use std::{
+    fs,
     io::{ErrorKind, Read},
     path::PathBuf,
     sync::{Arc, Mutex},
@@ -10,7 +11,10 @@ use millrace_sessions_core::{
     error::{MillmuxError, MillmuxResult},
     ids::SessionId,
     paths::StatePaths,
-    scrollback::ScrollbackBuffer,
+    scrollback::{
+        ScrollbackBuffer, TerminalStateBuffer, DEFAULT_RAW_REPLAY_CAPACITY_BYTES,
+        DEFAULT_TERMINAL_COLS, DEFAULT_TERMINAL_ROWS,
+    },
 };
 use pty::{spawn_pty, PtyCommandSpec};
 
@@ -63,10 +67,23 @@ pub fn run_worker(session_id: SessionId, state_dir: impl Into<PathBuf>) -> Millm
         master,
     } = running;
 
+    let current_pty_offset = fs::metadata(&session_paths.pty_log)
+        .map(|metadata| metadata.len())
+        .unwrap_or(0);
+    let terminal_state = Arc::new(Mutex::new(TerminalStateBuffer::restore_or_new(
+        &session_paths.terminal_snapshot,
+        &session_paths.raw_replay_ring,
+        current_pty_offset,
+        DEFAULT_TERMINAL_ROWS,
+        DEFAULT_TERMINAL_COLS,
+        DEFAULT_RAW_REPLAY_CAPACITY_BYTES,
+    )?));
+
     let control = start_control_server(WorkerControlConfig {
         paths: session_paths.clone(),
         writer: Arc::new(Mutex::new(writer)),
         master: Arc::new(Mutex::new(master)),
+        terminal_state: Arc::clone(&terminal_state),
         child_pid,
         child_pgid,
     })?;
@@ -78,6 +95,9 @@ pub fn run_worker(session_id: SessionId, state_dir: impl Into<PathBuf>) -> Millm
         pty_log: session_paths.pty_log.clone(),
         events_jsonl: session_paths.events_jsonl.clone(),
         scrollback_snapshot: session_paths.scrollback_snapshot.clone(),
+        terminal_snapshot: session_paths.terminal_snapshot.clone(),
+        raw_replay_ring: session_paths.raw_replay_ring.clone(),
+        terminal_state,
         scrollback_capacity: ScrollbackBuffer::default_capacity(),
     })?;
     let mut buffer = [0_u8; 8192];

@@ -88,6 +88,31 @@ pub fn append_raw_pty_log(path: impl AsRef<Path>, bytes: &[u8]) -> MillmuxResult
     Ok(())
 }
 
+pub fn write_private_bytes_atomic(path: impl AsRef<Path>, bytes: &[u8]) -> MillmuxResult<()> {
+    let path = path.as_ref();
+    let parent = path
+        .parent()
+        .ok_or_else(|| MillmuxError::Storage(format!("missing parent for {}", path.display())))?;
+    create_private_dir_all(parent)?;
+
+    let temp_path = temp_path_for(path);
+    let result = (|| -> MillmuxResult<()> {
+        let mut file = create_private_file(&temp_path)?;
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        drop(file);
+        fs::rename(&temp_path, path)?;
+        harden_private_file(path)?;
+        sync_dir(parent)?;
+        Ok(())
+    })();
+
+    if result.is_err() {
+        let _ = fs::remove_file(&temp_path);
+    }
+    result
+}
+
 fn create_private_file(path: &Path) -> MillmuxResult<File> {
     let mut options = OpenOptions::new();
     options.write(true).create_new(true);
@@ -216,6 +241,11 @@ mod tests {
         append_raw_pty_log(&log, b"hello").unwrap();
         append_raw_pty_log(&log, b" world").unwrap();
         assert_eq!(fs::read(&log).unwrap(), b"hello world");
+
+        let ring = temp.path().join("pty.replay");
+        write_private_bytes_atomic(&ring, &[0x00, 0xff, b'a']).unwrap();
+        write_private_bytes_atomic(&ring, b"replacement").unwrap();
+        assert_eq!(fs::read(&ring).unwrap(), b"replacement");
     }
 
     #[cfg(unix)]
@@ -289,10 +319,12 @@ mod tests {
                 append_json_line(&events, &Sample { value: "b".into() }).unwrap();
                 append_raw_pty_log(&log, b"hello").unwrap();
                 append_raw_pty_log(&log, b" world").unwrap();
+                write_private_bytes_atomic(temp.path().join("pty.replay"), b"tail").unwrap();
             });
 
             assert_eq!(mode(&events), PRIVATE_FILE_MODE);
             assert_eq!(mode(&log), PRIVATE_FILE_MODE);
+            assert_eq!(mode(&temp.path().join("pty.replay")), PRIVATE_FILE_MODE);
             assert_eq!(mode(temp.path()), PRIVATE_DIR_MODE);
             assert_eq!(
                 read_json_lines::<Sample>(&events).unwrap(),

@@ -178,18 +178,25 @@ fn render_agent_terminal(frame: &mut ratatui::Frame<'_>, area: Rect, app: &AppMo
         return;
     };
     let input = if terminal.input_owner && !terminal.read_only {
-        "input=owned"
+        "owned"
     } else {
-        "input=read-only"
+        "read-only"
     };
     let screen = if terminal.snapshot.alternate_screen {
         "alt"
     } else {
         "main"
     };
+    let view = if app.scroll_mode && focused {
+        "scroll"
+    } else if terminal.is_following() {
+        "live"
+    } else {
+        "paused"
+    };
     let mut lines = vec![Line::from(vec![Span::styled(
         format!(
-            "Agent Terminal | {input} screen={screen} cursor={},{}{}",
+            "Agent Terminal | {input} {screen} {view} cur={},{}{}",
             terminal.snapshot.cursor_row,
             terminal.snapshot.cursor_col,
             focus_suffix(focused)
@@ -199,15 +206,19 @@ fn render_agent_terminal(frame: &mut ratatui::Frame<'_>, area: Rect, app: &AppMo
             .add_modifier(Modifier::BOLD),
     )])];
     let content_height = area.height.saturating_sub(1);
-    for row in terminal
-        .snapshot
-        .cells
-        .iter()
-        .take(usize::from(content_height))
-    {
-        lines.push(Line::from(
-            row.iter().map(cell_span).collect::<Vec<Span<'_>>>(),
-        ));
+    if terminal.initializing {
+        lines.push(Line::from("agent terminal initializing"));
+    } else {
+        for row in terminal
+            .snapshot
+            .cells
+            .iter()
+            .take(usize::from(content_height))
+        {
+            lines.push(Line::from(
+                row.iter().map(cell_span).collect::<Vec<Span<'_>>>(),
+            ));
+        }
     }
     frame.render_widget(Paragraph::new(lines), area);
 }
@@ -356,27 +367,31 @@ fn render_log(
     let log = session_id
         .and_then(|session_id| app.daemon_logs.get(&session_id))
         .unwrap_or(&app.line_log);
-    let profile = session_id
-        .and_then(|session_id| {
-            app.daemon_sessions
-                .iter()
-                .find(|session| session.session_id == session_id)
-        })
+    let daemon = session_id.and_then(|session_id| {
+        app.daemon_sessions
+            .iter()
+            .find(|session| session.session_id == session_id)
+    });
+    let profile = daemon
         .map(|session| session.monitor_profile.to_string())
         .unwrap_or_else(|| app.monitor_profile.to_string());
+    let state = daemon
+        .filter(|session| !daemon_state_is_healthy(&session.process_state))
+        .map(|session| format!(" | state={}", process_label(&session.process_state)))
+        .unwrap_or_default();
     let header = if app.scroll_mode || log.is_scrolled() {
         format!(
-            "{title} | mon={profile} | follow=paused scroll{}",
+            "{title}{state} | mon={profile} | follow=paused scroll{}",
             focus_suffix(focused)
         )
     } else if log.is_following() {
         format!(
-            "{title} | mon={profile} | follow=live{}",
+            "{title}{state} | mon={profile} | follow=live{}",
             focus_suffix(focused)
         )
     } else {
         format!(
-            "{title} | mon={profile} | follow=paused{}",
+            "{title}{state} | mon={profile} | follow=paused{}",
             focus_suffix(focused)
         )
     };
@@ -387,7 +402,25 @@ fn render_log(
             .fg(Color::Cyan)
             .add_modifier(Modifier::BOLD),
     )])];
-    let content_height = area.height.saturating_sub(1);
+    if let Some(session) = daemon.filter(|session| !daemon_state_is_healthy(&session.process_state))
+    {
+        lines.push(Line::from(format!(
+            "daemon degraded: state={} attention={}",
+            process_label(&session.process_state),
+            attention_label(&session.attention_state)
+        )));
+        if let Some(message) = &session.failure_message {
+            lines.push(Line::from(format!(
+                "failure: {}",
+                compact_text(message, 96)
+            )));
+        }
+        lines.push(Line::from(format!(
+            "recovery: {}",
+            recovery_actions_label(&session.process_state)
+        )));
+    }
+    let content_height = area.height.saturating_sub(lines.len() as u16);
     for line in log.visible_lines(content_height) {
         lines.push(Line::from(line));
     }
@@ -521,13 +554,7 @@ fn render_status(frame: &mut ratatui::Frame<'_>, area: Rect, app: &AppModel) {
     } else {
         "ready"
     };
-    let scroll = if app.scroll_mode {
-        "scroll"
-    } else if app.line_log.is_following() {
-        "live"
-    } else {
-        "paused"
-    };
+    let scroll = app.active_view_label();
     let status = format!(
         " mode={:?} monitor={:?} host={} input={} view={} status={} ",
         app.mode,
@@ -585,6 +612,30 @@ fn process_label(value: &millrace_sessions_core::state::ProcessState) -> &'stati
     }
 }
 
+fn daemon_state_is_healthy(value: &millrace_sessions_core::state::ProcessState) -> bool {
+    matches!(
+        value,
+        millrace_sessions_core::state::ProcessState::Starting
+            | millrace_sessions_core::state::ProcessState::Running
+    )
+}
+
+fn recovery_actions_label(value: &millrace_sessions_core::state::ProcessState) -> &'static str {
+    match value {
+        millrace_sessions_core::state::ProcessState::Starting
+        | millrace_sessions_core::state::ProcessState::Running => "inspect logs stop kill",
+        millrace_sessions_core::state::ProcessState::FailedStart => "inspect logs doctor delete",
+        millrace_sessions_core::state::ProcessState::Exited
+        | millrace_sessions_core::state::ProcessState::Killed => "inspect logs archive delete",
+        millrace_sessions_core::state::ProcessState::Crashed
+        | millrace_sessions_core::state::ProcessState::Failed
+        | millrace_sessions_core::state::ProcessState::Lost
+        | millrace_sessions_core::state::ProcessState::Stale => {
+            "inspect logs doctor archive delete"
+        }
+    }
+}
+
 fn attention_label(value: &millrace_sessions_core::state::AttentionState) -> &'static str {
     match value {
         millrace_sessions_core::state::AttentionState::Unknown => "unknown",
@@ -637,11 +688,16 @@ fn to_ratatui_color(color: TerminalColor) -> Color {
 }
 
 fn compact_path(path: &str, width: usize) -> String {
-    if path.chars().count() <= width {
-        return path.to_string();
+    compact_text(path, width)
+}
+
+fn compact_text(value: &str, width: usize) -> String {
+    let value = value.replace('\n', " ");
+    if value.chars().count() <= width {
+        return value;
     }
     let keep = width.saturating_sub(1);
-    let tail = path
+    let tail = value
         .chars()
         .rev()
         .take(keep)

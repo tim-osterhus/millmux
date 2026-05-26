@@ -13,7 +13,7 @@ use millrace_sessions_core::{
     protocol::{
         DoctorRepairMode, DoctorRepairStatus, DoctorRequest, DoctorResponse, DoctorSeverity,
     },
-    scrollback::ScrollbackBuffer,
+    scrollback::{legacy_line_scrollback_contains_tui_sequences, ScrollbackBuffer},
     state::{
         AttentionState, HostMeta, MonitorProfile, ProcessState, SessionMeta, SessionRole, UiEvent,
         WorkerMeta,
@@ -195,6 +195,69 @@ fn doctor_archive_preserves_private_session_artifacts() {
 }
 
 #[test]
+fn doctor_archive_preserves_unsafe_agent_terminal_evidence() {
+    let temp = tempfile::tempdir().unwrap();
+    let paths = prepared_state(temp.path());
+    let mut stale = sample_meta(ProcessState::Lost, temp.path());
+    stale.role = SessionRole::Agent;
+    stale.argv = vec!["millrace-cli".to_string()];
+    let session_paths = paths.session_paths(stale.id);
+
+    create_private_dir_all(&session_paths.root).unwrap();
+    write_json_atomic(&session_paths.meta_json, &stale).unwrap();
+    append_raw_pty_log(&session_paths.pty_log, full_screen_agent_fixture()).unwrap();
+    let mut output = SessionEvent::new(stale.id, SessionEventKind::Output);
+    output.message = Some("\x1b[?2026hstreaming answer\x1b[?2026l".to_string());
+    millrace_sessions_core::events::append_event(&session_paths.events_jsonl, &output).unwrap();
+    let mut scrollback = ScrollbackBuffer::new(10);
+    scrollback.push_line("\x1b[?1049h\x1b[2Jlegacy alternate frame");
+    scrollback.push_line("\x1b[3J\x1b[Hstale answer");
+    scrollback
+        .persist_snapshot(&session_paths.scrollback_snapshot)
+        .unwrap();
+
+    let report = run_doctor(&paths, None, &DoctorRequest::default()).unwrap();
+    let issue = issue_by_code(&report, "unsafe_legacy_line_scrollback");
+    assert_eq!(issue.severity, DoctorSeverity::Warning);
+    assert_eq!(issue.session_id, Some(stale.id));
+    assert_eq!(
+        issue.path.as_ref(),
+        Some(&session_paths.scrollback_snapshot)
+    );
+    assert!(issue.repairable);
+    let suggested_action = issue.suggested_action.as_deref().unwrap_or_default();
+    assert!(suggested_action.contains("ARCHIVE_STALE"));
+    assert!(suggested_action.contains("preserve pty.log and events.jsonl"));
+    assert!(session_paths.pty_log.exists());
+    assert!(session_paths.events_jsonl.exists());
+
+    run_doctor(
+        &paths,
+        None,
+        &DoctorRequest {
+            repair: Some(DoctorRepairMode::ArchiveStale),
+        },
+    )
+    .unwrap();
+
+    let archive_root = paths.archive_dir.join(stale.id.to_string());
+    let archived_pty = fs::read(archive_root.join("pty.log")).unwrap();
+    assert!(archived_pty.windows(4).any(|window| window == b"\x1b[2J"));
+    assert!(archived_pty.windows(4).any(|window| window == b"\x1b[3J"));
+    let archived_events = read_events(archive_root.join("events.jsonl")).unwrap();
+    assert!(archived_events.iter().any(|event| event
+        .message
+        .as_deref()
+        .is_some_and(|message| message.contains("\x1b[?2026h"))));
+    let archived_scrollback =
+        ScrollbackBuffer::restore_snapshot(archive_root.join("scrollback.snapshot")).unwrap();
+    assert!(
+        legacy_line_scrollback_contains_tui_sequences(&archived_scrollback.lines()),
+        "unsafe legacy line scrollback remains detectable after archive repair"
+    );
+}
+
+#[test]
 fn doctor_close_stale_ui_contexts_preserves_live_contexts_and_session_artifacts() {
     let temp = tempfile::tempdir().unwrap();
     let paths = prepared_state(temp.path());
@@ -319,6 +382,23 @@ fn prepared_state(root: &Path) -> StatePaths {
     paths
 }
 
+fn full_screen_agent_fixture() -> &'static [u8] {
+    concat!(
+        "fixture-agent ready\r\n",
+        "\x1b[?1049h",
+        "\x1b[?2026h",
+        "\x1b[2J",
+        "\x1b[3J",
+        "\x1b[H",
+        "question one\r\n",
+        "\x1b[4;9Hanswer one complete\r\n",
+        "\x1b[2Kanswer two chunk 3\r\n",
+        "\x1b[?2026l",
+        "\x1b[?1049l",
+    )
+    .as_bytes()
+}
+
 fn write_session(
     paths: &StatePaths,
     meta: &SessionMeta,
@@ -404,6 +484,8 @@ fn sample_worker(session_id: SessionId, pid: u32, state: ProcessState) -> Worker
         ended_at: None,
         exit_code: None,
         exit_signal: None,
+        attached_clients: 0,
+        input_owner: None,
         updated_at: "2026-05-20T18:01:00Z".to_string(),
     }
 }
@@ -419,12 +501,19 @@ fn host_meta(paths: &StatePaths) -> HostMeta {
 }
 
 fn assert_issue(result: &DoctorResponse, code: &str, severity: DoctorSeverity) {
-    let issue = result
+    let issue = issue_by_code(result, code);
+    assert_eq!(issue.severity, severity);
+}
+
+fn issue_by_code<'a>(
+    result: &'a DoctorResponse,
+    code: &str,
+) -> &'a millrace_sessions_core::protocol::DoctorIssue {
+    result
         .issues
         .iter()
         .find(|issue| issue.code == code)
-        .unwrap_or_else(|| panic!("missing issue {code}; got {:#?}", result.issues));
-    assert_eq!(issue.severity, severity);
+        .unwrap_or_else(|| panic!("missing issue {code}; got {:#?}", result.issues))
 }
 
 #[cfg(unix)]

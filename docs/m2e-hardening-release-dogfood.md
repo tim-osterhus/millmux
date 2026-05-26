@@ -152,3 +152,113 @@ Millmux and the main Millrace daemon was stopped through Millmux:
 - `f8e73443-6029-4ad5-a739-8ff2a393026a`: `killed`
 - `e5aa3ed8-0934-463d-bdc7-91d6f13e9421`: `exited`
 - Detach-event rerun daemon `991fa3fa-4019-4335-b01a-96ae9a55b027`: `exited`
+
+## R0 Regression Harness Addendum
+
+Date: 2026-05-26
+
+Deterministic coverage added for the cockpit terminal remediation gate:
+
+- `crates/millrace-sessions-worker/tests/logging.rs` includes a fake
+  full-screen agent stream with alternate-screen enter/exit, `ESC[2J`,
+  `ESC[3J`, cursor movement, synchronized-output markers, line clear,
+  resize-sensitive text, and streaming answer output. The test preserves
+  `pty.log`, `events.jsonl`, and `scrollback.snapshot`, and flags the legacy
+  line scrollback as unsafe for TUI replay.
+- `crates/millrace-sessions-tui/src/terminal.rs` and
+  `crates/millrace-sessions-tui/tests/render_snapshots.rs` cover the same
+  terminal protocol fixture through the `vt100` adapter and cockpit rendering,
+  including two-question visible history and no pre-cockpit shell sentinel.
+- `crates/millrace-sessions/tests/cli_smoke.rs` covers cockpit snapshot startup
+  with unsafe legacy agent line scrollback present, plus daemon autostart from
+  a client `PATH` after the host was already started with a stale `PATH`.
+- `crates/millrace-sessions-host/tests/session_lifecycle.rs` covers read/write
+  attach ownership, read-only observers, conflict behavior, close/release, and
+  post-detach input recovery.
+- `crates/millrace-sessions-host/tests/doctor.rs` covers preserving unsafe
+  agent terminal evidence when stale records are archived.
+
+Manual dogfood items that still require real terminal coverage before release:
+
+```bash
+# Short-reader output should exit normally without a Rust panic.
+millmux list --json | head -c 200
+millmux status --json | head -c 200
+millmux logs <session-id> --json | head -c 20000
+millmux events <session-id> --json | head -c 20000
+
+# Prefix/detach must be verified in each supported terminal.
+millmux cockpit --workspace "$WORKSPACE" --agent-argv -- millracer operator
+# Send Ctrl-] d and confirm the agent does not receive a literal "d".
+```
+
+## R5 Attach Ownership Addendum
+
+Date: 2026-05-26
+
+Automated coverage now treats the worker as the authoritative source for active
+attach ownership:
+
+- `SessionSummary` exposes active `attached_clients` and `input_owner` through
+  `list --json`, `status --json`, and `inspect --json`; terminal records clear
+  stale owner state.
+- Worker and host coverage exercises one read/write input owner, read-only
+  observers, input-owner conflict errors, rejected non-owner input, close/drop
+  ownership release, and attach-state persistence in `worker.json`.
+- CLI and cockpit coverage exercises detach/prefix behavior without forwarding
+  the detach key to the hosted agent, read-only cockpit fallback on ownership
+  conflict, and later writable recovery after the owner releases input.
+
+Manual macOS Terminal.app and SSH terminal dogfood was not executable from the
+R5 runner. Treat that as reduced evidence quality for release QA, not as an
+affirmative terminal pass.
+
+## R6 CLI Pipe And Doctor Addendum
+
+Date: 2026-05-26
+
+Automated coverage now hardens short-reader CLI pipelines and legacy artifact
+diagnostics:
+
+- `crates/millrace-sessions/src/main.rs`, `console.rs`, and `cockpit.rs` route
+  stdout through fallible writers and treat broken stdout pipes as normal
+  termination without hiding non-pipe command failures.
+- `crates/millrace-sessions/tests/cli_smoke.rs` covers short-reader pipelines
+  for JSON list/status/events output and line list/inspect/log output.
+- `crates/millrace-sessions-core/src/scrollback.rs` detects likely full-screen
+  TUI control sequences in legacy line scrollback while ignoring ordinary ANSI
+  color output.
+- `crates/millrace-sessions-host/src/doctor.rs` reports
+  `unsafe_legacy_line_scrollback` for agent-like sessions and recommends
+  ignoring unsafe line replay or archiving stale sessions without deleting
+  `pty.log`, `events.jsonl`, or `scrollback.snapshot`.
+
+## R7 Cockpit Release QA Addendum
+
+Date: 2026-05-26
+
+The final cockpit terminal remediation gate is recorded in
+`docs/r7-cockpit-release-qa.md`.
+
+Fresh evidence includes:
+
+- Full required cargo gates: fmt, clippy with `-D warnings`, workspace tests,
+  release build, and locked install.
+- Deterministic PTY fixtures for full-screen agent control sequences, terminal
+  resize metadata, terminal snapshot/raw replay, degraded daemon rendering,
+  attach ownership, prefix detach, broken stdout pipes, and doctor legacy
+  artifact handling.
+- Live Linux/WSL-style PTY dogfood in
+  `/tmp/millmux-r7-qa-final2.DQkWYL`, using a real Millrace daemon and a
+  full-screen fixture agent. The run covered repeated questions, scroll mode,
+  jump-to-bottom, detach, reattach, direct Millmux resize to `40x100`, degraded
+  daemon/PATH failure, recovery rendering, short-reader CLI pipelines, and
+  doctor output.
+- A release-gate keymap repair found during dogfood: Unix crossterm can report
+  Ctrl-] as `Ctrl-5`, and shifted bindings such as `G` can carry a SHIFT
+  modifier. Cockpit now accepts those encodings without forwarding prefix,
+  jump, or detach keys to the agent.
+
+Manual macOS Terminal.app and SSH terminal dogfood remains unavailable from the
+R7 runner. Treat that as reduced cross-terminal evidence quality, not as an
+affirmative pass for those terminal emulators.

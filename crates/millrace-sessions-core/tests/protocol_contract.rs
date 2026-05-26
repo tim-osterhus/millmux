@@ -3,11 +3,16 @@ use std::{collections::BTreeMap, path::PathBuf};
 use millrace_sessions_core::{
     ids::{PaneId, SessionId, UiId},
     protocol::{
-        ControlErrorBody, ControlErrorCode, ControlMethod, ControlRequest, ControlResponse,
-        SessionListRequest, SessionListResponse, SessionStartRequest, SessionSummary,
-        UiContextGetRequest, UiContextSetRequest, M1_PROTOCOL_VERSION,
+        AttachReplayMode, AttachStreamFrame, ControlErrorBody, ControlErrorCode, ControlMethod,
+        ControlRequest, ControlResponse, SessionAttachRequest, SessionListRequest,
+        SessionListResponse, SessionSelector, SessionStartRequest, SessionSummary,
+        TerminalDimensions, UiContextGetRequest, UiContextSetRequest, WorkerAttachRequest,
+        WorkerAttachStateResponse, WorkerControlMethod, WorkerControlRequest, M1_PROTOCOL_VERSION,
     },
-    state::{AttentionState, MonitorProfile, ProcessState, SessionRole, UiContext, UiMode},
+    state::{
+        AttentionState, MonitorProfile, ProcessState, SessionRole, UiContext, UiDaemonHealth,
+        UiDaemonRecoveryAction, UiMode,
+    },
 };
 use serde_json::json;
 use time::macros::datetime;
@@ -95,6 +100,7 @@ fn session_list_request_and_response_match_m1_jsonl_contract() {
             role: SessionRole::MillraceDaemon,
             process_state: ProcessState::Running,
             attention_state: AttentionState::MillraceIdle,
+            failure_message: None,
             workspace: None,
             cwd: PathBuf::from("/tmp/millmux-workspace"),
             argv: vec![
@@ -106,6 +112,7 @@ fn session_list_request_and_response_match_m1_jsonl_contract() {
             created_at: "2026-05-20T18:00:00Z".to_string(),
             updated_at: "2026-05-20T18:01:00Z".to_string(),
             attached_clients: 0,
+            input_owner: None,
         }],
     };
 
@@ -133,7 +140,8 @@ fn session_list_request_and_response_match_m1_jsonl_contract() {
                     "monitor_profile": "basic",
                     "created_at": "2026-05-20T18:00:00Z",
                     "updated_at": "2026-05-20T18:01:00Z",
-                    "attached_clients": 0
+                    "attached_clients": 0,
+                    "input_owner": null
                 }]
             }
         })
@@ -144,6 +152,185 @@ fn session_list_request_and_response_match_m1_jsonl_contract() {
         .result_as::<SessionListResponse>()
         .expect("typed result");
     assert_eq!(decoded_result.sessions[0].session_id, session_id);
+}
+
+#[test]
+fn session_attach_replay_modes_replace_legacy_scrollback_boolean() {
+    let session_id: SessionId = "018f5d8d-3e79-4a62-9bc5-51c3c7f4d5c8".parse().unwrap();
+    let params = SessionAttachRequest {
+        selector: SessionSelector::Id { session_id },
+        read_only: true,
+        replay: AttachReplayMode::LineScrollback,
+        requested_terminal_size: None,
+    };
+
+    let request = ControlRequest::with_params("attach-1", ControlMethod::SessionAttach, &params)
+        .expect("params serialize");
+
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(request.to_json_line().unwrap().trim_end())
+            .unwrap(),
+        json!({
+            "id": "attach-1",
+            "method": "session.attach",
+            "params": {
+                "selector": {"type": "id", "session_id": "018f5d8d-3e79-4a62-9bc5-51c3c7f4d5c8"},
+                "read_only": true,
+                "replay": "line_scrollback"
+            }
+        })
+    );
+
+    let legacy: SessionAttachRequest = serde_json::from_value(json!({
+        "selector": {"type": "id", "session_id": "018f5d8d-3e79-4a62-9bc5-51c3c7f4d5c8"},
+        "include_scrollback": true
+    }))
+    .expect("legacy attach params deserialize");
+    assert_eq!(legacy.replay, AttachReplayMode::LineScrollback);
+    assert_eq!(legacy.requested_terminal_size, None);
+
+    let legacy_no_replay: SessionAttachRequest = serde_json::from_value(json!({
+        "selector": {"type": "id", "session_id": "018f5d8d-3e79-4a62-9bc5-51c3c7f4d5c8"},
+        "include_scrollback": false
+    }))
+    .expect("legacy no-scrollback params deserialize");
+    assert_eq!(legacy_no_replay.replay, AttachReplayMode::None);
+    assert_eq!(legacy_no_replay.requested_terminal_size, None);
+
+    let default_no_replay: SessionAttachRequest = serde_json::from_value(json!({
+        "selector": {"type": "id", "session_id": "018f5d8d-3e79-4a62-9bc5-51c3c7f4d5c8"}
+    }))
+    .expect("default attach params deserialize");
+    assert_eq!(default_no_replay.replay, AttachReplayMode::None);
+    assert_eq!(default_no_replay.requested_terminal_size, None);
+}
+
+#[test]
+fn session_attach_terminal_snapshot_carries_requested_size() {
+    let session_id: SessionId = "018f5d8d-3e79-4a62-9bc5-51c3c7f4d5c8".parse().unwrap();
+    let params = SessionAttachRequest {
+        selector: SessionSelector::Id { session_id },
+        read_only: false,
+        replay: AttachReplayMode::TerminalSnapshot,
+        requested_terminal_size: Some(TerminalDimensions { rows: 31, cols: 99 }),
+    };
+
+    let request =
+        ControlRequest::with_params("attach-sized", ControlMethod::SessionAttach, &params)
+            .expect("params serialize");
+
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(request.to_json_line().unwrap().trim_end())
+            .unwrap(),
+        json!({
+            "id": "attach-sized",
+            "method": "session.attach",
+            "params": {
+                "selector": {"type": "id", "session_id": "018f5d8d-3e79-4a62-9bc5-51c3c7f4d5c8"},
+                "replay": "terminal_snapshot",
+                "requested_terminal_size": {"rows": 31, "cols": 99}
+            }
+        })
+    );
+
+    let decoded = request.params_as::<SessionAttachRequest>().unwrap();
+    assert_eq!(
+        decoded.requested_terminal_size,
+        Some(TerminalDimensions { rows: 31, cols: 99 })
+    );
+}
+
+#[test]
+fn worker_attach_replay_modes_decode_legacy_scrollback_boolean() {
+    let request = WorkerControlRequest::with_params(
+        "worker-attach-1",
+        WorkerControlMethod::AcquireAttach,
+        &WorkerAttachRequest {
+            stream_id: "stream-1".to_string(),
+            read_only: false,
+            replay: AttachReplayMode::TerminalSnapshot,
+            requested_terminal_size: Some(TerminalDimensions { rows: 31, cols: 99 }),
+        },
+    )
+    .expect("worker request serializes");
+
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(request.to_json_line().unwrap().trim_end())
+            .unwrap(),
+        json!({
+            "id": "worker-attach-1",
+            "method": "acquire_attach",
+            "params": {
+                "stream_id": "stream-1",
+                "replay": "terminal_snapshot",
+                "requested_terminal_size": {"rows": 31, "cols": 99}
+            }
+        })
+    );
+    let decoded = request.params_as::<WorkerAttachRequest>().unwrap();
+    assert_eq!(
+        decoded.requested_terminal_size,
+        Some(TerminalDimensions { rows: 31, cols: 99 })
+    );
+
+    let legacy: WorkerAttachRequest = serde_json::from_value(json!({
+        "stream_id": "stream-legacy",
+        "include_scrollback": true
+    }))
+    .expect("legacy worker attach params deserialize");
+    assert_eq!(legacy.replay, AttachReplayMode::LineScrollback);
+    assert_eq!(legacy.requested_terminal_size, None);
+}
+
+#[test]
+fn worker_attach_state_exposes_active_clients_and_input_owner() {
+    let request = WorkerControlRequest::with_params(
+        "worker-attach-state-1",
+        WorkerControlMethod::AttachState,
+        &json!({}),
+    )
+    .expect("worker request serializes");
+
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(request.to_json_line().unwrap().trim_end())
+            .unwrap(),
+        json!({
+            "id": "worker-attach-state-1",
+            "method": "attach_state",
+            "params": {}
+        })
+    );
+
+    let result = WorkerAttachStateResponse {
+        attached_clients: 2,
+        input_owner: Some("stream-owner".to_string()),
+    };
+    let encoded = serde_json::to_value(&result).expect("state result serializes");
+    assert_eq!(
+        encoded,
+        json!({
+            "attached_clients": 2,
+            "input_owner": "stream-owner"
+        })
+    );
+}
+
+#[test]
+fn raw_attach_output_frame_serializes_bytes_as_base64() {
+    let frame = AttachStreamFrame::raw_output(vec![0x00, 0xff, b'A']);
+    let encoded = frame.to_json_line().expect("frame serializes");
+
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(encoded.trim_end()).unwrap(),
+        json!({
+            "type": "raw_output",
+            "data": "AP9B"
+        })
+    );
+    assert!(matches!(
+        AttachStreamFrame::from_json_line(&encoded).expect("frame deserializes"),
+        AttachStreamFrame::RawOutput { data } if data.as_slice() == [0x00, 0xff, b'A']
+    ));
 }
 
 #[test]
@@ -200,6 +387,18 @@ fn ui_context_matches_m2a_jsonl_contract() {
         agent_session_id: None,
         managed_daemon_session_ids: vec![daemon_id],
         monitor_profile: MonitorProfile::Basic,
+        daemon_health: vec![UiDaemonHealth {
+            session_id: daemon_id,
+            process_state: ProcessState::FailedStart,
+            attention_state: AttentionState::NeedsAttention,
+            failure_message: Some("failed to spawn pty child: not found".to_string()),
+            recovery_actions: vec![
+                UiDaemonRecoveryAction::Inspect,
+                UiDaemonRecoveryAction::Logs,
+                UiDaemonRecoveryAction::Doctor,
+                UiDaemonRecoveryAction::Delete,
+            ],
+        }],
         updated_at: datetime!(2026-05-26 04:00:00 UTC),
     };
 
@@ -237,6 +436,18 @@ fn ui_context_matches_m2a_jsonl_contract() {
                         "818b61b1-a620-4a57-8e72-4d439d03840f"
                     ],
                     "monitor_profile": "basic",
+                    "daemon_health": [{
+                        "session_id": "818b61b1-a620-4a57-8e72-4d439d03840f",
+                        "process_state": "failed_start",
+                        "attention_state": "needs_attention",
+                        "failure_message": "failed to spawn pty child: not found",
+                        "recovery_actions": [
+                            "inspect",
+                            "logs",
+                            "doctor",
+                            "delete"
+                        ]
+                    }],
                     "updated_at": "2026-05-26T04:00:00Z"
                 }
             }

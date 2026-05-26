@@ -5,6 +5,7 @@ use std::{
     os::unix::net::UnixStream,
     path::{Path, PathBuf},
     process::{Child, Command},
+    sync::Once,
     thread,
     time::{Duration, Instant},
 };
@@ -17,8 +18,9 @@ use millrace_sessions_core::{
         SessionDeleteResponse, SessionEventsResponse, SessionKillResponse, SessionLogsResponse,
         SessionResizeResponse, SessionSendResponse, SessionStartResponse, SessionStopResponse,
     },
+    scrollback::{restore_terminal_replay, TerminalSnapshot, TerminalStateBuffer},
     state::{ProcessState, SessionMeta, WorkerMeta},
-    storage::read_json,
+    storage::{append_raw_pty_log, read_json},
 };
 use serde_json::{json, Value};
 
@@ -83,6 +85,11 @@ fn start_persists_worker_output_and_lifecycle_state() {
     wait_for_file_contains(&session_paths.scrollback_snapshot, "ready");
     let scrollback = fs::read_to_string(&session_paths.scrollback_snapshot).unwrap();
     assert!(scrollback.contains("ready"));
+    wait_for_file_contains(&session_paths.terminal_snapshot, "ready");
+    assert!(session_paths.raw_replay_ring.exists());
+    assert!(fs::read(&session_paths.raw_replay_ring)
+        .unwrap()
+        .ends_with(b"ready"));
 
     daemon.kill();
 }
@@ -108,6 +115,7 @@ fn session_artifacts_are_private() {
     wait_for_file_contains(&session_paths.worker_json, "\"session_id\"");
     wait_for_file_contains(&session_paths.events_jsonl, "\"output\"");
     wait_for_file_contains(&session_paths.scrollback_snapshot, "ready");
+    wait_for_file_contains(&session_paths.terminal_snapshot, "ready");
 
     assert_private_dir(&session_paths.root);
     assert_private_file(&session_paths.meta_json);
@@ -115,6 +123,8 @@ fn session_artifacts_are_private() {
     assert_private_file(&session_paths.events_jsonl);
     assert_private_file(&session_paths.pty_log);
     assert_private_file(&session_paths.scrollback_snapshot);
+    assert_private_file(&session_paths.terminal_snapshot);
+    assert_private_file(&session_paths.raw_replay_ring);
 
     daemon.kill();
 }
@@ -169,6 +179,123 @@ fn start_returns_existing_active_daemon_for_duplicate_workspace_role() {
         second_start.session.session_id,
         first_start.session.session_id
     );
+
+    daemon.kill();
+}
+
+#[test]
+fn daemon_command_resolution_failure_persists_failed_start_summary() {
+    let temp = tempfile::tempdir().unwrap();
+    let paths = StatePaths::new(temp.path().join("state"));
+    let workspace = temp.path().join("workspace");
+    let empty_bin = temp.path().join("empty-bin");
+    fs::create_dir_all(&workspace).unwrap();
+    fs::create_dir_all(&empty_bin).unwrap();
+    let path_env = std::env::join_paths([empty_bin]).unwrap();
+    let mut daemon = DaemonChild::spawn(&paths);
+    wait_for_socket(&paths.control_sock);
+
+    let response = request_json(
+        &paths,
+        json!({
+            "id": "daemon-missing-command",
+            "method": "session.start",
+            "params": {
+                "name": "daemon-missing-command",
+                "role": "millrace_daemon",
+                "workspace": workspace,
+                "cwd": workspace,
+                "argv": ["millrace", "run", "daemon", "--workspace", workspace],
+                "env": {"PATH": path_env.to_string_lossy()}
+            }
+        }),
+    );
+    assert_eq!(response["ok"], true, "{response:#}");
+    let start: SessionStartResponse =
+        serde_json::from_value(response["result"].clone()).expect("start result");
+    let session_paths = paths.session_paths(start.session.session_id);
+    let meta = wait_for_meta_state(&session_paths.meta_json, ProcessState::FailedStart);
+
+    let failure = meta.failure_message.expect("failed_start message");
+    assert!(failure.contains("failed to spawn pty child"), "{failure}");
+
+    let listed = request_json(
+        &paths,
+        json!({
+            "id": "list-failed-daemon",
+            "method": "session.list",
+            "params": {
+                "role": "millrace_daemon",
+                "workspace": workspace
+            }
+        }),
+    );
+    assert_eq!(listed["ok"], true, "{listed:#}");
+    assert_eq!(
+        listed["result"]["sessions"][0]["process_state"], "failed_start",
+        "{listed:#}"
+    );
+    assert!(
+        listed["result"]["sessions"][0]["failure_message"]
+            .as_str()
+            .is_some_and(|message| message.contains("failed to spawn pty child")),
+        "{listed:#}"
+    );
+
+    daemon.kill();
+}
+
+#[test]
+fn millrace_status_probe_redacts_secret_stderr() {
+    let temp = tempfile::tempdir().unwrap();
+    let paths = StatePaths::new(temp.path().join("state"));
+    let workspace = temp.path().join("workspace");
+    fs::create_dir_all(&workspace).unwrap();
+    let path_env = fake_millrace_path(
+        temp.path(),
+        r#"if [ "$1" = "status" ]; then
+  printf 'MILLRACE_TOKEN=super-secret NORMAL=value\n' >&2
+  exit 7
+fi
+exit 0
+"#,
+    );
+    let mut daemon = DaemonChild::spawn(&paths);
+    wait_for_socket(&paths.control_sock);
+
+    let response = request_json(
+        &paths,
+        json!({
+            "id": "daemon-status-secret",
+            "method": "session.start",
+            "params": {
+                "name": "daemon-status-secret",
+                "role": "millrace_daemon",
+                "workspace": workspace,
+                "cwd": workspace,
+                "argv": ["sh", "-c", "sleep 1"],
+                "env": {"PATH": path_env}
+            }
+        }),
+    );
+    assert_eq!(response["ok"], true, "{response:#}");
+    let start: SessionStartResponse =
+        serde_json::from_value(response["result"].clone()).expect("start result");
+    let session_paths = paths.session_paths(start.session.session_id);
+    wait_for_event_kind(
+        &session_paths.events_jsonl,
+        SessionEventKind::MillraceStatusProbe,
+    );
+
+    let events = read_events(&session_paths.events_jsonl).unwrap();
+    let stderr = events
+        .iter()
+        .find(|event| event.kind == SessionEventKind::MillraceStatusProbe)
+        .and_then(|event| event.fields.get("stderr"))
+        .expect("status probe stderr");
+    assert!(stderr.contains("MILLRACE_TOKEN=<redacted>"), "{stderr}");
+    assert!(stderr.contains("NORMAL=value"), "{stderr}");
+    assert!(!stderr.contains("super-secret"), "{stderr}");
 
     daemon.kill();
 }
@@ -371,6 +498,7 @@ fn resize_forwards_dimensions_and_records_event() {
         serde_json::from_value(response["result"].clone()).expect("resize result");
     assert_eq!((resize.rows, resize.cols), (31, 99));
     wait_for_event_kind(&session_paths.events_jsonl, SessionEventKind::Resize);
+    wait_for_terminal_snapshot_size(&session_paths.terminal_snapshot, 31, 99);
 
     daemon.kill();
 }
@@ -535,6 +663,8 @@ fn delete_refuses_running_archives_stopped_and_purges_explicitly() {
     assert!(archive_root.join("pty.log").exists());
     assert!(archive_root.join("worker.json").exists());
     assert!(archive_root.join("scrollback.snapshot").exists());
+    assert!(archive_root.join("terminal.snapshot.json").exists());
+    assert!(archive_root.join("pty.replay").exists());
 
     let active_list = request_json(
         &paths,
@@ -619,7 +749,7 @@ fn attach_streams_scrollback_releases_input_and_leaves_session_running() {
                     "method": "session.attach",
                     "params": {
                         "selector": {"type": "id", "session_id": start.session.session_id},
-                        "include_scrollback": true
+                        "replay": "line_scrollback"
                     }
                 }))
                 .unwrap()
@@ -677,6 +807,180 @@ fn attach_streams_scrollback_releases_input_and_leaves_session_running() {
         }),
     );
     assert_eq!(after_close["ok"], true, "{after_close:#}");
+
+    daemon.kill();
+}
+
+#[test]
+fn attach_terminal_snapshot_replays_raw_bytes_without_text_conversion() {
+    let temp = tempfile::tempdir().unwrap();
+    let paths = StatePaths::new(temp.path().join("state"));
+    let workspace = temp.path().join("workspace");
+    fs::create_dir_all(&workspace).unwrap();
+    let mut daemon = DaemonChild::spawn(&paths);
+    wait_for_socket(&paths.control_sock);
+
+    let start = start_session(&paths, &workspace, "raw-attach-shell", "sleep 5");
+    let session_paths = paths.session_paths(start.session.session_id);
+    wait_for_worker_socket(&session_paths.worker_sock);
+    wait_for_running_meta(&session_paths.meta_json);
+    let raw = b"\x1b[?1049h\xffraw\r\n".to_vec();
+    persist_terminal_replay_fixture(&session_paths, &raw, raw.len() as u64);
+
+    let mut stream = UnixStream::connect(&paths.control_sock).expect("connect attach stream");
+    stream
+        .write_all(
+            format!(
+                "{}\n",
+                serde_json::to_string(&json!({
+                    "id": "attach-raw",
+                    "method": "session.attach",
+                    "params": {
+                        "selector": {"type": "id", "session_id": start.session.session_id},
+                        "replay": "terminal_snapshot",
+                        "requested_terminal_size": {"rows": 24, "cols": 80}
+                    }
+                }))
+                .unwrap()
+            )
+            .as_bytes(),
+        )
+        .unwrap();
+    let mut reader = BufReader::new(stream.try_clone().unwrap());
+    let mut response_line = String::new();
+    reader.read_line(&mut response_line).unwrap();
+    let response: ControlResponse = serde_json::from_str(response_line.trim_end()).unwrap();
+    assert!(response.ok, "{response:#?}");
+
+    let mut frame_line = String::new();
+    reader.read_line(&mut frame_line).unwrap();
+    assert!(
+        !frame_line.contains('\u{fffd}'),
+        "raw replay must not pass through UTF-8 replacement: {frame_line:?}"
+    );
+    let frame = AttachStreamFrame::from_json_line(&frame_line).unwrap();
+    assert!(
+        matches!(frame, AttachStreamFrame::RawOutput { data } if data.as_slice() == raw.as_slice())
+    );
+
+    stream
+        .write_all(AttachStreamFrame::Close.to_json_line().unwrap().as_bytes())
+        .unwrap();
+    wait_for_event_kind(&session_paths.events_jsonl, SessionEventKind::AttachClosed);
+    daemon.kill();
+}
+
+#[test]
+fn attach_terminal_snapshot_skips_mismatched_size_raw_replay() {
+    let temp = tempfile::tempdir().unwrap();
+    let paths = StatePaths::new(temp.path().join("state"));
+    let workspace = temp.path().join("workspace");
+    fs::create_dir_all(&workspace).unwrap();
+    let mut daemon = DaemonChild::spawn(&paths);
+    wait_for_socket(&paths.control_sock);
+
+    let start = start_session(&paths, &workspace, "mismatch-raw-attach-shell", "sleep 5");
+    let session_paths = paths.session_paths(start.session.session_id);
+    wait_for_worker_socket(&session_paths.worker_sock);
+    wait_for_running_meta(&session_paths.meta_json);
+    let raw = b"\x1b[?1049hsize-sensitive raw\r\n".to_vec();
+    persist_terminal_replay_fixture(&session_paths, &raw, raw.len() as u64);
+
+    let mut stream = UnixStream::connect(&paths.control_sock).expect("connect attach stream");
+    stream
+        .write_all(
+            format!(
+                "{}\n",
+                serde_json::to_string(&json!({
+                    "id": "attach-size-mismatch",
+                    "method": "session.attach",
+                    "params": {
+                        "selector": {"type": "id", "session_id": start.session.session_id},
+                        "replay": "terminal_snapshot",
+                        "requested_terminal_size": {"rows": 30, "cols": 100}
+                    }
+                }))
+                .unwrap()
+            )
+            .as_bytes(),
+        )
+        .unwrap();
+    let mut reader = BufReader::new(stream.try_clone().unwrap());
+    let mut response_line = String::new();
+    reader.read_line(&mut response_line).unwrap();
+    let response: ControlResponse = serde_json::from_str(response_line.trim_end()).unwrap();
+    assert!(response.ok, "{response:#?}");
+
+    stream
+        .write_all(AttachStreamFrame::Close.to_json_line().unwrap().as_bytes())
+        .unwrap();
+    let mut frame_line = String::new();
+    reader.read_line(&mut frame_line).unwrap();
+    let frame = AttachStreamFrame::from_json_line(&frame_line).unwrap();
+    assert_eq!(frame, AttachStreamFrame::Closed);
+
+    daemon.kill();
+}
+
+#[test]
+fn attach_terminal_snapshot_skips_stale_raw_replay() {
+    let temp = tempfile::tempdir().unwrap();
+    let paths = StatePaths::new(temp.path().join("state"));
+    let workspace = temp.path().join("workspace");
+    fs::create_dir_all(&workspace).unwrap();
+    let mut daemon = DaemonChild::spawn(&paths);
+    wait_for_socket(&paths.control_sock);
+
+    let start = start_session(&paths, &workspace, "stale-raw-attach-shell", "sleep 5");
+    let session_paths = paths.session_paths(start.session.session_id);
+    wait_for_worker_socket(&session_paths.worker_sock);
+    wait_for_running_meta(&session_paths.meta_json);
+    let raw = b"\x1b[?1049hstale raw\r\n".to_vec();
+    persist_terminal_replay_fixture(&session_paths, &raw, raw.len() as u64);
+    append_raw_pty_log(&session_paths.pty_log, b"newer").unwrap();
+    assert!(
+        restore_terminal_replay(
+            &session_paths.terminal_snapshot,
+            &session_paths.raw_replay_ring,
+            raw.len() as u64 + 5
+        )
+        .unwrap()
+        .is_none(),
+        "fixture should be stale before attach"
+    );
+
+    let mut stream = UnixStream::connect(&paths.control_sock).expect("connect attach stream");
+    stream
+        .write_all(
+            format!(
+                "{}\n",
+                serde_json::to_string(&json!({
+                    "id": "attach-stale-raw",
+                    "method": "session.attach",
+                    "params": {
+                        "selector": {"type": "id", "session_id": start.session.session_id},
+                        "replay": "terminal_snapshot",
+                        "requested_terminal_size": {"rows": 24, "cols": 80}
+                    }
+                }))
+                .unwrap()
+            )
+            .as_bytes(),
+        )
+        .unwrap();
+    let mut reader = BufReader::new(stream.try_clone().unwrap());
+    let mut response_line = String::new();
+    reader.read_line(&mut response_line).unwrap();
+    let response: ControlResponse = serde_json::from_str(response_line.trim_end()).unwrap();
+    assert!(response.ok, "{response:#?}");
+
+    stream
+        .write_all(AttachStreamFrame::Close.to_json_line().unwrap().as_bytes())
+        .unwrap();
+    let mut frame_line = String::new();
+    reader.read_line(&mut frame_line).unwrap();
+    let frame = AttachStreamFrame::from_json_line(&frame_line).unwrap();
+    assert_eq!(frame, AttachStreamFrame::Closed);
 
     daemon.kill();
 }
@@ -742,6 +1046,161 @@ fn attach_drop_without_close_releases_input_and_records_closed() {
     daemon.kill();
 }
 
+#[test]
+fn attach_read_only_observer_does_not_steal_input_owner() {
+    let temp = tempfile::tempdir().unwrap();
+    let paths = StatePaths::new(temp.path().join("state"));
+    let workspace = temp.path().join("workspace");
+    fs::create_dir_all(&workspace).unwrap();
+    let mut daemon = DaemonChild::spawn(&paths);
+    wait_for_socket(&paths.control_sock);
+
+    let start = start_session(
+        &paths,
+        &workspace,
+        "attach-owner-shell",
+        "printf 'ready\\n'; while IFS= read -r line; do printf 'got:%s\\n' \"$line\"; done",
+    );
+    let session_paths = paths.session_paths(start.session.session_id);
+    wait_for_worker_socket(&session_paths.worker_sock);
+    wait_for_running_meta(&session_paths.meta_json);
+    wait_for_file_contains(&session_paths.pty_log, "ready");
+
+    let mut owner = open_attach_stream(&paths, start.session.session_id, false);
+    let owner_response = read_attach_response(&owner);
+    assert!(owner_response.stream.input_owner);
+    assert!(!owner_response.stream.read_only);
+    let owner_stream_id = owner_response.stream.stream_id.clone();
+    let listed_owner = listed_session(&paths, start.session.session_id);
+    assert_eq!(listed_owner["attached_clients"], 1, "{listed_owner:#}");
+    assert_eq!(
+        listed_owner["input_owner"], owner_stream_id,
+        "{listed_owner:#}"
+    );
+    let inspected_owner = inspected_session_summary(&paths, start.session.session_id);
+    assert_eq!(
+        inspected_owner["attached_clients"], 1,
+        "{inspected_owner:#}"
+    );
+    assert_eq!(
+        inspected_owner["input_owner"], owner_stream_id,
+        "{inspected_owner:#}"
+    );
+
+    let mut observer = open_attach_stream(&paths, start.session.session_id, true);
+    let observer_response = read_attach_response(&observer);
+    assert!(!observer_response.stream.input_owner);
+    assert!(observer_response.stream.read_only);
+    let listed_observer = listed_session(&paths, start.session.session_id);
+    assert_eq!(
+        listed_observer["attached_clients"], 2,
+        "{listed_observer:#}"
+    );
+    assert_eq!(
+        listed_observer["input_owner"], owner_stream_id,
+        "{listed_observer:#}"
+    );
+
+    let conflict = request_json(
+        &paths,
+        json!({
+            "id": "send-while-owned",
+            "method": "session.send",
+            "params": {
+                "selector": {"type": "id", "session_id": start.session.session_id},
+                "text": "blocked\n"
+            }
+        }),
+    );
+    assert_error(
+        &conflict,
+        "send-while-owned",
+        ControlErrorCode::InputOwnerConflict,
+    );
+
+    observer
+        .write_all(AttachStreamFrame::Close.to_json_line().unwrap().as_bytes())
+        .unwrap();
+    wait_for_attach_closed_count(&session_paths.events_jsonl, 1);
+    let listed_after_observer_close = listed_session(&paths, start.session.session_id);
+    assert_eq!(
+        listed_after_observer_close["attached_clients"], 1,
+        "{listed_after_observer_close:#}"
+    );
+    assert_eq!(
+        listed_after_observer_close["input_owner"], owner_stream_id,
+        "{listed_after_observer_close:#}"
+    );
+
+    owner
+        .write_all(AttachStreamFrame::Close.to_json_line().unwrap().as_bytes())
+        .unwrap();
+    wait_for_attach_closed_count(&session_paths.events_jsonl, 2);
+    let listed_after_owner_close = listed_session(&paths, start.session.session_id);
+    assert_eq!(
+        listed_after_owner_close["attached_clients"], 0,
+        "{listed_after_owner_close:#}"
+    );
+    assert_eq!(
+        listed_after_owner_close["input_owner"],
+        Value::Null,
+        "{listed_after_owner_close:#}"
+    );
+
+    let after_close = request_json(
+        &paths,
+        json!({
+            "id": "send-after-owner-close",
+            "method": "session.send",
+            "params": {
+                "selector": {"type": "id", "session_id": start.session.session_id},
+                "text": "after-owner-close\n"
+            }
+        }),
+    );
+    assert_eq!(after_close["ok"], true, "{after_close:#}");
+    wait_for_file_contains(&session_paths.pty_log, "got:after-owner-close");
+
+    daemon.kill();
+}
+
+fn listed_session(paths: &StatePaths, session_id: millrace_sessions_core::ids::SessionId) -> Value {
+    let listed = request_json(
+        paths,
+        json!({
+            "id": "list-attach-state",
+            "method": "session.list",
+            "params": {}
+        }),
+    );
+    assert_eq!(listed["ok"], true, "{listed:#}");
+    listed["result"]["sessions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|session| session["session_id"] == session_id.to_string())
+        .unwrap_or_else(|| panic!("missing session {session_id} in {listed:#}"))
+        .clone()
+}
+
+fn inspected_session_summary(
+    paths: &StatePaths,
+    session_id: millrace_sessions_core::ids::SessionId,
+) -> Value {
+    let inspected = request_json(
+        paths,
+        json!({
+            "id": "inspect-attach-state",
+            "method": "session.inspect",
+            "params": {
+                "selector": {"type": "id", "session_id": session_id}
+            }
+        }),
+    );
+    assert_eq!(inspected["ok"], true, "{inspected:#}");
+    inspected["result"]["session"].clone()
+}
+
 fn request_json(paths: &StatePaths, value: Value) -> Value {
     let mut stream = UnixStream::connect(&paths.control_sock).expect("connect to daemon socket");
     stream
@@ -752,6 +1211,42 @@ fn request_json(paths: &StatePaths, value: Value) -> Value {
         .read_line(&mut response)
         .expect("read response");
     serde_json::from_str(response.trim_end()).expect("response is json")
+}
+
+fn open_attach_stream(
+    paths: &StatePaths,
+    session_id: millrace_sessions_core::ids::SessionId,
+    read_only: bool,
+) -> UnixStream {
+    let mut stream = UnixStream::connect(&paths.control_sock).expect("connect attach stream");
+    stream
+        .write_all(
+            format!(
+                "{}\n",
+                serde_json::to_string(&json!({
+                    "id": if read_only { "attach-observer" } else { "attach-owner" },
+                    "method": "session.attach",
+                    "params": {
+                        "selector": {"type": "id", "session_id": session_id},
+                        "read_only": read_only,
+                        "replay": "none"
+                    }
+                }))
+                .unwrap()
+            )
+            .as_bytes(),
+        )
+        .unwrap();
+    stream
+}
+
+fn read_attach_response(stream: &UnixStream) -> SessionAttachResponse {
+    let mut reader = BufReader::new(stream.try_clone().unwrap());
+    let mut response_line = String::new();
+    reader.read_line(&mut response_line).unwrap();
+    let response: ControlResponse = serde_json::from_str(response_line.trim_end()).unwrap();
+    assert!(response.ok, "{response:#?}");
+    response.result_as().unwrap()
 }
 
 fn start_session(
@@ -888,6 +1383,80 @@ fn wait_for_event_kind(path: &Path, kind: SessionEventKind) {
     panic!("{} did not contain event kind {kind:?}", path.display());
 }
 
+fn wait_for_terminal_snapshot_size(path: &Path, rows: u16, cols: u16) {
+    let started = Instant::now();
+    while started.elapsed() < Duration::from_secs(5) {
+        if read_json::<TerminalSnapshot>(path)
+            .map(|snapshot| snapshot.same_size(rows, cols))
+            .unwrap_or(false)
+        {
+            return;
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
+    panic!(
+        "{} did not contain terminal snapshot size rows={rows} cols={cols}",
+        path.display()
+    );
+}
+
+fn wait_for_attach_closed_count(path: &Path, expected: usize) {
+    let started = Instant::now();
+    while started.elapsed() < Duration::from_secs(5) {
+        if read_events(path)
+            .map(|events| {
+                events
+                    .iter()
+                    .filter(|event| event.kind == SessionEventKind::AttachClosed)
+                    .count()
+                    >= expected
+            })
+            .unwrap_or(false)
+        {
+            return;
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
+    panic!(
+        "{} did not contain {expected} attach closed events",
+        path.display()
+    );
+}
+
+fn persist_terminal_replay_fixture(
+    session_paths: &millrace_sessions_core::state::SessionPaths,
+    raw: &[u8],
+    expected_offset: u64,
+) {
+    append_raw_pty_log(&session_paths.pty_log, raw).unwrap();
+    let mut state = TerminalStateBuffer::new(24, 80, 1024, 0);
+    state.process_output(raw);
+    state
+        .persist(
+            &session_paths.terminal_snapshot,
+            &session_paths.raw_replay_ring,
+        )
+        .unwrap();
+    let snapshot: TerminalSnapshot = read_json(&session_paths.terminal_snapshot).unwrap();
+    assert_eq!(snapshot.pty_log_offset, expected_offset);
+}
+
+fn fake_millrace_path(root: &Path, script: &str) -> String {
+    use std::os::unix::fs::PermissionsExt;
+
+    let bin = root.join("fake-bin");
+    fs::create_dir_all(&bin).unwrap();
+    let millrace = bin.join("millrace");
+    fs::write(&millrace, format!("#!/bin/sh\n{script}\n")).unwrap();
+    let mut permissions = fs::metadata(&millrace).unwrap().permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&millrace, permissions).unwrap();
+    std::env::join_paths([bin])
+        .unwrap()
+        .to_string_lossy()
+        .to_string()
+}
+
 #[cfg(unix)]
 fn assert_private_dir(path: &Path) {
     use std::os::unix::fs::PermissionsExt;
@@ -966,16 +1535,23 @@ fn worker_bin() -> PathBuf {
 }
 
 fn ensure_bin(path: &Path, binary_name: &str) {
-    if is_executable(path) {
-        return;
-    }
+    static SESSIOND_BUILD: Once = Once::new();
+    static WORKER_BUILD: Once = Once::new();
 
-    let status = Command::new("cargo")
-        .args(["build", "-p", "millrace-sessions", "--bin", binary_name])
-        .current_dir(workspace_root())
-        .status()
-        .unwrap_or_else(|error| panic!("build {binary_name}: {error}"));
-    assert!(status.success(), "failed to build {binary_name}");
+    let build = || {
+        let status = Command::new("cargo")
+            .args(["build", "-p", "millrace-sessions", "--bin", binary_name])
+            .current_dir(workspace_root())
+            .status()
+            .unwrap_or_else(|error| panic!("build {binary_name}: {error}"));
+        assert!(status.success(), "failed to build {binary_name}");
+    };
+    match binary_name {
+        "millrace-sessiond" => SESSIOND_BUILD.call_once(build),
+        "millrace-session-worker" => WORKER_BUILD.call_once(build),
+        _ => build(),
+    }
+    assert!(is_executable(path), "{} is not executable", path.display());
 }
 
 fn is_executable(path: &Path) -> bool {
