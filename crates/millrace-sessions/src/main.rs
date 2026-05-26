@@ -3,6 +3,7 @@ mod client;
 mod cockpit;
 mod commands;
 mod console;
+mod launch_env;
 mod output;
 
 use std::{

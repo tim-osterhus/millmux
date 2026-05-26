@@ -36,6 +36,7 @@ use thiserror::Error;
 use crate::{
     client::{ClientError, SessionControlClient},
     commands::{CommandError, ConsoleArgs, ConsoleCommand},
+    launch_env::{current_launch_env, resolve_argv_executable},
 };
 
 const LOG_TAIL: usize = 4000;
@@ -205,6 +206,7 @@ async fn start_workspace_daemon(
         argv.push("--monitor".to_string());
         argv.push(monitor.as_wire_value());
     }
+    resolve_argv_executable(&mut argv);
     let name = canonical_workspace
         .file_name()
         .and_then(|value| value.to_str())
@@ -218,7 +220,7 @@ async fn start_workspace_daemon(
             role: Some(SessionRole::MillraceDaemon),
             session_id: None,
             monitor_profile: monitor.clone(),
-            env: Default::default(),
+            env: current_launch_env(),
         })
         .await?;
     Ok(result.session)

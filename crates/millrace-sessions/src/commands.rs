@@ -16,6 +16,8 @@ use millrace_sessions_core::{
 use millrace_sessions_tui::{AgentCockpitLayout, DaemonConsoleLayout};
 use thiserror::Error;
 
+use crate::launch_env::current_launch_env;
+
 #[derive(Debug, Parser)]
 #[command(name = "millmux", about = "Control local Millrace sessions")]
 pub struct Cli {
@@ -98,7 +100,7 @@ impl StartArgs {
             role: self.role.clone(),
             session_id: None,
             monitor_profile: self.monitor.clone(),
-            env: Default::default(),
+            env: current_launch_env(),
         })
     }
 }
@@ -682,6 +684,12 @@ mod tests {
                 assert_eq!(request.role, Some(SessionRole::MillraceDaemon));
                 assert_eq!(request.workspace, Some(PathBuf::from("/tmp/workspace")));
                 assert_eq!(request.cwd, Some(PathBuf::from("/tmp/workspace")));
+                if let Ok(path) = env::var("PATH") {
+                    assert_eq!(
+                        request.env.get("PATH").map(String::as_str),
+                        Some(path.as_str())
+                    );
+                }
             }
             other => panic!("unexpected command: {other:?}"),
         }

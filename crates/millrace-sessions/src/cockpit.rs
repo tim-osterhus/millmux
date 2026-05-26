@@ -36,6 +36,7 @@ use thiserror::Error;
 use crate::{
     client::{AttachConnection, ClientError, SessionControlClient},
     commands::{CockpitArgs, CommandError},
+    launch_env::{current_launch_env, merge_current_launch_env, resolve_argv_executable},
 };
 
 const LOG_TAIL: usize = 4000;
@@ -224,6 +225,7 @@ async fn start_workspace_daemon(
         argv.push("--monitor".to_string());
         argv.push(monitor.as_wire_value());
     }
+    resolve_argv_executable(&mut argv);
     let name = workspace
         .file_name()
         .and_then(|value| value.to_str())
@@ -237,7 +239,7 @@ async fn start_workspace_daemon(
             role: Some(SessionRole::MillraceDaemon),
             session_id: None,
             monitor_profile: monitor.clone(),
-            env: Default::default(),
+            env: current_launch_env(),
         })
         .await?
         .session)
@@ -250,7 +252,8 @@ async fn ensure_agent_session(
     daemon_session_id: Option<SessionId>,
     workspace: &Path,
 ) -> Result<millrace_sessions_core::protocol::SessionSummary, CockpitError> {
-    let argv = args.resolved_agent_argv();
+    let mut argv = args.resolved_agent_argv();
+    resolve_argv_executable(&mut argv);
     let existing = client
         .list(&SessionListRequest {
             role: Some(SessionRole::Agent),
@@ -271,7 +274,7 @@ async fn ensure_agent_session(
     let agent_session_id = SessionId::new();
     let state = state_paths()?;
     let ui_paths = state.ui_context_paths(ui_id);
-    let mut env = BTreeMap::from([
+    let mut env = merge_current_launch_env(BTreeMap::from([
         (UI_ID_ENV.to_string(), ui_id.to_string()),
         (
             CONTEXT_FILE_ENV.to_string(),
@@ -293,7 +296,7 @@ async fn ensure_agent_session(
             MILLRACE_WORKSPACE_ENV.to_string(),
             workspace.display().to_string(),
         ),
-    ]);
+    ]));
     if let Some(session_id) = daemon_session_id {
         env.insert(
             "MILLMUX_ACTIVE_DAEMON_SESSION_ID".to_string(),
@@ -400,11 +403,7 @@ async fn run_interactive_cockpit(
         match tokio::time::timeout(Duration::from_millis(5), attach.reader.next_frame()).await {
             Ok(Ok(Some(frame))) => match frame {
                 AttachStreamFrame::Scrollback { lines } => {
-                    for line in lines {
-                        emulator.process_text(&line);
-                        emulator.process_text("\n");
-                    }
-                    app.update_agent_terminal(emulator.snapshot());
+                    let _ = lines;
                 }
                 AttachStreamFrame::Output { text } => {
                     emulator.process_text(&text);
@@ -503,23 +502,24 @@ async fn open_agent_attach(
     client: &SessionControlClient,
     session_id: SessionId,
 ) -> Result<OpenedAgentAttach, CockpitError> {
-    let request = SessionAttachRequest {
-        selector: SessionSelector::Id { session_id },
-        read_only: false,
-        include_scrollback: true,
-    };
+    let request = agent_attach_request(session_id, false);
     match client.attach(&request).await {
         Ok(connection) => Ok(opened_agent_attach(connection, false)),
         Err(ClientError::Control(error)) if error.code == ControlErrorCode::InputOwnerConflict => {
             let connection = client
-                .attach(&SessionAttachRequest {
-                    read_only: true,
-                    ..request
-                })
+                .attach(&agent_attach_request(session_id, true))
                 .await?;
             Ok(opened_agent_attach(connection, true))
         }
         Err(error) => Err(error.into()),
+    }
+}
+
+fn agent_attach_request(session_id: SessionId, read_only: bool) -> SessionAttachRequest {
+    SessionAttachRequest {
+        selector: SessionSelector::Id { session_id },
+        read_only,
+        include_scrollback: false,
     }
 }
 
@@ -790,6 +790,33 @@ fn absolute_path(path: &Path) -> PathBuf {
     env::current_dir()
         .map(|cwd| cwd.join(path))
         .unwrap_or_else(|_| path.to_path_buf())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cockpit_agent_attach_does_not_request_line_scrollback() {
+        let session_id = SessionId::new();
+
+        let request = agent_attach_request(session_id, false);
+
+        assert_eq!(request.selector, SessionSelector::Id { session_id });
+        assert!(!request.read_only);
+        assert!(
+            !request.include_scrollback,
+            "line scrollback cannot be replayed safely into an embedded full-screen TUI"
+        );
+    }
+
+    #[test]
+    fn cockpit_agent_read_only_attach_also_avoids_line_scrollback() {
+        let request = agent_attach_request(SessionId::new(), true);
+
+        assert!(request.read_only);
+        assert!(!request.include_scrollback);
+    }
 }
 
 struct TerminalSession {

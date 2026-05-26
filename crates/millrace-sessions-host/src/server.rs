@@ -401,7 +401,7 @@ fn start_session(
             ));
         }
 
-        match probe_millrace_status(&workspace.canonical_path) {
+        match probe_millrace_status(&workspace.canonical_path, &env) {
             MillraceStatusProbe::Running => {
                 return Err(StartSessionError::Control(
                     ControlErrorCode::DuplicateMillraceDaemon,
@@ -534,15 +534,19 @@ impl MillraceStatusProbeIssue {
     }
 }
 
-fn probe_millrace_status(workspace: &Path) -> MillraceStatusProbe {
-    match Command::new("millrace")
+fn probe_millrace_status(
+    workspace: &Path,
+    env_overrides: &BTreeMap<String, String>,
+) -> MillraceStatusProbe {
+    let mut command = Command::new("millrace");
+    command
         .arg("status")
         .arg("--format")
         .arg("json")
         .arg("--workspace")
         .arg(workspace)
-        .output()
-    {
+        .envs(env_overrides);
+    match command.output() {
         Ok(output) if output.status.success() => {
             match serde_json::from_slice::<Value>(&output.stdout) {
                 Ok(value) if value_process_running(&value) => MillraceStatusProbe::Running,
