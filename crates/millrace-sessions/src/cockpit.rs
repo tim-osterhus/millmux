@@ -354,7 +354,7 @@ async fn seed_agent_terminal_from_logs(
     }
     for line in response.lines {
         emulator.process_text(&line.line);
-        emulator.process_text("\n");
+        emulator.process_text("\r\n");
     }
     app.update_agent_terminal(emulator.snapshot());
     Ok(())
