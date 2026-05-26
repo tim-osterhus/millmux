@@ -2,9 +2,15 @@ use std::{env, path::PathBuf};
 
 use directories::BaseDirs;
 
-use crate::{error::MillmuxResult, ids::SessionId, state::SessionPaths};
+use crate::{
+    error::MillmuxResult,
+    ids::{SessionId, UiId},
+    state::{SessionPaths, UiContextPaths},
+};
 
 pub const STATE_DIR_ENV: &str = "MILLMUX_STATE_DIR";
+pub const UI_ID_ENV: &str = "MILLMUX_UI_ID";
+pub const CONTROL_SOCK_ENV: &str = "MILLMUX_CONTROL_SOCK";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StatePaths {
@@ -14,6 +20,7 @@ pub struct StatePaths {
     pub control_sock: PathBuf,
     pub sessions_dir: PathBuf,
     pub archive_dir: PathBuf,
+    pub views_dir: PathBuf,
 }
 
 impl StatePaths {
@@ -24,6 +31,7 @@ impl StatePaths {
             control_sock: root.join("session-control.sock"),
             sessions_dir: root.join("sessions"),
             archive_dir: root.join("archive"),
+            views_dir: root.join("views"),
             root,
         }
     }
@@ -35,6 +43,15 @@ impl StatePaths {
             .join("w")
             .join(format!("{}.sock", short_session_id(session_id)));
         paths
+    }
+
+    pub fn ui_context_paths(&self, ui_id: UiId) -> UiContextPaths {
+        let root = self.views_dir.join(ui_id.to_string());
+        UiContextPaths {
+            context_json: root.join("context.json"),
+            events_jsonl: root.join("events.jsonl"),
+            root,
+        }
     }
 }
 
@@ -124,6 +141,7 @@ mod tests {
         );
         assert_eq!(paths.sessions_dir, PathBuf::from("/state/sessions"));
         assert_eq!(paths.archive_dir, PathBuf::from("/state/archive"));
+        assert_eq!(paths.views_dir, PathBuf::from("/state/views"));
 
         let session = paths.session_paths(id);
         let root = PathBuf::from("/state/sessions").join(id.to_string());
@@ -140,6 +158,15 @@ mod tests {
             session.worker_sock,
             PathBuf::from("/state/w").join(format!("{}.sock", short_session_id(id)))
         );
+
+        let ui_id = UiId::new();
+        let ui = paths.ui_context_paths(ui_id);
+        assert_eq!(
+            ui.root,
+            PathBuf::from("/state/views").join(ui_id.to_string())
+        );
+        assert_eq!(ui.context_json, ui.root.join("context.json"));
+        assert_eq!(ui.events_jsonl, ui.root.join("events.jsonl"));
     }
 
     #[test]

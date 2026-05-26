@@ -3,7 +3,8 @@ use millrace_sessions_core::{
         DoctorResponse, EventStreamFrame, HostStatusResponse, LogStreamFrame,
         SessionDeleteResponse, SessionEventsResponse, SessionInspectResponse, SessionKillResponse,
         SessionListResponse, SessionLogsResponse, SessionResizeResponse, SessionSendResponse,
-        SessionStartResponse, SessionStopResponse, SessionSummary,
+        SessionStartResponse, SessionStopResponse, SessionSummary, UiContextGetResponse,
+        UiContextListResponse,
     },
     state::{AttentionState, ProcessState, SessionRole},
 };
@@ -25,11 +26,12 @@ pub fn render_list(result: &SessionListResponse) -> String {
     let mut lines = String::new();
     for session in &result.sessions {
         lines.push_str(&format!(
-            "{} {} role={} name={} cwd={}\n",
+            "{} {} role={} name={} monitor={} cwd={}\n",
             session.session_id,
             process_state(&session.process_state),
             role(&session.role),
             session.name.as_deref().unwrap_or("-"),
+            session.monitor_profile,
             session.cwd.display()
         ));
     }
@@ -77,11 +79,12 @@ pub fn render_doctor(result: &DoctorResponse) -> String {
 pub fn render_start(result: &SessionStartResponse) -> String {
     let session = &result.session;
     format!(
-        "session {} {} role={} name={} attached_existing={}\n",
+        "session {} {} role={} name={} monitor={} attached_existing={}\n",
         session.session_id,
         process_state(&session.process_state),
         role(&session.role),
         session.name.as_deref().unwrap_or("-"),
+        session.monitor_profile,
         result.attached_existing
     )
 }
@@ -89,11 +92,12 @@ pub fn render_start(result: &SessionStartResponse) -> String {
 pub fn render_session_status(result: &SessionInspectResponse) -> String {
     let session = &result.session;
     format!(
-        "session {} {} role={} name={} clients={}\n",
+        "session {} {} role={} name={} monitor={} clients={}\n",
         session.session_id,
         process_state(&session.process_state),
         role(&session.role),
         session.name.as_deref().unwrap_or("-"),
+        session.monitor_profile,
         session.attached_clients
     )
 }
@@ -167,6 +171,65 @@ pub fn render_delete(result: &SessionDeleteResponse) -> String {
     )
 }
 
+pub fn render_context(result: &UiContextGetResponse) -> String {
+    let context = &result.context;
+    let mut lines = String::new();
+    lines.push_str(&format!("ui {}\n", context.ui_id));
+    push_field(&mut lines, "mode", &json_string(&context.mode));
+    push_field(
+        &mut lines,
+        "monitor",
+        &json_string(&context.monitor_profile),
+    );
+    push_field(
+        &mut lines,
+        "active_pane",
+        &context
+            .active_pane_id
+            .map(|id| id.to_string())
+            .unwrap_or_else(|| "-".to_string()),
+    );
+    push_field(
+        &mut lines,
+        "active_daemon",
+        &context
+            .active_daemon_session_id
+            .map(|id| id.to_string())
+            .unwrap_or_else(|| "-".to_string()),
+    );
+    if let Some(workspace) = &context.active_workspace {
+        push_field(
+            &mut lines,
+            "workspace",
+            &workspace.canonical_path.display().to_string(),
+        );
+    }
+    push_field(
+        &mut lines,
+        "context",
+        &result.paths.context_json.display().to_string(),
+    );
+    lines
+}
+
+pub fn render_context_list(result: &UiContextListResponse) -> String {
+    if result.contexts.is_empty() {
+        return "no UI contexts\n".to_string();
+    }
+
+    let mut lines = String::new();
+    for entry in &result.contexts {
+        lines.push_str(&format!(
+            "{} mode={} monitor={} updated_at={}\n",
+            entry.context.ui_id,
+            json_string(&entry.context.mode),
+            json_string(&entry.context.monitor_profile),
+            entry.context.updated_at
+        ));
+    }
+    lines
+}
+
 pub fn render_inspect(result: &SessionInspectResponse) -> String {
     let session = &result.session;
     let mut lines = String::new();
@@ -184,6 +247,7 @@ pub fn render_inspect(result: &SessionInspectResponse) -> String {
         &attention_state(&session.attention_state),
     );
     push_field(&mut lines, "cwd", &session.cwd.display().to_string());
+    push_field(&mut lines, "monitor", &session.monitor_profile.to_string());
     if let Some(workspace) = &session.workspace {
         push_field(
             &mut lines,
@@ -289,6 +353,7 @@ mod tests {
             workspace: None,
             cwd: PathBuf::from("/tmp"),
             argv: vec!["sh".to_string()],
+            monitor_profile: millrace_sessions_core::state::MonitorProfile::Auto,
             created_at: "2026-05-20T18:00:00Z".to_string(),
             updated_at: "2026-05-20T18:01:00Z".to_string(),
             attached_clients: 0,

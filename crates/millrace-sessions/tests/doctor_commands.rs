@@ -103,6 +103,7 @@ fn sample_meta(state: ProcessState, root: &Path) -> SessionMeta {
         workspace: None,
         cwd: root.to_path_buf(),
         argv: vec!["sh".to_string()],
+        monitor_profile: millrace_sessions_core::state::MonitorProfile::Auto,
         env: BTreeMap::new(),
         worker_pid: None,
         child_pid: None,

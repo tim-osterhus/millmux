@@ -1,6 +1,8 @@
 mod attach;
 mod client;
+mod cockpit;
 mod commands;
+mod console;
 mod output;
 
 use std::{
@@ -248,6 +250,36 @@ async fn run() -> Result<(), MillmuxCliError> {
                 }
             );
         }
+        CliCommand::Context(args) => {
+            let client = ready_client().await?;
+            if args.list {
+                let result = client.ui_context_list(&args.list_request()).await?;
+                print!(
+                    "{}",
+                    if args.json {
+                        output::render_json(&result)?
+                    } else {
+                        output::render_context_list(&result)
+                    }
+                );
+            } else {
+                let result = client.ui_context_get(&args.get_request()?).await?;
+                print!(
+                    "{}",
+                    if args.json {
+                        output::render_json(&result)?
+                    } else {
+                        output::render_context(&result)
+                    }
+                );
+            }
+        }
+        CliCommand::Console(args) => {
+            console::run_console(args).await?;
+        }
+        CliCommand::Cockpit(args) => {
+            cockpit::run_cockpit(args).await?;
+        }
         CliCommand::Attach(args) => {
             let client = ready_client().await?;
             attach::run_attach(&client, &args.request()?).await?;
@@ -285,6 +317,10 @@ enum MillmuxCliError {
     Output(#[from] output::OutputError),
     #[error(transparent)]
     Attach(#[from] attach::AttachError),
+    #[error(transparent)]
+    Console(#[from] console::ConsoleError),
+    #[error(transparent)]
+    Cockpit(#[from] cockpit::CockpitError),
     #[error(transparent)]
     Io(#[from] io::Error),
 }

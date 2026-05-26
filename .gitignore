@@ -2,3 +2,5 @@ millrace-agents/
 ideas/
 target/
 .DS_Store
+*.pending-snap
+*.snap.new

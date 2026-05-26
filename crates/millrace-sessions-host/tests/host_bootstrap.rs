@@ -150,6 +150,7 @@ fn sample_session(workspace: impl AsRef<Path>, role: SessionRole) -> SessionMeta
             "run".to_string(),
             "daemon".to_string(),
         ],
+        monitor_profile: millrace_sessions_core::state::MonitorProfile::Auto,
         env: BTreeMap::new(),
         worker_pid: None,
         child_pid: None,

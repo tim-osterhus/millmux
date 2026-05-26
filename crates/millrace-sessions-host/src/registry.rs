@@ -12,7 +12,7 @@ use millrace_sessions_core::{
         SessionInspectResponse, SessionListRequest, SessionSelector, SessionSummary,
         M1_PROTOCOL_VERSION,
     },
-    state::{ProcessState, SessionMeta, SessionRole, WorkerMeta},
+    state::{MonitorProfile, ProcessState, SessionMeta, SessionRole, WorkerMeta},
     storage::read_json,
     workspace::WorkspaceIdentity,
 };
@@ -241,10 +241,33 @@ fn summary_from_meta(meta: &SessionMeta) -> SessionSummary {
         workspace: meta.workspace.clone(),
         cwd: meta.cwd.clone(),
         argv: meta.argv.clone(),
+        monitor_profile: monitor_profile_from_meta(meta),
         created_at: meta.created_at.clone(),
         updated_at: meta.updated_at.clone(),
         attached_clients: 0,
     }
+}
+
+fn monitor_profile_from_meta(meta: &SessionMeta) -> MonitorProfile {
+    if !meta.monitor_profile.is_auto() {
+        return meta.monitor_profile.clone();
+    }
+    monitor_profile_from_argv(&meta.argv).unwrap_or_default()
+}
+
+fn monitor_profile_from_argv(argv: &[String]) -> Option<MonitorProfile> {
+    let mut args = argv.iter();
+    while let Some(arg) = args.next() {
+        if arg == "--monitor" {
+            return args
+                .next()
+                .and_then(|value| value.parse::<MonitorProfile>().ok());
+        }
+        if let Some(value) = arg.strip_prefix("--monitor=") {
+            return value.parse::<MonitorProfile>().ok();
+        }
+    }
+    None
 }
 
 fn workspace_identity_matches(stored: &WorkspaceIdentity, candidate: &WorkspaceIdentity) -> bool {
@@ -288,6 +311,7 @@ mod tests {
             workspace: None,
             cwd: temp.path().to_path_buf(),
             argv: vec!["sh".to_string()],
+            monitor_profile: MonitorProfile::Auto,
             env: BTreeMap::new(),
             worker_pid: None,
             child_pid: None,

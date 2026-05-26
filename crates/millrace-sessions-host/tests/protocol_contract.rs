@@ -10,17 +10,17 @@ use std::{
 };
 
 use millrace_sessions_core::{
-    ids::SessionId,
+    ids::{PaneId, SessionId, UiId},
     paths::{StatePaths, STATE_DIR_ENV},
     protocol::{ControlErrorCode, SessionInspectResponse, SessionListResponse},
-    state::{AttentionState, HostMeta, ProcessState, SessionMeta, SessionRole},
-    storage::write_json_atomic,
+    state::{AttentionState, HostMeta, MonitorProfile, ProcessState, SessionMeta, SessionRole},
+    storage::{read_json, read_json_lines, write_json_atomic},
     workspace::WorkspaceIdentity,
 };
 use serde_json::{json, Value};
 
 #[test]
-fn foreground_daemon_serves_read_only_jsonl_contract() {
+fn protocol_contract_foreground_daemon_serves_read_only_jsonl_contract() {
     let temp = tempfile::tempdir().unwrap();
     let paths = StatePaths::new(temp.path().join("state"));
     fs::create_dir_all(&paths.sessions_dir).unwrap();
@@ -110,6 +110,174 @@ fn foreground_daemon_serves_read_only_jsonl_contract() {
     child.kill();
 }
 
+#[test]
+fn protocol_contract_foreground_daemon_persists_ui_context_contract() {
+    let temp = tempfile::tempdir().unwrap();
+    let paths = StatePaths::new(temp.path().join("state"));
+    let mut child = DaemonChild::spawn(&paths);
+    wait_for_socket(&paths.control_sock);
+
+    let ui_id = UiId::new();
+    let pane_id = PaneId::new();
+    let daemon_id = SessionId::new();
+    let set = request_json(
+        &paths,
+        json!({
+            "id": "ui-set-1",
+            "method": "ui.context.set",
+            "params": {
+                "context": {
+                    "schema_version": 1,
+                    "ui_id": ui_id,
+                    "mode": "daemon_console",
+                    "active_pane_id": pane_id,
+                    "active_daemon_session_id": daemon_id,
+                    "active_workspace": null,
+                    "agent_session_id": null,
+                    "managed_daemon_session_ids": [daemon_id],
+                    "monitor_profile": "basic",
+                    "updated_at": "2026-05-26T04:00:00Z"
+                },
+                "events": [{
+                    "timestamp": "",
+                    "ui_id": ui_id,
+                    "kind": "active_daemon_changed",
+                    "message": "daemon selected",
+                    "fields": {}
+                }]
+            }
+        }),
+    );
+    assert_eq!(set["ok"], true);
+    assert_eq!(set["result"]["context"]["ui_id"], ui_id.to_string());
+    assert_eq!(set["result"]["context"]["mode"], "daemon_console");
+
+    let ui_paths = paths.ui_context_paths(ui_id);
+    assert!(ui_paths.context_json.exists());
+    assert!(ui_paths.events_jsonl.exists());
+    assert_private_file(&ui_paths.context_json);
+    assert_private_file(&ui_paths.events_jsonl);
+
+    let stored: millrace_sessions_core::state::UiContext =
+        read_json(&ui_paths.context_json).expect("context persists");
+    assert_eq!(stored.ui_id, ui_id);
+    assert_eq!(stored.monitor_profile, MonitorProfile::Basic);
+    let events: Vec<millrace_sessions_core::state::UiEvent> =
+        read_json_lines(&ui_paths.events_jsonl).expect("events persist");
+    assert_eq!(events.len(), 1);
+    assert_eq!(
+        serde_json::to_value(&events[0].kind).unwrap(),
+        json!("active_daemon_changed")
+    );
+
+    let get_by_id = request_json(
+        &paths,
+        json!({
+            "id": "ui-get-1",
+            "method": "ui.context.get",
+            "params": { "ui_id": ui_id }
+        }),
+    );
+    assert_eq!(get_by_id["ok"], true);
+    assert_eq!(get_by_id["result"]["context"]["ui_id"], ui_id.to_string());
+
+    let get_unambiguous = request_json(
+        &paths,
+        json!({"id": "ui-get-2", "method": "ui.context.get", "params": {}}),
+    );
+    assert_eq!(get_unambiguous["ok"], true);
+    assert_eq!(
+        get_unambiguous["result"]["context"]["ui_id"],
+        ui_id.to_string()
+    );
+
+    let second_ui_id = UiId::new();
+    let second_set = request_json(
+        &paths,
+        json!({
+            "id": "ui-set-2",
+            "method": "ui.context.set",
+            "params": {
+                "context": {
+                    "schema_version": 1,
+                    "ui_id": second_ui_id,
+                    "mode": "agent_cockpit",
+                    "active_pane_id": null,
+                    "active_daemon_session_id": null,
+                    "active_workspace": null,
+                    "agent_session_id": null,
+                    "managed_daemon_session_ids": [],
+                    "monitor_profile": "auto",
+                    "updated_at": "2026-05-26T04:01:00Z"
+                }
+            }
+        }),
+    );
+    assert_eq!(second_set["ok"], true);
+
+    let ambiguous = request_json(
+        &paths,
+        json!({"id": "ui-get-ambiguous", "method": "ui.context.get", "params": {}}),
+    );
+    assert_error(
+        &ambiguous,
+        "ui-get-ambiguous",
+        ControlErrorCode::AmbiguousUiContext,
+    );
+
+    let list = request_json(
+        &paths,
+        json!({"id": "ui-list-1", "method": "ui.context.list", "params": {}}),
+    );
+    assert_eq!(list["ok"], true);
+    assert_eq!(list["result"]["contexts"].as_array().unwrap().len(), 2);
+
+    let close_second = request_json(
+        &paths,
+        json!({
+            "id": "ui-close-2",
+            "method": "ui.context.close",
+            "params": { "ui_id": second_ui_id }
+        }),
+    );
+    assert_eq!(close_second["ok"], true);
+    assert_eq!(close_second["result"]["closed"], true);
+    assert!(!paths.ui_context_paths(second_ui_id).context_json.exists());
+
+    let close_first = request_json(
+        &paths,
+        json!({
+            "id": "ui-close-1",
+            "method": "ui.context.close",
+            "params": { "ui_id": ui_id }
+        }),
+    );
+    assert_eq!(close_first["ok"], true);
+    assert!(!ui_paths.context_json.exists());
+    let first_events: Vec<millrace_sessions_core::state::UiEvent> =
+        read_json_lines(&ui_paths.events_jsonl).expect("close event persists");
+    assert_eq!(
+        serde_json::to_value(&first_events.last().unwrap().kind).unwrap(),
+        json!("ui_closed")
+    );
+
+    let missing = request_json(
+        &paths,
+        json!({
+            "id": "ui-get-missing",
+            "method": "ui.context.get",
+            "params": { "ui_id": ui_id }
+        }),
+    );
+    assert_error(
+        &missing,
+        "ui-get-missing",
+        ControlErrorCode::UiContextNotFound,
+    );
+
+    child.kill();
+}
+
 fn request_json(paths: &StatePaths, value: Value) -> Value {
     request_line(
         paths,
@@ -135,6 +303,17 @@ fn assert_error(response: &Value, id: &str, code: ControlErrorCode) {
         code
     );
 }
+
+#[cfg(unix)]
+fn assert_private_file(path: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+
+    let mode = fs::metadata(path).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode, 0o600);
+}
+
+#[cfg(not(unix))]
+fn assert_private_file(_path: &Path) {}
 
 fn wait_for_socket(path: &Path) {
     let started = Instant::now();
@@ -238,6 +417,7 @@ fn sample_session(workspace: impl AsRef<Path>) -> SessionMeta {
             "run".to_string(),
             "daemon".to_string(),
         ],
+        monitor_profile: MonitorProfile::Auto,
         env: BTreeMap::new(),
         worker_pid: None,
         child_pid: None,

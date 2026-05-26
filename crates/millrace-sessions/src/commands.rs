@@ -1,16 +1,19 @@
-use std::{path::PathBuf, str::FromStr};
+use std::{env, path::PathBuf, str::FromStr};
 
 use clap::{Args, Parser, Subcommand};
 use millrace_sessions_core::{
-    ids::SessionId,
+    ids::{SessionId, UiId},
+    paths::UI_ID_ENV,
     protocol::{
         DoctorRepairMode, DoctorRequest, SessionAttachRequest, SessionDeleteRequest,
         SessionEventsRequest, SessionInspectRequest, SessionKillRequest, SessionListRequest,
         SessionLogsRequest, SessionResizeRequest, SessionSelector, SessionSendRequest,
-        SessionStartRequest, SessionStopRequest,
+        SessionStartRequest, SessionStopRequest, UiContextGetRequest, UiContextListRequest,
     },
+    state::MonitorProfile,
     state::SessionRole,
 };
+use millrace_sessions_tui::{AgentCockpitLayout, DaemonConsoleLayout};
 use thiserror::Error;
 
 #[derive(Debug, Parser)]
@@ -34,6 +37,9 @@ pub enum CliCommand {
     Stop(StopArgs),
     Kill(KillArgs),
     Delete(DeleteArgs),
+    Context(ContextArgs),
+    Console(ConsoleArgs),
+    Cockpit(CockpitArgs),
     Doctor(DoctorArgs),
 }
 
@@ -52,6 +58,9 @@ impl CliCommand {
             | Self::Stop(_)
             | Self::Kill(_)
             | Self::Delete(_)
+            | Self::Context(_)
+            | Self::Console(_)
+            | Self::Cockpit(_)
             | Self::Doctor(_) => None,
         }
     }
@@ -69,6 +78,8 @@ pub struct StartArgs {
     pub cwd: Option<PathBuf>,
     #[arg(long)]
     pub json: bool,
+    #[arg(long, value_parser = parse_monitor_profile, default_value = "auto")]
+    pub monitor: MonitorProfile,
     #[arg(last = true, required = true, num_args = 1..)]
     pub argv: Vec<String>,
 }
@@ -85,6 +96,9 @@ impl StartArgs {
             workspace: self.workspace.clone(),
             name: self.name.clone(),
             role: self.role.clone(),
+            session_id: None,
+            monitor_profile: self.monitor.clone(),
+            env: Default::default(),
         })
     }
 }
@@ -314,6 +328,134 @@ impl DoctorArgs {
     }
 }
 
+#[derive(Debug, Args)]
+pub struct ContextArgs {
+    #[arg(long)]
+    pub json: bool,
+    #[arg(long, conflicts_with = "list")]
+    pub ui: Option<String>,
+    #[arg(long)]
+    pub list: bool,
+}
+
+impl ContextArgs {
+    pub fn get_request(&self) -> Result<UiContextGetRequest, CommandError> {
+        Ok(UiContextGetRequest {
+            ui_id: self.selected_ui_id()?,
+        })
+    }
+
+    pub fn list_request(&self) -> UiContextListRequest {
+        UiContextListRequest::default()
+    }
+
+    fn selected_ui_id(&self) -> Result<Option<UiId>, CommandError> {
+        if let Some(value) = &self.ui {
+            return parse_ui_id(value).map(Some);
+        }
+
+        match env::var(UI_ID_ENV) {
+            Ok(value) if !value.trim().is_empty() => parse_ui_id(&value).map(Some),
+            _ => Ok(None),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConsoleCommand {
+    Status,
+    Inspect,
+    Logs,
+    Events,
+    Doctor,
+    Stop,
+    Kill,
+    Delete,
+    Archive,
+    Purge,
+}
+
+impl ConsoleCommand {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Status => "status",
+            Self::Inspect => "inspect",
+            Self::Logs => "logs",
+            Self::Events => "events",
+            Self::Doctor => "doctor",
+            Self::Stop => "stop",
+            Self::Kill => "kill",
+            Self::Delete => "delete",
+            Self::Archive => "archive",
+            Self::Purge => "purge",
+        }
+    }
+
+    pub fn is_destructive(self) -> bool {
+        matches!(
+            self,
+            Self::Stop | Self::Kill | Self::Delete | Self::Archive | Self::Purge
+        )
+    }
+}
+
+#[derive(Debug, Args)]
+pub struct ConsoleArgs {
+    #[arg(long)]
+    pub workspace: Option<PathBuf>,
+    #[arg(long, value_parser = parse_role, default_value = "millrace-daemon")]
+    pub role: SessionRole,
+    #[arg(long, value_parser = parse_monitor_profile)]
+    pub monitor: Option<MonitorProfile>,
+    #[arg(long, value_parser = parse_console_layout)]
+    pub layout: Option<DaemonConsoleLayout>,
+    #[arg(long)]
+    pub no_start: bool,
+    #[arg(long)]
+    pub ui: Option<String>,
+    #[arg(long)]
+    pub once: bool,
+    #[arg(long, value_parser = parse_console_command)]
+    pub command: Option<ConsoleCommand>,
+    #[arg(long)]
+    pub confirm: Option<String>,
+}
+
+#[derive(Debug, Args)]
+pub struct CockpitArgs {
+    #[arg(long)]
+    pub workspace: PathBuf,
+    #[arg(long, default_value = "millracer")]
+    pub agent: String,
+    #[arg(long = "agent-argv")]
+    pub agent_argv: bool,
+    #[arg(last = true)]
+    pub argv: Vec<String>,
+    #[arg(long, value_parser = parse_monitor_profile)]
+    pub monitor: Option<MonitorProfile>,
+    #[arg(long, value_parser = parse_cockpit_layout)]
+    pub layout: Option<AgentCockpitLayout>,
+    #[arg(long)]
+    pub no_start: bool,
+    #[arg(long)]
+    pub ui: Option<String>,
+    #[arg(long)]
+    pub once: bool,
+}
+
+impl CockpitArgs {
+    pub fn resolved_agent_argv(&self) -> Vec<String> {
+        if !self.argv.is_empty() {
+            return self.argv.clone();
+        }
+        vec![self.agent.clone()]
+    }
+
+    pub fn requested_monitor_profile(&self) -> MonitorProfile {
+        self.monitor.clone().unwrap_or_default()
+    }
+}
+
 #[derive(Debug, Clone, Args)]
 pub struct SelectorArgs {
     #[arg(value_name = "SESSION", conflicts_with_all = ["workspace", "role"])]
@@ -356,6 +498,16 @@ pub enum CommandError {
     InvalidRole(String),
     #[error("invalid doctor repair mode: {0}")]
     InvalidDoctorRepair(String),
+    #[error("invalid UI id: {0}")]
+    InvalidUiId(String),
+    #[error("invalid monitor profile: {0}")]
+    InvalidMonitorProfile(String),
+    #[error("invalid daemon console layout: {0}")]
+    InvalidConsoleLayout(String),
+    #[error("invalid agent cockpit layout: {0}")]
+    InvalidCockpitLayout(String),
+    #[error("invalid daemon console command: {0}")]
+    InvalidConsoleCommand(String),
 }
 
 fn selector_from_value(value: &str) -> SessionSelector {
@@ -386,7 +538,49 @@ pub fn parse_role(value: &str) -> Result<SessionRole, CommandError> {
 fn parse_doctor_repair(value: &str) -> Result<DoctorRepairMode, CommandError> {
     match value.trim() {
         "ARCHIVE_STALE" => Ok(DoctorRepairMode::ArchiveStale),
+        "CLOSE_STALE_UI_CONTEXTS" => Ok(DoctorRepairMode::CloseStaleUiContexts),
         other => Err(CommandError::InvalidDoctorRepair(other.to_string())),
+    }
+}
+
+fn parse_ui_id(value: &str) -> Result<UiId, CommandError> {
+    value
+        .trim()
+        .parse()
+        .map_err(|_| CommandError::InvalidUiId(value.to_string()))
+}
+
+fn parse_monitor_profile(value: &str) -> Result<MonitorProfile, CommandError> {
+    value
+        .parse()
+        .map_err(|_| CommandError::InvalidMonitorProfile(value.to_string()))
+}
+
+fn parse_console_layout(value: &str) -> Result<DaemonConsoleLayout, CommandError> {
+    value
+        .parse()
+        .map_err(|_| CommandError::InvalidConsoleLayout(value.to_string()))
+}
+
+fn parse_cockpit_layout(value: &str) -> Result<AgentCockpitLayout, CommandError> {
+    value
+        .parse()
+        .map_err(|_| CommandError::InvalidCockpitLayout(value.to_string()))
+}
+
+fn parse_console_command(value: &str) -> Result<ConsoleCommand, CommandError> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "status" => Ok(ConsoleCommand::Status),
+        "inspect" => Ok(ConsoleCommand::Inspect),
+        "logs" => Ok(ConsoleCommand::Logs),
+        "events" => Ok(ConsoleCommand::Events),
+        "doctor" => Ok(ConsoleCommand::Doctor),
+        "stop" => Ok(ConsoleCommand::Stop),
+        "kill" => Ok(ConsoleCommand::Kill),
+        "delete" => Ok(ConsoleCommand::Delete),
+        "archive" => Ok(ConsoleCommand::Archive),
+        "purge" => Ok(ConsoleCommand::Purge),
+        other => Err(CommandError::InvalidConsoleCommand(other.to_string())),
     }
 }
 
@@ -579,6 +773,139 @@ mod tests {
                 let request = args.request().unwrap();
                 assert!(request.read_only);
                 assert!(request.include_scrollback);
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn commands_parse_doctor_stale_ui_context_repair() {
+        let cli = Cli::try_parse_from([
+            "millmux",
+            "doctor",
+            "--repair",
+            "CLOSE_STALE_UI_CONTEXTS",
+            "--json",
+        ])
+        .unwrap();
+
+        match cli.command {
+            CliCommand::Doctor(args) => {
+                assert!(args.json);
+                assert_eq!(
+                    args.request().unwrap().repair,
+                    Some(DoctorRepairMode::CloseStaleUiContexts)
+                );
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn commands_parse_context_modes() {
+        let ui_id = UiId::new().to_string();
+        let cli = Cli::try_parse_from(["millmux", "context", "--ui", &ui_id, "--json"]).unwrap();
+
+        match cli.command {
+            CliCommand::Context(args) => {
+                assert!(args.json);
+                assert_eq!(
+                    args.get_request().unwrap().ui_id.unwrap().to_string(),
+                    ui_id
+                );
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+
+        let cli = Cli::try_parse_from(["millmux", "context", "--list", "--json"]).unwrap();
+        match cli.command {
+            CliCommand::Context(args) => assert!(args.list),
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn commands_parse_agent_cockpit_args() {
+        let cli = Cli::try_parse_from([
+            "millmux",
+            "cockpit",
+            "--workspace",
+            "/tmp/work",
+            "--agent",
+            "codex",
+            "--layout",
+            "wide",
+            "--once",
+            "--agent-argv",
+            "--",
+            "codex",
+            "exec",
+            "--dangerously-bypass-approvals-and-sandbox",
+        ])
+        .unwrap();
+
+        match cli.command {
+            CliCommand::Cockpit(args) => {
+                assert_eq!(args.workspace, PathBuf::from("/tmp/work"));
+                assert_eq!(args.agent, "codex");
+                assert_eq!(
+                    args.resolved_agent_argv(),
+                    [
+                        "codex",
+                        "exec",
+                        "--dangerously-bypass-approvals-and-sandbox"
+                    ]
+                );
+                assert_eq!(args.layout, Some(AgentCockpitLayout::Wide));
+                assert!(args.once);
+                assert_eq!(args.monitor, None);
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn commands_parse_monitor_profiles_for_start_and_tui_modes() {
+        let start = Cli::try_parse_from([
+            "millmux",
+            "start",
+            "--role",
+            "millrace-daemon",
+            "--workspace",
+            "/tmp/work",
+            "--monitor",
+            "jsonl",
+            "--",
+            "millrace",
+            "run",
+            "daemon",
+        ])
+        .unwrap();
+        match start.command {
+            CliCommand::Start(args) => {
+                assert_eq!(
+                    args.request().unwrap().monitor_profile,
+                    MonitorProfile::Jsonl
+                );
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+
+        let console = Cli::try_parse_from([
+            "millmux",
+            "console",
+            "--workspace",
+            "/tmp/work",
+            "--monitor",
+            "other:semantic",
+        ])
+        .unwrap();
+        match console.command {
+            CliCommand::Console(args) => {
+                assert_eq!(
+                    args.monitor,
+                    Some(MonitorProfile::Other("semantic".to_string()))
+                );
             }
             other => panic!("unexpected command: {other:?}"),
         }

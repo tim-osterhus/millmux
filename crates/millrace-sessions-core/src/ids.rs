@@ -6,7 +6,41 @@ use uuid::Uuid;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct SessionId(Uuid);
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct UiId(Uuid);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct PaneId(Uuid);
+
 impl SessionId {
+    pub fn new() -> Self {
+        Self(Uuid::new_v4())
+    }
+
+    pub fn from_uuid(uuid: Uuid) -> Self {
+        Self(uuid)
+    }
+
+    pub fn as_uuid(&self) -> Uuid {
+        self.0
+    }
+}
+
+impl UiId {
+    pub fn new() -> Self {
+        Self(Uuid::new_v4())
+    }
+
+    pub fn from_uuid(uuid: Uuid) -> Self {
+        Self(uuid)
+    }
+
+    pub fn as_uuid(&self) -> Uuid {
+        self.0
+    }
+}
+
+impl PaneId {
     pub fn new() -> Self {
         Self(Uuid::new_v4())
     }
@@ -26,13 +60,53 @@ impl Default for SessionId {
     }
 }
 
+impl Default for UiId {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Default for PaneId {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl fmt::Display for SessionId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}", self.0)
     }
 }
 
+impl fmt::Display for UiId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+impl fmt::Display for PaneId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
 impl FromStr for SessionId {
+    type Err = uuid::Error;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        Ok(Self(Uuid::parse_str(value)?))
+    }
+}
+
+impl FromStr for UiId {
+    type Err = uuid::Error;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        Ok(Self(Uuid::parse_str(value)?))
+    }
+}
+
+impl FromStr for PaneId {
     type Err = uuid::Error;
 
     fn from_str(value: &str) -> Result<Self, Self::Err> {
@@ -49,7 +123,45 @@ impl Serialize for SessionId {
     }
 }
 
+impl Serialize for UiId {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(&self.to_string())
+    }
+}
+
+impl Serialize for PaneId {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(&self.to_string())
+    }
+}
+
 impl<'de> Deserialize<'de> for SessionId {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        value.parse().map_err(serde::de::Error::custom)
+    }
+}
+
+impl<'de> Deserialize<'de> for UiId {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        value.parse().map_err(serde::de::Error::custom)
+    }
+}
+
+impl<'de> Deserialize<'de> for PaneId {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
         D: Deserializer<'de>,
@@ -70,5 +182,22 @@ mod tests {
         assert_eq!(encoded.trim_matches('"'), id.to_string());
         let decoded: SessionId = serde_json::from_str(&encoded).unwrap();
         assert_eq!(decoded, id);
+    }
+
+    #[test]
+    fn ui_and_pane_ids_round_trip_as_strings() {
+        let ui_id = UiId::new();
+        let pane_id = PaneId::new();
+
+        let encoded_ui = serde_json::to_string(&ui_id).unwrap();
+        let encoded_pane = serde_json::to_string(&pane_id).unwrap();
+
+        assert_eq!(encoded_ui.trim_matches('"'), ui_id.to_string());
+        assert_eq!(encoded_pane.trim_matches('"'), pane_id.to_string());
+        assert_eq!(serde_json::from_str::<UiId>(&encoded_ui).unwrap(), ui_id);
+        assert_eq!(
+            serde_json::from_str::<PaneId>(&encoded_pane).unwrap(),
+            pane_id
+        );
     }
 }

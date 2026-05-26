@@ -46,6 +46,7 @@ pub fn run_worker(session_id: SessionId, state_dir: impl Into<PathBuf>) -> Millm
     let running = match spawn_pty(PtyCommandSpec {
         argv: meta.argv.clone(),
         cwd: meta.cwd.clone(),
+        env: meta.env.clone(),
     }) {
         Ok(running) => running,
         Err(error) => {

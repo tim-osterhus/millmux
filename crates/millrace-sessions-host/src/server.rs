@@ -16,7 +16,7 @@ use std::{
 use millrace_sessions_core::{
     error::{MillmuxError, MillmuxResult},
     events::{append_event, current_timestamp, read_events, SessionEvent, SessionEventKind},
-    ids::SessionId,
+    ids::{SessionId, UiId},
     paths::{state_paths, StatePaths},
     protocol::{
         AttachStreamFrame, ControlErrorBody, ControlErrorCode, ControlResponse, DoctorRequest,
@@ -27,20 +27,24 @@ use millrace_sessions_core::{
         SessionLogsRequest, SessionLogsResponse, SessionResizeRequest, SessionResizeResponse,
         SessionSendRequest, SessionSendResponse, SessionStartRequest, SessionStartResponse,
         SessionStopRequest, SessionStopResponse, SessionSummary, StreamKind, StreamSetup,
-        WorkerAckResponse, WorkerAttachRequest, WorkerAttachResponse, WorkerControlMethod,
-        WorkerControlRequest, WorkerControlResponse, WorkerReleaseAttachRequest,
-        WorkerResizeRequest, WorkerResizeResponse, WorkerSendRequest, WorkerSendResponse,
-        M1_PROTOCOL_VERSION,
+        UiContextCloseRequest, UiContextCloseResponse, UiContextGetRequest, UiContextGetResponse,
+        UiContextListEntry, UiContextListRequest, UiContextListResponse, UiContextSetRequest,
+        UiContextSetResponse, WorkerAckResponse, WorkerAttachRequest, WorkerAttachResponse,
+        WorkerControlMethod, WorkerControlRequest, WorkerControlResponse,
+        WorkerReleaseAttachRequest, WorkerResizeRequest, WorkerResizeResponse, WorkerSendRequest,
+        WorkerSendResponse, M1_PROTOCOL_VERSION,
     },
     scrollback::ScrollbackBuffer,
     state::{
-        AttentionState, HostMeta, ProcessState, SessionMeta, SessionPaths, SessionRole, WorkerMeta,
+        AttentionState, HostMeta, MonitorProfile, ProcessState, SessionMeta, SessionPaths,
+        SessionRole, UiContext, UiContextPaths, UiEvent, UiEventKind, WorkerMeta,
     },
-    storage::{create_private_dir_all, read_json, write_json_atomic},
+    storage::{append_json_line, create_private_dir_all, read_json, write_json_atomic},
     workspace::WorkspaceIdentity,
 };
 use serde_json::{json, Value};
 use thiserror::Error;
+use time::OffsetDateTime;
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader as TokioBufReader, Lines},
     net::{unix::OwnedReadHalf, unix::OwnedWriteHalf, UnixListener, UnixStream},
@@ -266,6 +270,10 @@ pub fn dispatch_json_line(line: &str, paths: &StatePaths, host: &HostMeta) -> Co
         "session.stop" => dispatch_session_stop(id, params, paths),
         "session.kill" => dispatch_session_kill(id, params, paths),
         "session.delete" => dispatch_session_delete(id, params, paths),
+        "ui.context.get" => dispatch_ui_context_get(id, params, paths),
+        "ui.context.set" => dispatch_ui_context_set(id, params, paths),
+        "ui.context.list" => dispatch_ui_context_list(id, params, paths),
+        "ui.context.close" => dispatch_ui_context_close(id, params, paths),
         _ => error_response(
             id,
             ControlErrorCode::UnknownMethod,
@@ -336,6 +344,9 @@ fn start_session(
         ));
     }
     let argv = request.argv;
+    let requested_session_id = request.session_id;
+    let monitor_profile = request.monitor_profile;
+    let env = request.env;
 
     let cwd = match request.cwd {
         Some(cwd) => cwd,
@@ -407,8 +418,14 @@ fn start_session(
         }
     }
 
-    let session_id = SessionId::new();
+    let session_id = requested_session_id.unwrap_or_default();
     let session_paths = paths.session_paths(session_id);
+    if session_paths.root.exists() {
+        return Err(StartSessionError::Control(
+            ControlErrorCode::InvalidRequest,
+            format!("session id {session_id} already exists"),
+        ));
+    }
     create_private_dir_all(&session_paths.root)?;
     let now = current_timestamp();
     let mut meta = SessionMeta {
@@ -420,7 +437,8 @@ fn start_session(
         workspace,
         cwd,
         argv,
-        env: BTreeMap::new(),
+        monitor_profile,
+        env,
         worker_pid: None,
         child_pid: None,
         child_pgid: None,
@@ -767,6 +785,110 @@ fn dispatch_session_delete(id: String, params: Value, paths: &StatePaths) -> Con
     }
 }
 
+fn dispatch_ui_context_get(id: String, params: Value, paths: &StatePaths) -> ControlResponse {
+    let request = match serde_json::from_value::<UiContextGetRequest>(params) {
+        Ok(request) => request,
+        Err(error) => {
+            return error_response(
+                id,
+                ControlErrorCode::InvalidRequest,
+                format!("invalid ui.context.get params: {error}"),
+            )
+        }
+    };
+
+    match resolve_ui_context(paths, request.ui_id) {
+        Ok((context, context_paths)) => success_response(
+            id,
+            &UiContextGetResponse {
+                schema_version: M1_PROTOCOL_VERSION,
+                protocol_version: M1_PROTOCOL_VERSION,
+                context,
+                paths: context_paths,
+            },
+        ),
+        Err(error) => ControlResponse::failure(id, error),
+    }
+}
+
+fn dispatch_ui_context_set(id: String, params: Value, paths: &StatePaths) -> ControlResponse {
+    let request = match serde_json::from_value::<UiContextSetRequest>(params) {
+        Ok(request) => request,
+        Err(error) => {
+            return error_response(
+                id,
+                ControlErrorCode::InvalidRequest,
+                format!("invalid ui.context.set params: {error}"),
+            )
+        }
+    };
+
+    match set_ui_context(paths, request) {
+        Ok((context, context_paths)) => success_response(
+            id,
+            &UiContextSetResponse {
+                schema_version: M1_PROTOCOL_VERSION,
+                protocol_version: M1_PROTOCOL_VERSION,
+                context,
+                paths: context_paths,
+            },
+        ),
+        Err(error) => ControlResponse::failure(id, error),
+    }
+}
+
+fn dispatch_ui_context_list(id: String, params: Value, paths: &StatePaths) -> ControlResponse {
+    if let Err(error) = serde_json::from_value::<UiContextListRequest>(params) {
+        return error_response(
+            id,
+            ControlErrorCode::InvalidRequest,
+            format!("invalid ui.context.list params: {error}"),
+        );
+    }
+
+    match list_ui_contexts(paths) {
+        Ok(contexts) => success_response(
+            id,
+            &UiContextListResponse {
+                schema_version: M1_PROTOCOL_VERSION,
+                protocol_version: M1_PROTOCOL_VERSION,
+                contexts: contexts
+                    .into_iter()
+                    .map(|(context, paths)| UiContextListEntry { context, paths })
+                    .collect(),
+            },
+        ),
+        Err(error) => ControlResponse::failure(id, error),
+    }
+}
+
+fn dispatch_ui_context_close(id: String, params: Value, paths: &StatePaths) -> ControlResponse {
+    let request = match serde_json::from_value::<UiContextCloseRequest>(params) {
+        Ok(request) => request,
+        Err(error) => {
+            return error_response(
+                id,
+                ControlErrorCode::InvalidRequest,
+                format!("invalid ui.context.close params: {error}"),
+            )
+        }
+    };
+
+    match close_ui_context(paths, request.ui_id) {
+        Ok(context_paths) => success_response(
+            id,
+            &UiContextCloseResponse {
+                schema_version: M1_PROTOCOL_VERSION,
+                protocol_version: M1_PROTOCOL_VERSION,
+                ui_id: request.ui_id,
+                closed: true,
+                paths: context_paths,
+            },
+        ),
+        Err(error) => ControlResponse::failure(id, error),
+    }
+}
+
 fn build_logs_response(
     paths: &StatePaths,
     request: &SessionLogsRequest,
@@ -1047,6 +1169,175 @@ fn delete_session(
         purged: false,
         archive_path: Some(inspected.paths.root),
     })
+}
+
+fn resolve_ui_context(
+    paths: &StatePaths,
+    ui_id: Option<UiId>,
+) -> Result<(UiContext, UiContextPaths), ControlErrorBody> {
+    if let Some(ui_id) = ui_id {
+        return load_ui_context(paths, ui_id);
+    }
+
+    let mut contexts = list_ui_contexts(paths)?;
+    match contexts.len() {
+        0 => Err(ControlErrorBody::new(
+            ControlErrorCode::UiContextNotFound,
+            "no active UI context found",
+        )),
+        1 => Ok(contexts.remove(0)),
+        count => Err(ControlErrorBody::new(
+            ControlErrorCode::AmbiguousUiContext,
+            format!("multiple active UI contexts found ({count}); pass --ui or set MILLMUX_UI_ID"),
+        )),
+    }
+}
+
+fn list_ui_contexts(
+    paths: &StatePaths,
+) -> Result<Vec<(UiContext, UiContextPaths)>, ControlErrorBody> {
+    let mut contexts = Vec::new();
+    let entries = match fs::read_dir(&paths.views_dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(contexts),
+        Err(error) => return Err(control_io_error(error)),
+    };
+
+    for entry in entries {
+        let entry = entry.map_err(control_io_error)?;
+        if !entry.file_type().map_err(control_io_error)?.is_dir() {
+            continue;
+        }
+        let file_name = entry.file_name();
+        let Some(raw_ui_id) = file_name.to_str() else {
+            continue;
+        };
+        let Ok(ui_id) = raw_ui_id.parse::<UiId>() else {
+            continue;
+        };
+        let context_paths = paths.ui_context_paths(ui_id);
+        if !context_paths.context_json.exists() {
+            continue;
+        }
+        let context =
+            read_json::<UiContext>(&context_paths.context_json).map_err(control_core_error)?;
+        if context.ui_id != ui_id {
+            return Err(ControlErrorBody::new(
+                ControlErrorCode::InvalidRequest,
+                format!(
+                    "UI context {} has mismatched ui_id {}",
+                    context_paths.context_json.display(),
+                    context.ui_id
+                ),
+            ));
+        }
+        contexts.push((context, context_paths));
+    }
+
+    contexts.sort_by_key(|context| std::cmp::Reverse(context.0.updated_at));
+    Ok(contexts)
+}
+
+fn load_ui_context(
+    paths: &StatePaths,
+    ui_id: UiId,
+) -> Result<(UiContext, UiContextPaths), ControlErrorBody> {
+    let context_paths = paths.ui_context_paths(ui_id);
+    if !context_paths.context_json.exists() {
+        return Err(ControlErrorBody::new(
+            ControlErrorCode::UiContextNotFound,
+            format!("UI context not found: {ui_id}"),
+        ));
+    }
+    let context =
+        read_json::<UiContext>(&context_paths.context_json).map_err(control_core_error)?;
+    if context.ui_id != ui_id {
+        return Err(ControlErrorBody::new(
+            ControlErrorCode::InvalidRequest,
+            format!(
+                "UI context {} has mismatched ui_id {}",
+                context_paths.context_json.display(),
+                context.ui_id
+            ),
+        ));
+    }
+    Ok((context, context_paths))
+}
+
+fn set_ui_context(
+    paths: &StatePaths,
+    request: UiContextSetRequest,
+) -> Result<(UiContext, UiContextPaths), ControlErrorBody> {
+    let mut context = request.context;
+    validate_ui_context(&context)?;
+    let events = request.events;
+    for event in &events {
+        if event.ui_id != context.ui_id {
+            return Err(ControlErrorBody::new(
+                ControlErrorCode::InvalidRequest,
+                format!(
+                    "UI event for {} cannot be stored under context {}",
+                    event.ui_id, context.ui_id
+                ),
+            ));
+        }
+    }
+    let context_paths = paths.ui_context_paths(context.ui_id);
+    let existed = context_paths.context_json.exists();
+
+    create_private_dir_all(&paths.views_dir).map_err(control_core_error)?;
+    context.updated_at = OffsetDateTime::now_utc();
+    write_json_atomic(&context_paths.context_json, &context).map_err(control_core_error)?;
+
+    if events.is_empty() && !existed {
+        append_ui_event(
+            &context_paths,
+            new_ui_event(context.ui_id, UiEventKind::UiStarted),
+        )?;
+    } else {
+        for mut event in events {
+            if event.timestamp.trim().is_empty() {
+                event.timestamp = current_timestamp();
+            }
+            append_ui_event(&context_paths, event)?;
+        }
+    }
+
+    Ok((context, context_paths))
+}
+
+fn validate_ui_context(context: &UiContext) -> Result<(), ControlErrorBody> {
+    if context.schema_version != M1_PROTOCOL_VERSION {
+        return Err(ControlErrorBody::new(
+            ControlErrorCode::InvalidRequest,
+            format!(
+                "unsupported UI context schema_version {}; expected {}",
+                context.schema_version, M1_PROTOCOL_VERSION
+            ),
+        ));
+    }
+    Ok(())
+}
+
+fn close_ui_context(paths: &StatePaths, ui_id: UiId) -> Result<UiContextPaths, ControlErrorBody> {
+    let (_context, context_paths) = load_ui_context(paths, ui_id)?;
+    append_ui_event(&context_paths, new_ui_event(ui_id, UiEventKind::UiClosed))?;
+    fs::remove_file(&context_paths.context_json).map_err(control_io_error)?;
+    Ok(context_paths)
+}
+
+fn new_ui_event(ui_id: UiId, kind: UiEventKind) -> UiEvent {
+    UiEvent {
+        timestamp: current_timestamp(),
+        ui_id,
+        kind,
+        message: None,
+        fields: BTreeMap::new(),
+    }
+}
+
+fn append_ui_event(paths: &UiContextPaths, event: UiEvent) -> Result<(), ControlErrorBody> {
+    append_json_line(&paths.events_jsonl, &event).map_err(control_core_error)
 }
 
 fn resolve_session(
@@ -1890,10 +2181,33 @@ fn summary_from_meta(meta: &SessionMeta) -> SessionSummary {
         workspace: meta.workspace.clone(),
         cwd: meta.cwd.clone(),
         argv: meta.argv.clone(),
+        monitor_profile: monitor_profile_from_meta(meta),
         created_at: meta.created_at.clone(),
         updated_at: meta.updated_at.clone(),
         attached_clients: 0,
     }
+}
+
+fn monitor_profile_from_meta(meta: &SessionMeta) -> MonitorProfile {
+    if !meta.monitor_profile.is_auto() {
+        return meta.monitor_profile.clone();
+    }
+    monitor_profile_from_argv(&meta.argv).unwrap_or_default()
+}
+
+fn monitor_profile_from_argv(argv: &[String]) -> Option<MonitorProfile> {
+    let mut args = argv.iter();
+    while let Some(arg) = args.next() {
+        if arg == "--monitor" {
+            return args
+                .next()
+                .and_then(|value| value.parse::<MonitorProfile>().ok());
+        }
+        if let Some(value) = arg.strip_prefix("--monitor=") {
+            return value.parse::<MonitorProfile>().ok();
+        }
+    }
+    None
 }
 
 #[cfg(test)]

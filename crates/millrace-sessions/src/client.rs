@@ -17,7 +17,9 @@ use millrace_sessions_core::{
         SessionInspectResponse, SessionKillRequest, SessionKillResponse, SessionListRequest,
         SessionListResponse, SessionLogsRequest, SessionLogsResponse, SessionResizeRequest,
         SessionResizeResponse, SessionSendRequest, SessionSendResponse, SessionStartRequest,
-        SessionStartResponse, SessionStopRequest, SessionStopResponse,
+        SessionStartResponse, SessionStopRequest, SessionStopResponse, UiContextCloseRequest,
+        UiContextCloseResponse, UiContextGetRequest, UiContextGetResponse, UiContextListRequest,
+        UiContextListResponse, UiContextSetRequest, UiContextSetResponse,
     },
 };
 use serde::{de::DeserializeOwned, Serialize};
@@ -186,6 +188,36 @@ impl SessionControlClient {
         request: &SessionDeleteRequest,
     ) -> Result<SessionDeleteResponse, ClientError> {
         self.request(ControlMethod::SessionDelete, request).await
+    }
+
+    pub async fn ui_context_get(
+        &self,
+        request: &UiContextGetRequest,
+    ) -> Result<UiContextGetResponse, ClientError> {
+        self.request(ControlMethod::UiContextGet, request).await
+    }
+
+    #[allow(dead_code)]
+    pub async fn ui_context_set(
+        &self,
+        request: &UiContextSetRequest,
+    ) -> Result<UiContextSetResponse, ClientError> {
+        self.request(ControlMethod::UiContextSet, request).await
+    }
+
+    pub async fn ui_context_list(
+        &self,
+        request: &UiContextListRequest,
+    ) -> Result<UiContextListResponse, ClientError> {
+        self.request(ControlMethod::UiContextList, request).await
+    }
+
+    #[allow(dead_code)]
+    pub async fn ui_context_close(
+        &self,
+        request: &UiContextCloseRequest,
+    ) -> Result<UiContextCloseResponse, ClientError> {
+        self.request(ControlMethod::UiContextClose, request).await
     }
 
     pub async fn attach(
@@ -512,7 +544,7 @@ pub enum ClientError {
     },
     #[error("could not locate millrace-sessiond; set {HOST_BIN_ENV}")]
     HostBinaryNotFound,
-    #[error("session control error: {0:?}")]
+    #[error("session control error: {0}")]
     Control(millrace_sessions_core::protocol::ControlErrorBody),
     #[error("session control protocol error: {0}")]
     Protocol(String),

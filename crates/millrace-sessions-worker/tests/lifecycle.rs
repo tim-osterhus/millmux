@@ -140,6 +140,7 @@ fn sample_session(cwd: &Path) -> SessionMeta {
         workspace: None,
         cwd: cwd.to_path_buf(),
         argv: vec!["sh".to_string(), "-c".to_string(), "echo ready".to_string()],
+        monitor_profile: millrace_sessions_core::state::MonitorProfile::Auto,
         env: BTreeMap::new(),
         created_at: now.clone(),
         updated_at: now,

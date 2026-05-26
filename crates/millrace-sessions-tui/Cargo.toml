@@ -1,0 +1,24 @@
+[package]
+name = "millrace-sessions-tui"
+version = "0.1.0"
+description = "Ratatui app foundation for Millrace session UI modes"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+readme = "../../README.md"
+keywords = ["millrace", "session", "tui", "terminal"]
+categories = ["command-line-utilities", "development-tools"]
+
+[dependencies]
+crossterm.workspace = true
+millrace-sessions-core = { path = "../millrace-sessions-core", version = "0.1.0" }
+ratatui.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+time.workspace = true
+vt100.workspace = true
+
+[dev-dependencies]
+insta.workspace = true
+serde_json.workspace = true

@@ -1,4 +1,5 @@
 use std::{
+    collections::BTreeMap,
     io::{Read, Write},
     path::PathBuf,
 };
@@ -10,6 +11,7 @@ use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize}
 pub struct PtyCommandSpec {
     pub argv: Vec<String>,
     pub cwd: PathBuf,
+    pub env: BTreeMap<String, String>,
 }
 
 pub struct RunningPty {
@@ -65,6 +67,9 @@ pub fn spawn_pty(spec: PtyCommandSpec) -> MillmuxResult<RunningPty> {
     let mut command = CommandBuilder::new(&spec.argv[0]);
     command.args(spec.argv.iter().skip(1).map(String::as_str));
     command.cwd(spec.cwd.as_os_str());
+    for (key, value) in &spec.env {
+        command.env(key, value);
+    }
 
     let child = pair.slave.spawn_command(command).map_err(|error| {
         MillmuxError::WorkerUnavailable(format!("failed to spawn pty child: {error}"))

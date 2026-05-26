@@ -8,14 +8,19 @@ use std::{
 
 use millrace_sessions_core::{
     events::{read_events, SessionEvent, SessionEventKind},
-    ids::SessionId,
+    ids::{SessionId, UiId},
     paths::StatePaths,
     protocol::{
         DoctorRepairMode, DoctorRepairStatus, DoctorRequest, DoctorResponse, DoctorSeverity,
     },
     scrollback::ScrollbackBuffer,
-    state::{AttentionState, HostMeta, ProcessState, SessionMeta, SessionRole, WorkerMeta},
-    storage::{append_raw_pty_log, create_private_dir_all, read_json, write_json_atomic},
+    state::{
+        AttentionState, HostMeta, MonitorProfile, ProcessState, SessionMeta, SessionRole, UiEvent,
+        WorkerMeta,
+    },
+    storage::{
+        append_raw_pty_log, create_private_dir_all, read_json, read_json_lines, write_json_atomic,
+    },
 };
 use millrace_sessions_host::{
     doctor::run_doctor, reconcile::reconcile_startup, server::dispatch_json_line,
@@ -190,6 +195,84 @@ fn doctor_archive_preserves_private_session_artifacts() {
 }
 
 #[test]
+fn doctor_close_stale_ui_contexts_preserves_live_contexts_and_session_artifacts() {
+    let temp = tempfile::tempdir().unwrap();
+    let paths = prepared_state(temp.path());
+
+    let terminal = sample_meta(ProcessState::Exited, temp.path());
+    write_session(&paths, &terminal, None, true);
+
+    let mut live = sample_meta(ProcessState::Running, temp.path());
+    live.worker_pid = Some(std::process::id());
+    let live_worker = sample_worker(live.id, std::process::id(), ProcessState::Running);
+    write_session(&paths, &live, Some(live_worker), true);
+
+    let stale_ui_id = UiId::new();
+    seed_ui_context(
+        &paths,
+        stale_ui_id,
+        Some(terminal.id),
+        None,
+        vec![terminal.id],
+        "2000-01-01T00:00:00Z",
+    );
+    let live_ui_id = UiId::new();
+    seed_ui_context(
+        &paths,
+        live_ui_id,
+        Some(live.id),
+        None,
+        vec![live.id],
+        "2000-01-01T00:00:00Z",
+    );
+
+    let report = run_doctor(&paths, None, &DoctorRequest::default()).unwrap();
+    assert_issue(&report, "stale_ui_context", DoctorSeverity::Warning);
+    assert_issue(
+        &report,
+        "ui_context_has_live_session_refs",
+        DoctorSeverity::Info,
+    );
+
+    let result = run_doctor(
+        &paths,
+        None,
+        &DoctorRequest {
+            repair: Some(DoctorRepairMode::CloseStaleUiContexts),
+        },
+    )
+    .unwrap();
+
+    let stale_paths = paths.ui_context_paths(stale_ui_id);
+    let live_paths = paths.ui_context_paths(live_ui_id);
+    assert!(!stale_paths.context_json.exists());
+    assert!(stale_paths.events_jsonl.exists());
+    assert!(live_paths.context_json.exists());
+    assert!(paths.session_paths(terminal.id).root.exists());
+    assert!(paths.session_paths(live.id).root.exists());
+
+    let repair = result
+        .repairs
+        .iter()
+        .find(|repair| {
+            repair.status == DoctorRepairStatus::Applied
+                && repair
+                    .details
+                    .as_ref()
+                    .and_then(|details| details.get("ui_id"))
+                    .and_then(|value| value.as_str())
+                    == Some(stale_ui_id.to_string().as_str())
+        })
+        .expect("stale UI context repair summary");
+    assert_eq!(repair.mode, DoctorRepairMode::CloseStaleUiContexts);
+
+    let events: Vec<UiEvent> = read_json_lines(&stale_paths.events_jsonl).unwrap();
+    assert!(events
+        .iter()
+        .any(|event| event.message.as_deref() == Some("doctor closed stale UI context")));
+}
+
+#[test]
 fn startup_reconciliation_preserves_live_and_marks_dead_without_deleting() {
     let temp = tempfile::tempdir().unwrap();
     let paths = prepared_state(temp.path());
@@ -258,6 +341,33 @@ fn write_session(
     .unwrap();
 }
 
+fn seed_ui_context(
+    paths: &StatePaths,
+    ui_id: UiId,
+    active_daemon_session_id: Option<SessionId>,
+    agent_session_id: Option<SessionId>,
+    managed_daemon_session_ids: Vec<SessionId>,
+    updated_at: &str,
+) {
+    let ui_paths = paths.ui_context_paths(ui_id);
+    write_json_atomic(
+        &ui_paths.context_json,
+        &serde_json::json!({
+            "schema_version": 1,
+            "ui_id": ui_id,
+            "mode": "daemon_console",
+            "active_pane_id": null,
+            "active_daemon_session_id": active_daemon_session_id,
+            "active_workspace": null,
+            "agent_session_id": agent_session_id,
+            "managed_daemon_session_ids": managed_daemon_session_ids,
+            "monitor_profile": "auto",
+            "updated_at": updated_at
+        }),
+    )
+    .unwrap();
+}
+
 fn sample_meta(state: ProcessState, root: &Path) -> SessionMeta {
     SessionMeta {
         id: SessionId::new(),
@@ -268,6 +378,7 @@ fn sample_meta(state: ProcessState, root: &Path) -> SessionMeta {
         workspace: None,
         cwd: root.to_path_buf(),
         argv: vec!["sh".to_string()],
+        monitor_profile: MonitorProfile::Auto,
         env: BTreeMap::new(),
         worker_pid: None,
         child_pid: None,

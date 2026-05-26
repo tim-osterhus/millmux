@@ -1,4 +1,5 @@
 use std::{
+    collections::BTreeSet,
     fs,
     os::unix::fs::{FileTypeExt, PermissionsExt},
     path::{Path, PathBuf},
@@ -6,21 +7,25 @@ use std::{
 
 use millrace_sessions_core::{
     events::{append_event, SessionEvent, SessionEventKind},
+    ids::{SessionId, UiId},
     paths::StatePaths,
     protocol::{
         DoctorIssue, DoctorRepair, DoctorRepairMode, DoctorRepairStatus, DoctorRequest,
         DoctorResponse, DoctorSeverity, DoctorStatus, M1_PROTOCOL_VERSION,
     },
-    state::{HostMeta, ProcessState},
-    storage::create_private_dir_all,
+    state::{HostMeta, ProcessState, UiContext, UiContextPaths, UiEvent, UiEventKind},
+    storage::{append_json_line, create_private_dir_all, read_json},
 };
 use serde_json::json;
 use thiserror::Error;
+use time::{Duration, OffsetDateTime};
 
 use crate::{
     reconcile::{collect_record_pids, is_active_process_state, pid_status, PidStatus},
     registry::{HostRegistry, RegistryError, SessionRecord},
 };
+
+const STALE_UI_CONTEXT_AFTER: Duration = Duration::hours(24);
 
 #[derive(Debug, Error)]
 pub enum DoctorError {
@@ -64,9 +69,11 @@ pub fn run_doctor(
     for record in registry.sessions().values() {
         check_session_record(record, &mut issues);
     }
+    check_ui_contexts(paths, &registry, &mut issues)?;
 
     let repairs = match request.repair {
         Some(DoctorRepairMode::ArchiveStale) => archive_stale(paths, &registry)?,
+        Some(DoctorRepairMode::CloseStaleUiContexts) => close_stale_ui_contexts(paths, &registry)?,
         None => Vec::new(),
     };
 
@@ -277,6 +284,105 @@ fn check_session_record(record: &SessionRecord, issues: &mut Vec<DoctorIssue>) {
     }
 }
 
+fn check_ui_contexts(
+    paths: &StatePaths,
+    registry: &HostRegistry,
+    issues: &mut Vec<DoctorIssue>,
+) -> Result<(), DoctorError> {
+    let entries = match fs::read_dir(&paths.views_dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.into()),
+    };
+
+    for entry in entries {
+        let entry = entry?;
+        if !entry.file_type()?.is_dir() {
+            continue;
+        }
+        let file_name = entry.file_name();
+        let Some(raw_ui_id) = file_name.to_str() else {
+            continue;
+        };
+        let Ok(ui_id) = raw_ui_id.parse::<UiId>() else {
+            continue;
+        };
+        let context_paths = paths.ui_context_paths(ui_id);
+        if !context_paths.context_json.exists() {
+            continue;
+        }
+        let context = match read_json::<UiContext>(&context_paths.context_json) {
+            Ok(context) => context,
+            Err(error) => {
+                issues.push(issue(
+                    "corrupted_ui_context_json",
+                    DoctorSeverity::Critical,
+                    format!("could not decode {}", context_paths.context_json.display()),
+                    None,
+                    Some(context_paths.context_json.clone()),
+                    false,
+                    Some(
+                        "preserve the view directory and inspect or close it manually".to_string(),
+                    ),
+                    Some(json!({ "error": error.to_string(), "ui_id": ui_id })),
+                ));
+                continue;
+            }
+        };
+        if context.ui_id != ui_id {
+            issues.push(issue(
+                "mismatched_ui_context_id",
+                DoctorSeverity::Critical,
+                format!(
+                    "UI context {} has mismatched ui_id {}",
+                    context_paths.context_json.display(),
+                    context.ui_id
+                ),
+                None,
+                Some(context_paths.context_json.clone()),
+                false,
+                Some("preserve the view directory and inspect it manually".to_string()),
+                Some(json!({ "directory_ui_id": ui_id, "context_ui_id": context.ui_id })),
+            ));
+            continue;
+        }
+
+        let live_refs = live_referenced_session_ids(&context, registry);
+        if !live_refs.is_empty() {
+            issues.push(issue(
+                "ui_context_has_live_session_refs",
+                DoctorSeverity::Info,
+                format!("UI context {ui_id} references live sessions"),
+                None,
+                Some(context_paths.context_json.clone()),
+                false,
+                None,
+                Some(json!({ "ui_id": ui_id, "live_session_ids": live_refs })),
+            ));
+            continue;
+        }
+
+        if ui_context_age_is_stale(&context) {
+            issues.push(issue(
+                "stale_ui_context",
+                DoctorSeverity::Warning,
+                format!("UI context {ui_id} is stale and references no live sessions"),
+                None,
+                Some(context_paths.context_json.clone()),
+                true,
+                Some("run millmux doctor --repair CLOSE_STALE_UI_CONTEXTS".to_string()),
+                Some(json!({
+                    "ui_id": ui_id,
+                    "updated_at": context.updated_at,
+                    "referenced_session_ids": referenced_session_id_strings(&context),
+                })),
+            ));
+        }
+    }
+
+    Ok(())
+}
+
 fn archive_stale(
     paths: &StatePaths,
     registry: &HostRegistry,
@@ -332,6 +438,99 @@ fn archive_stale(
     Ok(repairs)
 }
 
+fn close_stale_ui_contexts(
+    paths: &StatePaths,
+    registry: &HostRegistry,
+) -> Result<Vec<DoctorRepair>, DoctorError> {
+    let mut repairs = Vec::new();
+    let entries = match fs::read_dir(&paths.views_dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            repairs.push(repair(
+                DoctorRepairMode::CloseStaleUiContexts,
+                DoctorRepairStatus::Skipped,
+                None,
+                None,
+                None,
+                Some("no UI context directory exists".to_string()),
+                None,
+            ));
+            return Ok(repairs);
+        }
+        Err(error) => return Err(error.into()),
+    };
+
+    for entry in entries {
+        let entry = entry?;
+        if !entry.file_type()?.is_dir() {
+            continue;
+        }
+        let file_name = entry.file_name();
+        let Some(raw_ui_id) = file_name.to_str() else {
+            continue;
+        };
+        let Ok(ui_id) = raw_ui_id.parse::<UiId>() else {
+            continue;
+        };
+        let context_paths = paths.ui_context_paths(ui_id);
+        if !context_paths.context_json.exists() {
+            continue;
+        }
+        let context = match read_json::<UiContext>(&context_paths.context_json) {
+            Ok(context) => context,
+            Err(error) => {
+                repairs.push(repair(
+                    DoctorRepairMode::CloseStaleUiContexts,
+                    DoctorRepairStatus::Failed,
+                    None,
+                    Some(context_paths.context_json.clone()),
+                    None,
+                    Some("could not decode UI context".to_string()),
+                    Some(json!({ "ui_id": ui_id, "error": error.to_string() })),
+                ));
+                continue;
+            }
+        };
+
+        if context.ui_id != ui_id
+            || !ui_context_age_is_stale(&context)
+            || !live_referenced_session_ids(&context, registry).is_empty()
+        {
+            continue;
+        }
+
+        append_ui_context_repair_event(&context, &context_paths)?;
+        fs::remove_file(&context_paths.context_json)?;
+        repairs.push(repair(
+            DoctorRepairMode::CloseStaleUiContexts,
+            DoctorRepairStatus::Applied,
+            None,
+            Some(context_paths.context_json.clone()),
+            None,
+            Some("closed stale UI context without touching session artifacts".to_string()),
+            Some(json!({
+                "ui_id": ui_id,
+                "events_jsonl": context_paths.events_jsonl,
+                "referenced_session_ids": referenced_session_id_strings(&context),
+            })),
+        ));
+    }
+
+    if repairs.is_empty() {
+        repairs.push(repair(
+            DoctorRepairMode::CloseStaleUiContexts,
+            DoctorRepairStatus::Skipped,
+            None,
+            None,
+            None,
+            Some("no stale UI contexts were eligible to close".to_string()),
+            None,
+        ));
+    }
+
+    Ok(repairs)
+}
+
 fn archive_eligible(record: &SessionRecord) -> bool {
     if record.archived {
         return false;
@@ -350,6 +549,62 @@ fn archive_eligible(record: &SessionRecord) -> bool {
 
     let pids = collect_record_pids(record);
     !pids.is_empty() && pids.iter().all(|pid| pid_status(*pid) == PidStatus::Dead)
+}
+
+fn ui_context_age_is_stale(context: &UiContext) -> bool {
+    OffsetDateTime::now_utc() - context.updated_at >= STALE_UI_CONTEXT_AFTER
+}
+
+fn referenced_session_ids(context: &UiContext) -> BTreeSet<SessionId> {
+    let mut ids = BTreeSet::new();
+    if let Some(session_id) = context.active_daemon_session_id {
+        ids.insert(session_id);
+    }
+    if let Some(session_id) = context.agent_session_id {
+        ids.insert(session_id);
+    }
+    ids.extend(context.managed_daemon_session_ids.iter().copied());
+    ids
+}
+
+fn referenced_session_id_strings(context: &UiContext) -> Vec<String> {
+    referenced_session_ids(context)
+        .into_iter()
+        .map(|session_id| session_id.to_string())
+        .collect()
+}
+
+fn live_referenced_session_ids(context: &UiContext, registry: &HostRegistry) -> Vec<String> {
+    referenced_session_ids(context)
+        .into_iter()
+        .filter_map(|session_id| {
+            let record = registry.sessions().get(&session_id)?;
+            (!record.archived && is_active_process_state(&record.meta.process_state))
+                .then(|| session_id.to_string())
+        })
+        .collect()
+}
+
+fn append_ui_context_repair_event(
+    context: &UiContext,
+    paths: &UiContextPaths,
+) -> Result<(), DoctorError> {
+    append_json_line(
+        &paths.events_jsonl,
+        &UiEvent {
+            timestamp: millrace_sessions_core::events::current_timestamp(),
+            ui_id: context.ui_id,
+            kind: UiEventKind::UiClosed,
+            message: Some("doctor closed stale UI context".to_string()),
+            fields: [
+                ("mode".to_string(), "CLOSE_STALE_UI_CONTEXTS".to_string()),
+                ("reason".to_string(), "stale_ui_context".to_string()),
+            ]
+            .into_iter()
+            .collect(),
+        },
+    )?;
+    Ok(())
 }
 
 fn append_doctor_repair_event(record: &SessionRecord, archive_path: &Path) {

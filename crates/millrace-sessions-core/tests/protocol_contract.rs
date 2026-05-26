@@ -1,15 +1,16 @@
-use std::path::PathBuf;
+use std::{collections::BTreeMap, path::PathBuf};
 
 use millrace_sessions_core::{
-    ids::SessionId,
+    ids::{PaneId, SessionId, UiId},
     protocol::{
         ControlErrorBody, ControlErrorCode, ControlMethod, ControlRequest, ControlResponse,
         SessionListRequest, SessionListResponse, SessionStartRequest, SessionSummary,
-        M1_PROTOCOL_VERSION,
+        UiContextGetRequest, UiContextSetRequest, M1_PROTOCOL_VERSION,
     },
-    state::{AttentionState, ProcessState, SessionRole},
+    state::{AttentionState, MonitorProfile, ProcessState, SessionRole, UiContext, UiMode},
 };
 use serde_json::json;
+use time::macros::datetime;
 
 #[test]
 fn session_start_request_matches_m1_jsonl_contract() {
@@ -23,6 +24,9 @@ fn session_start_request_matches_m1_jsonl_contract() {
         workspace: Some(PathBuf::from("/tmp/millmux-workspace")),
         name: Some("daemon".to_string()),
         role: Some(SessionRole::MillraceDaemon),
+        session_id: None,
+        monitor_profile: MonitorProfile::Auto,
+        env: BTreeMap::new(),
     };
 
     let request = ControlRequest::with_params("req_start_1", ControlMethod::SessionStart, &params)
@@ -98,6 +102,7 @@ fn session_list_request_and_response_match_m1_jsonl_contract() {
                 "run".to_string(),
                 "daemon".to_string(),
             ],
+            monitor_profile: MonitorProfile::Basic,
             created_at: "2026-05-20T18:00:00Z".to_string(),
             updated_at: "2026-05-20T18:01:00Z".to_string(),
             attached_clients: 0,
@@ -125,6 +130,7 @@ fn session_list_request_and_response_match_m1_jsonl_contract() {
                     "workspace": null,
                     "cwd": "/tmp/millmux-workspace",
                     "argv": ["millrace", "run", "daemon"],
+                    "monitor_profile": "basic",
                     "created_at": "2026-05-20T18:00:00Z",
                     "updated_at": "2026-05-20T18:01:00Z",
                     "attached_clients": 0
@@ -176,5 +182,81 @@ fn duplicate_daemon_error_matches_m1_jsonl_contract() {
     assert_eq!(
         decoded_error.code,
         ControlErrorCode::DuplicateMillraceDaemon
+    );
+}
+
+#[test]
+fn ui_context_matches_m2a_jsonl_contract() {
+    let ui_id: UiId = "018f5d8d-3e79-4a62-9bc5-51c3c7f4d5c8".parse().unwrap();
+    let pane_id: PaneId = "2d14ac17-d5c9-43aa-a6f2-9414b3c16285".parse().unwrap();
+    let daemon_id: SessionId = "818b61b1-a620-4a57-8e72-4d439d03840f".parse().unwrap();
+    let context = UiContext {
+        schema_version: M1_PROTOCOL_VERSION,
+        ui_id,
+        mode: UiMode::DaemonConsole,
+        active_pane_id: Some(pane_id),
+        active_daemon_session_id: Some(daemon_id),
+        active_workspace: None,
+        agent_session_id: None,
+        managed_daemon_session_ids: vec![daemon_id],
+        monitor_profile: MonitorProfile::Basic,
+        updated_at: datetime!(2026-05-26 04:00:00 UTC),
+    };
+
+    let request = ControlRequest::with_params(
+        "ui-set-1",
+        ControlMethod::UiContextSet,
+        &UiContextSetRequest {
+            context,
+            events: Vec::new(),
+        },
+    )
+    .expect("params serialize");
+
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(
+            request
+                .to_json_line()
+                .expect("request serializes")
+                .trim_end()
+        )
+        .unwrap(),
+        json!({
+            "id": "ui-set-1",
+            "method": "ui.context.set",
+            "params": {
+                "context": {
+                    "schema_version": 1,
+                    "ui_id": "018f5d8d-3e79-4a62-9bc5-51c3c7f4d5c8",
+                    "mode": "daemon_console",
+                    "active_pane_id": "2d14ac17-d5c9-43aa-a6f2-9414b3c16285",
+                    "active_daemon_session_id": "818b61b1-a620-4a57-8e72-4d439d03840f",
+                    "active_workspace": null,
+                    "agent_session_id": null,
+                    "managed_daemon_session_ids": [
+                        "818b61b1-a620-4a57-8e72-4d439d03840f"
+                    ],
+                    "monitor_profile": "basic",
+                    "updated_at": "2026-05-26T04:00:00Z"
+                }
+            }
+        })
+    );
+
+    let get = ControlRequest::with_params(
+        "ui-get-1",
+        ControlMethod::UiContextGet,
+        &UiContextGetRequest { ui_id: Some(ui_id) },
+    )
+    .expect("params serialize");
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(get.to_json_line().unwrap().trim_end()).unwrap(),
+        json!({
+            "id": "ui-get-1",
+            "method": "ui.context.get",
+            "params": {
+                "ui_id": "018f5d8d-3e79-4a62-9bc5-51c3c7f4d5c8"
+            }
+        })
     );
 }

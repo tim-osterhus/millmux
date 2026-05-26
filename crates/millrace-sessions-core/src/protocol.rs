@@ -1,12 +1,15 @@
-use std::path::PathBuf;
+use std::{collections::BTreeMap, fmt, path::PathBuf};
 
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::{
     events::SessionEvent,
-    ids::SessionId,
-    state::{AttentionState, HostMeta, ProcessState, SessionPaths, SessionRole, WorkerMeta},
+    ids::{SessionId, UiId},
+    state::{
+        AttentionState, HostMeta, MonitorProfile, ProcessState, SessionPaths, SessionRole,
+        UiContext, UiContextPaths, UiEvent, WorkerMeta,
+    },
     workspace::WorkspaceIdentity,
 };
 
@@ -40,6 +43,14 @@ pub enum ControlMethod {
     SessionKill,
     #[serde(rename = "session.delete")]
     SessionDelete,
+    #[serde(rename = "ui.context.get")]
+    UiContextGet,
+    #[serde(rename = "ui.context.set")]
+    UiContextSet,
+    #[serde(rename = "ui.context.list")]
+    UiContextList,
+    #[serde(rename = "ui.context.close")]
+    UiContextClose,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -165,6 +176,8 @@ pub enum ControlErrorCode {
     IoError,
     WorkerUnavailable,
     MillraceStopFailed,
+    UiContextNotFound,
+    AmbiguousUiContext,
     InternalError,
 }
 
@@ -191,6 +204,16 @@ impl ControlErrorBody {
     }
 }
 
+impl fmt::Display for ControlErrorBody {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let code = serde_json::to_value(self.code)
+            .ok()
+            .and_then(|value| value.as_str().map(str::to_string))
+            .unwrap_or_else(|| "internal_error".to_string());
+        write!(f, "{code}: {}", self.message)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct HostStatusRequest {}
 
@@ -204,6 +227,8 @@ pub struct DoctorRequest {
 pub enum DoctorRepairMode {
     #[serde(rename = "ARCHIVE_STALE")]
     ArchiveStale,
+    #[serde(rename = "CLOSE_STALE_UI_CONTEXTS")]
+    CloseStaleUiContexts,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -225,6 +250,8 @@ pub enum SessionSelector {
 pub struct SessionStartRequest {
     pub argv: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<SessionId>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub cwd: Option<PathBuf>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub workspace: Option<PathBuf>,
@@ -232,6 +259,10 @@ pub struct SessionStartRequest {
     pub name: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub role: Option<SessionRole>,
+    #[serde(default, skip_serializing_if = "MonitorProfile::is_auto")]
+    pub monitor_profile: MonitorProfile,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub env: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -306,6 +337,27 @@ pub struct SessionDeleteRequest {
     pub purge: bool,
     #[serde(default, skip_serializing_if = "is_false")]
     pub kill: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct UiContextGetRequest {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ui_id: Option<UiId>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UiContextSetRequest {
+    pub context: UiContext,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub events: Vec<UiEvent>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct UiContextListRequest {}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UiContextCloseRequest {
+    pub ui_id: UiId,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -392,6 +444,7 @@ pub struct SessionSummary {
     pub workspace: Option<WorkspaceIdentity>,
     pub cwd: PathBuf,
     pub argv: Vec<String>,
+    pub monitor_profile: MonitorProfile,
     pub created_at: String,
     pub updated_at: String,
     pub attached_clients: u32,
@@ -502,6 +555,44 @@ pub struct SessionDeleteResponse {
     pub purged: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub archive_path: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UiContextGetResponse {
+    pub schema_version: u32,
+    pub protocol_version: u32,
+    pub context: UiContext,
+    pub paths: UiContextPaths,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UiContextSetResponse {
+    pub schema_version: u32,
+    pub protocol_version: u32,
+    pub context: UiContext,
+    pub paths: UiContextPaths,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UiContextListResponse {
+    pub schema_version: u32,
+    pub protocol_version: u32,
+    pub contexts: Vec<UiContextListEntry>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UiContextListEntry {
+    pub context: UiContext,
+    pub paths: UiContextPaths,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UiContextCloseResponse {
+    pub schema_version: u32,
+    pub protocol_version: u32,
+    pub ui_id: UiId,
+    pub closed: bool,
+    pub paths: UiContextPaths,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -767,6 +858,10 @@ mod tests {
             (ControlMethod::SessionStop, "session.stop"),
             (ControlMethod::SessionKill, "session.kill"),
             (ControlMethod::SessionDelete, "session.delete"),
+            (ControlMethod::UiContextGet, "ui.context.get"),
+            (ControlMethod::UiContextSet, "ui.context.set"),
+            (ControlMethod::UiContextList, "ui.context.list"),
+            (ControlMethod::UiContextClose, "ui.context.close"),
         ];
 
         for (method, wire_name) in cases {
@@ -831,6 +926,9 @@ mod tests {
             workspace: None,
             name: Some("hello".to_string()),
             role: Some(SessionRole::Shell),
+            session_id: None,
+            monitor_profile: MonitorProfile::Auto,
+            env: BTreeMap::new(),
         };
 
         let request =
