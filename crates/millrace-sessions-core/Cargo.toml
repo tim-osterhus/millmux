@@ -1,6 +1,6 @@
 [package]
 name = "millrace-sessions-core"
-version = "0.1.0"
+version = "0.2.0"
 description = "Core types, protocol contracts, and persistence helpers for millrace-sessions"
 edition.workspace = true
 license.workspace = true

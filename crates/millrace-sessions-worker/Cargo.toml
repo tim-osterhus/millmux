@@ -1,6 +1,6 @@
 [package]
 name = "millrace-sessions-worker"
-version = "0.1.0"
+version = "0.2.0"
 description = "Per-session PTY worker for millrace-sessions"
 edition.workspace = true
 license.workspace = true
@@ -8,7 +8,7 @@ repository.workspace = true
 rust-version.workspace = true
 
 [dependencies]
-millrace-sessions-core = { path = "../millrace-sessions-core", version = "0.1.0" }
+millrace-sessions-core = { path = "../millrace-sessions-core", version = "0.2.0" }
 nix.workspace = true
 portable-pty.workspace = true
 serde_json.workspace = true

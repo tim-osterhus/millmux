@@ -637,7 +637,7 @@ dependencies = [
 
 [[package]]
 name = "millrace-sessions"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "assert_cmd",
  "clap",
@@ -657,7 +657,7 @@ dependencies = [
 
 [[package]]
 name = "millrace-sessions-core"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "directories",
  "nix 0.29.0",
@@ -671,7 +671,7 @@ dependencies = [
 
 [[package]]
 name = "millrace-sessions-host"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "millrace-sessions-core",
  "nix 0.29.0",
@@ -685,7 +685,7 @@ dependencies = [
 
 [[package]]
 name = "millrace-sessions-tui"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "crossterm",
  "insta",
@@ -700,7 +700,7 @@ dependencies = [
 
 [[package]]
 name = "millrace-sessions-worker"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "millrace-sessions-core",
  "nix 0.29.0",
