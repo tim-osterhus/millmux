@@ -87,7 +87,10 @@ fn assert_short_reader_pipeline(host: &TempHost, args: &[&str]) {
         .expect("millmux binary")
         .get_program()
         .to_os_string();
-    let script = format!("\"$MILLMUX_BIN\" {} | head -c 0 >/dev/null", args.join(" "));
+    let script = format!(
+        "\"$MILLMUX_BIN\" {} | dd bs=1 count=0 of=/dev/null 2>/dev/null",
+        args.join(" ")
+    );
     let mut command = Command::new("bash");
     command
         .arg("-o")
@@ -308,7 +311,7 @@ fn cli_smoke_console_renders_existing_daemon_and_writes_context() {
         workspace.path(),
         "printf 'daemon ready\\n'; sleep 0.2",
     );
-    thread::sleep(Duration::from_millis(150));
+    wait_for_logs(&host, &session_id, "daemon ready");
 
     let output = millmux_command(&host)
         .args(["console", "--workspace"])
@@ -902,6 +905,20 @@ fn wait_for_session_state(host: &TempHost, session_id: &str, expected: &str) {
         thread::sleep(Duration::from_millis(50));
     }
     panic!("{session_id} did not reach {expected}");
+}
+
+fn wait_for_logs(host: &TempHost, session_id: &str, needle: &str) {
+    for _ in 0..120 {
+        let output = millmux_command(host)
+            .args(["logs", session_id])
+            .output()
+            .expect("run logs");
+        if output.status.success() && String::from_utf8_lossy(&output.stdout).contains(needle) {
+            return;
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
+    panic!("logs for {session_id} did not contain {needle:?}");
 }
 
 fn session_status(host: &TempHost, session_id: &str) -> Value {

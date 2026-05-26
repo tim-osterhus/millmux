@@ -118,14 +118,7 @@ fn cli_smoke_send_logs_events_resize_and_stream_through_host() {
         "printf 'attach-ready\\n'; sleep 3",
     );
     wait_for_logs(&host, &attach_id, "attach-ready");
-    let attach = millmux_command(&host)
-        .args(["attach", &attach_id, "--read-only"])
-        .assert()
-        .success()
-        .get_output()
-        .stdout
-        .clone();
-    assert!(String::from_utf8_lossy(&attach).contains("attach-ready"));
+    wait_for_attach_output(&host, &attach_id, "attach-ready");
 }
 
 #[test]
@@ -270,6 +263,22 @@ fn wait_for_logs(host: &TempHost, session_id: &str, needle: &str) {
         thread::sleep(Duration::from_millis(25));
     }
     panic!("logs for {session_id} did not contain {needle:?}");
+}
+
+fn wait_for_attach_output(host: &TempHost, session_id: &str, needle: &str) {
+    let mut last_output = String::new();
+    for _ in 0..120 {
+        let output = millmux_command(host)
+            .args(["attach", session_id, "--read-only"])
+            .output()
+            .expect("run attach");
+        last_output = String::from_utf8_lossy(&output.stdout).to_string();
+        if output.status.success() && last_output.contains(needle) {
+            return;
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
+    panic!("attach output for {session_id} did not contain {needle:?}: {last_output}");
 }
 
 fn millmux_command(host: &TempHost) -> Command {
