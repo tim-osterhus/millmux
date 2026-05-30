@@ -135,6 +135,8 @@ impl AttachArgs {
 pub struct ListArgs {
     #[arg(long)]
     pub json: bool,
+    #[arg(long)]
+    pub all: bool,
     #[arg(long, value_parser = parse_role)]
     pub role: Option<SessionRole>,
     #[arg(long)]
@@ -612,9 +614,20 @@ mod tests {
         match cli.command {
             CliCommand::List(args) => {
                 assert!(args.json);
+                assert!(!args.all);
                 assert_eq!(args.workspace, Some(PathBuf::from("/tmp/work")));
                 assert_eq!(args.role, Some(SessionRole::MillraceDaemon));
             }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn commands_parse_list_all() {
+        let cli = Cli::try_parse_from(["millmux", "list", "--all"]).unwrap();
+
+        match cli.command {
+            CliCommand::List(args) => assert!(args.all),
             other => panic!("unexpected command: {other:?}"),
         }
     }

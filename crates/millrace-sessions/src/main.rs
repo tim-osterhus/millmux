@@ -13,8 +13,13 @@ use std::{
 
 use clap::Parser;
 use commands::{Cli, CliCommand};
+use millrace_sessions_core::ids::SessionId;
 use millrace_sessions_core::paths::state_paths;
-use millrace_sessions_core::protocol::{EventStreamFrame, LogStreamFrame};
+use millrace_sessions_core::protocol::{
+    EventStreamFrame, LogStreamFrame, SessionInspectRequest, SessionInspectResponse,
+    SessionListRequest, SessionListResponse, SessionSelector, SessionSummary,
+};
+use millrace_sessions_core::state::ProcessState;
 use thiserror::Error;
 
 #[tokio::main]
@@ -74,7 +79,10 @@ async fn run() -> Result<(), MillmuxCliError> {
         }
         CliCommand::List(args) => {
             let client = ready_client().await?;
-            let result = client.list(&args.request()).await?;
+            let mut result = client.list(&args.request()).await?;
+            if !args.all {
+                retain_active_sessions(&mut result);
+            }
             write_stdout(if args.json {
                 output::render_json(&result)?
             } else {
@@ -84,9 +92,7 @@ async fn run() -> Result<(), MillmuxCliError> {
         CliCommand::Status(args) => {
             let client = ready_client().await?;
             if let Some(selector) = args.selector.optional()? {
-                let result = client
-                    .inspect(&millrace_sessions_core::protocol::SessionInspectRequest { selector })
-                    .await?;
+                let result = inspect_preferred_status_session(&client, selector).await?;
                 write_stdout(if args.json {
                     output::render_json(&result)?
                 } else {
@@ -248,6 +254,52 @@ async fn run() -> Result<(), MillmuxCliError> {
     Ok(())
 }
 
+async fn inspect_preferred_status_session(
+    client: &client::SessionControlClient,
+    selector: SessionSelector,
+) -> Result<SessionInspectResponse, MillmuxCliError> {
+    let selector = match &selector {
+        SessionSelector::WorkspaceRole { workspace, role } => {
+            let list = client
+                .list(&SessionListRequest {
+                    role: Some(role.clone()),
+                    workspace: Some(workspace.clone()),
+                    include_archived: false,
+                })
+                .await?;
+            preferred_session_id(&list.sessions)
+                .map(|session_id| SessionSelector::Id { session_id })
+                .unwrap_or(selector)
+        }
+        _ => selector,
+    };
+
+    Ok(client.inspect(&SessionInspectRequest { selector }).await?)
+}
+
+fn preferred_session_id(sessions: &[SessionSummary]) -> Option<SessionId> {
+    sessions
+        .iter()
+        .max_by_key(|session| {
+            (
+                is_active_process_state(&session.process_state),
+                session.updated_at.as_str(),
+                session.session_id,
+            )
+        })
+        .map(|session| session.session_id)
+}
+
+fn is_active_process_state(state: &ProcessState) -> bool {
+    matches!(state, ProcessState::Starting | ProcessState::Running)
+}
+
+fn retain_active_sessions(result: &mut SessionListResponse) {
+    result
+        .sessions
+        .retain(|session| is_active_process_state(&session.process_state));
+}
+
 async fn ready_client() -> Result<client::SessionControlClient, MillmuxCliError> {
     let client = client::SessionControlClient::new()?;
     client.ensure_host_ready().await?;
@@ -298,6 +350,77 @@ impl MillmuxCliError {
                 error.kind() == io::ErrorKind::BrokenPipe
             }
             _ => false,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{path::PathBuf, str::FromStr};
+
+    use millrace_sessions_core::{
+        ids::SessionId,
+        protocol::{SessionListResponse, M1_PROTOCOL_VERSION},
+        state::{AttentionState, MonitorProfile, SessionRole},
+    };
+
+    use super::*;
+
+    #[test]
+    fn preferred_session_id_prefers_running_session_over_newer_terminal_session() {
+        let running = SessionId::from_str("ffffffff-ffff-ffff-ffff-ffffffffffff").unwrap();
+        let exited = SessionId::from_str("00000000-0000-0000-0000-000000000001").unwrap();
+        let sessions = vec![
+            summary(exited, ProcessState::Exited, "2026-05-20T18:10:00Z"),
+            summary(running, ProcessState::Running, "2026-05-20T18:00:00Z"),
+        ];
+
+        assert_eq!(preferred_session_id(&sessions), Some(running));
+    }
+
+    #[test]
+    fn retain_active_sessions_hides_terminal_records_from_default_list() {
+        let running = SessionId::from_str("ffffffff-ffff-ffff-ffff-ffffffffffff").unwrap();
+        let exited = SessionId::from_str("00000000-0000-0000-0000-000000000001").unwrap();
+        let mut result = SessionListResponse {
+            schema_version: M1_PROTOCOL_VERSION,
+            protocol_version: M1_PROTOCOL_VERSION,
+            sessions: vec![
+                summary(exited, ProcessState::Exited, "2026-05-20T18:10:00Z"),
+                summary(running, ProcessState::Running, "2026-05-20T18:00:00Z"),
+            ],
+        };
+
+        retain_active_sessions(&mut result);
+
+        assert_eq!(result.sessions.len(), 1);
+        assert_eq!(result.sessions[0].session_id, running);
+    }
+
+    fn summary(
+        session_id: SessionId,
+        process_state: ProcessState,
+        updated_at: &str,
+    ) -> SessionSummary {
+        SessionSummary {
+            session_id,
+            name: Some("daemon:millrace".to_string()),
+            role: SessionRole::MillraceDaemon,
+            process_state,
+            attention_state: AttentionState::Active,
+            failure_message: None,
+            workspace: None,
+            cwd: PathBuf::from("/tmp"),
+            argv: vec![
+                "millrace".to_string(),
+                "run".to_string(),
+                "daemon".to_string(),
+            ],
+            monitor_profile: MonitorProfile::Basic,
+            created_at: "2026-05-20T18:00:00Z".to_string(),
+            updated_at: updated_at.to_string(),
+            attached_clients: 0,
+            input_owner: None,
         }
     }
 }

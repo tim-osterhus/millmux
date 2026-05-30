@@ -115,6 +115,10 @@ async fn build_console_app(
     if sessions.is_empty() {
         return Err(ConsoleError::NoDaemonsFound);
     }
+    retain_terminal_daemons_only_when_active_daemon_exists(
+        &mut sessions,
+        args.workspace.as_deref(),
+    );
 
     sessions.sort_by(|left, right| {
         left.workspace
@@ -181,6 +185,32 @@ async fn discover_daemons(
 
 fn is_active_daemon_state(state: &ProcessState) -> bool {
     matches!(state, ProcessState::Starting | ProcessState::Running)
+}
+
+fn workspace_matches(
+    session: &millrace_sessions_core::protocol::SessionSummary,
+    workspace: &Path,
+) -> bool {
+    session
+        .workspace
+        .as_ref()
+        .is_some_and(|identity| identity.canonical_path == workspace)
+}
+
+fn retain_terminal_daemons_only_when_active_daemon_exists(
+    sessions: &mut Vec<millrace_sessions_core::protocol::SessionSummary>,
+    workspace: Option<&Path>,
+) {
+    let has_active = sessions.iter().any(|session| {
+        workspace.map_or(true, |workspace| workspace_matches(session, workspace))
+            && is_active_daemon_state(&session.process_state)
+    });
+    if has_active {
+        sessions.retain(|session| {
+            !workspace.map_or(true, |workspace| workspace_matches(session, workspace))
+                || is_active_daemon_state(&session.process_state)
+        });
+    }
 }
 
 async fn start_workspace_daemon(

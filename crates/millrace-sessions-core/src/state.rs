@@ -237,7 +237,7 @@ pub struct UiEvent {
     pub fields: BTreeMap<String, String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct SessionPaths {
     pub root: PathBuf,
     pub meta_json: PathBuf,
@@ -248,6 +248,45 @@ pub struct SessionPaths {
     pub terminal_snapshot: PathBuf,
     pub raw_replay_ring: PathBuf,
     pub worker_sock: PathBuf,
+}
+
+impl<'de> Deserialize<'de> for SessionPaths {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        struct RawSessionPaths {
+            root: PathBuf,
+            meta_json: PathBuf,
+            worker_json: PathBuf,
+            pty_log: PathBuf,
+            events_jsonl: PathBuf,
+            scrollback_snapshot: PathBuf,
+            #[serde(default)]
+            terminal_snapshot: Option<PathBuf>,
+            #[serde(default)]
+            raw_replay_ring: Option<PathBuf>,
+            worker_sock: PathBuf,
+        }
+
+        let raw = RawSessionPaths::deserialize(deserializer)?;
+        Ok(Self {
+            terminal_snapshot: raw
+                .terminal_snapshot
+                .unwrap_or_else(|| raw.root.join("terminal.snapshot.json")),
+            raw_replay_ring: raw
+                .raw_replay_ring
+                .unwrap_or_else(|| raw.root.join("pty.replay")),
+            root: raw.root,
+            meta_json: raw.meta_json,
+            worker_json: raw.worker_json,
+            pty_log: raw.pty_log,
+            events_jsonl: raw.events_jsonl,
+            scrollback_snapshot: raw.scrollback_snapshot,
+            worker_sock: raw.worker_sock,
+        })
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -318,6 +357,8 @@ pub struct HostMeta {
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
+
+    use serde_json::json;
 
     use super::*;
 
@@ -417,5 +458,30 @@ mod tests {
         let encoded = serde_json::to_string(&role).unwrap();
         assert_eq!(encoded, "\"custom_role\"");
         assert_eq!(serde_json::from_str::<SessionRole>(&encoded).unwrap(), role);
+    }
+
+    #[test]
+    fn session_paths_deserializes_legacy_paths_without_terminal_replay_fields() {
+        let root = PathBuf::from("/state/sessions/session-1");
+        let value = json!({
+            "root": root,
+            "meta_json": "/state/sessions/session-1/meta.json",
+            "worker_json": "/state/sessions/session-1/worker.json",
+            "pty_log": "/state/sessions/session-1/pty.log",
+            "events_jsonl": "/state/sessions/session-1/events.jsonl",
+            "scrollback_snapshot": "/state/sessions/session-1/scrollback.snapshot",
+            "worker_sock": "/state/w/session-1.sock"
+        });
+
+        let paths: SessionPaths = serde_json::from_value(value).unwrap();
+
+        assert_eq!(
+            paths.terminal_snapshot,
+            PathBuf::from("/state/sessions/session-1/terminal.snapshot.json")
+        );
+        assert_eq!(
+            paths.raw_replay_ring,
+            PathBuf::from("/state/sessions/session-1/pty.replay")
+        );
     }
 }

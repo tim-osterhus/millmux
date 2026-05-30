@@ -129,6 +129,7 @@ async fn build_cockpit_app(
     if daemons.is_empty() {
         return Err(CockpitError::NoDaemonFound);
     }
+    retain_terminal_workspace_daemons_only_when_no_active_daemon(&mut daemons, &workspace);
     daemons.sort_by(|left, right| {
         left.workspace
             .as_ref()
@@ -214,6 +215,19 @@ fn workspace_matches(
         .workspace
         .as_ref()
         .is_some_and(|identity| identity.canonical_path == workspace)
+}
+
+fn retain_terminal_workspace_daemons_only_when_no_active_daemon(
+    sessions: &mut Vec<millrace_sessions_core::protocol::SessionSummary>,
+    workspace: &Path,
+) {
+    if sessions.iter().any(|session| {
+        workspace_matches(session, workspace) && is_active_state(&session.process_state)
+    }) {
+        sessions.retain(|session| {
+            !workspace_matches(session, workspace) || is_active_state(&session.process_state)
+        });
+    }
 }
 
 async fn start_workspace_daemon(
@@ -452,7 +466,15 @@ async fn refresh_daemon_sessions(
     client: &SessionControlClient,
     app: &mut AppModel,
 ) -> Result<(), CockpitError> {
-    app.replace_daemon_sessions(discover_daemons(client).await?);
+    let mut daemons = discover_daemons(client).await?;
+    if let Some(workspace) = app
+        .active_workspace
+        .as_ref()
+        .map(|identity| identity.canonical_path.clone())
+    {
+        retain_terminal_workspace_daemons_only_when_no_active_daemon(&mut daemons, &workspace);
+    }
+    app.replace_daemon_sessions(daemons);
     Ok(())
 }
 
@@ -471,6 +493,8 @@ async fn run_interactive_cockpit(
     let mut emulator = TerminalEmulator::new(rows, cols, TERMINAL_SCROLLBACK);
     let mut attach = open_agent_attach(&client, agent_session_id, rows, cols).await?;
     apply_agent_input_ownership(&mut app, attach.read_only);
+    sync_agent_terminal_to_interactive_size(&mut app, &mut emulator, rows, cols);
+    sync_agent_attach_size(&mut attach, rows, cols).await?;
     let mut last_refresh = Instant::now();
     let mut redraw = RedrawGate::new(Instant::now());
     let mut last_size = (rows, cols);
@@ -617,6 +641,24 @@ async fn open_agent_attach(
     rows: u16,
     cols: u16,
 ) -> Result<OpenedAgentAttach, CockpitError> {
+    let deadline = Instant::now() + SNAPSHOT_SEED_TIMEOUT;
+    loop {
+        match try_open_agent_attach(client, session_id, rows, cols).await {
+            Ok(attach) => return Ok(attach),
+            Err(error) if should_retry_agent_attach(&error, deadline) => {
+                tokio::time::sleep(SNAPSHOT_SEED_RETRY_INTERVAL).await;
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
+}
+
+async fn try_open_agent_attach(
+    client: &SessionControlClient,
+    session_id: SessionId,
+    rows: u16,
+    cols: u16,
+) -> Result<OpenedAgentAttach, ClientError> {
     let request = agent_attach_request(session_id, false, rows, cols);
     match client.attach(&request).await {
         Ok(connection) => Ok(opened_agent_attach(connection, false)),
@@ -626,7 +668,7 @@ async fn open_agent_attach(
                 .await?;
             Ok(opened_agent_attach(connection, true))
         }
-        Err(error) => Err(error.into()),
+        Err(error) => Err(error),
     }
 }
 
@@ -672,6 +714,36 @@ fn opened_agent_attach(connection: AttachConnection, read_only: bool) -> OpenedA
         writer,
         read_only: read_only || !result.stream.input_owner,
     }
+}
+
+fn should_retry_agent_attach(error: &ClientError, deadline: Instant) -> bool {
+    matches!(
+        error,
+        ClientError::Control(error) if error.code == ControlErrorCode::SessionNotRunning
+    ) && Instant::now() < deadline
+}
+
+async fn sync_agent_attach_size(
+    attach: &mut OpenedAgentAttach,
+    rows: u16,
+    cols: u16,
+) -> Result<(), CockpitError> {
+    attach
+        .writer
+        .write_frame(&AttachStreamFrame::Resize { rows, cols })
+        .await?;
+    Ok(())
+}
+
+fn sync_agent_terminal_to_interactive_size(
+    app: &mut AppModel,
+    emulator: &mut TerminalEmulator,
+    rows: u16,
+    cols: u16,
+) {
+    emulator.resize(rows, cols);
+    app.resize_agent_terminal(rows, cols);
+    app.update_agent_terminal_view(emulator.snapshot(), emulator.is_following());
 }
 
 struct OpenedAgentAttach {
@@ -1071,6 +1143,51 @@ mod tests {
     }
 
     #[test]
+    fn cockpit_interactive_size_sync_replaces_stale_seeded_agent_snapshot() {
+        let mut stale_terminal = TerminalEmulator::new(24, 80, TERMINAL_SCROLLBACK);
+        stale_terminal.process_text("stale 24x80 preattach frame\r\n");
+        let terminal_pane =
+            AgentTerminalPane::with_snapshot(stale_terminal.snapshot(), true, false);
+        let agent = session_summary("agent", SessionRole::Agent);
+        let daemon = session_summary("daemon", SessionRole::MillraceDaemon);
+        let daemon_id = daemon.session_id;
+        let mut app = AppModel::agent_cockpit(
+            UiId::new(),
+            agent,
+            vec![daemon],
+            Some(daemon_id),
+            BTreeMap::new(),
+            terminal_pane,
+            AgentCockpitLayout::Bottom,
+            MonitorProfile::Basic,
+        );
+        let mut emulator = TerminalEmulator::new(8, 72, TERMINAL_SCROLLBACK);
+
+        sync_agent_terminal_to_interactive_size(&mut app, &mut emulator, 8, 72);
+
+        let terminal = app.agent_terminal.as_ref().expect("agent terminal");
+        assert_eq!((terminal.snapshot.rows, terminal.snapshot.cols), (8, 72));
+        assert_eq!((terminal.rows, terminal.cols), (8, 72));
+        assert!(!terminal
+            .snapshot
+            .contains_text("stale 24x80 preattach frame"));
+    }
+
+    #[test]
+    fn cockpit_attach_retries_starting_session_until_deadline() {
+        let error = ClientError::Control(millrace_sessions_core::protocol::ControlErrorBody::new(
+            ControlErrorCode::SessionNotRunning,
+            "session is still starting",
+        ));
+
+        assert!(should_retry_agent_attach(
+            &error,
+            Instant::now() + Duration::from_secs(1)
+        ));
+        assert!(!should_retry_agent_attach(&error, Instant::now()));
+    }
+
+    #[test]
     fn redraw_gate_coalesces_dirty_draws_until_interval() {
         let start = Instant::now();
         let mut gate = RedrawGate::new(start);
@@ -1088,6 +1205,33 @@ mod tests {
 
         assert_eq!(gate.event_wait(), Duration::from_millis(30));
         assert!(!gate.should_draw(start + REDRAW_INTERVAL * 2));
+    }
+
+    fn session_summary(
+        name: &str,
+        role: SessionRole,
+    ) -> millrace_sessions_core::protocol::SessionSummary {
+        let cwd = PathBuf::from(format!("/tmp/{name}"));
+        millrace_sessions_core::protocol::SessionSummary {
+            session_id: SessionId::new(),
+            name: Some(name.to_string()),
+            role,
+            process_state: ProcessState::Running,
+            attention_state: millrace_sessions_core::state::AttentionState::Idle,
+            failure_message: None,
+            workspace: Some(millrace_sessions_core::workspace::WorkspaceIdentity {
+                canonical_path: cwd.clone(),
+                unix_device: None,
+                unix_inode: None,
+            }),
+            cwd,
+            argv: vec![name.to_string()],
+            monitor_profile: MonitorProfile::Auto,
+            created_at: "2026-05-26T00:00:00Z".to_string(),
+            updated_at: "2026-05-26T00:00:01Z".to_string(),
+            attached_clients: 0,
+            input_owner: None,
+        }
     }
 }
 

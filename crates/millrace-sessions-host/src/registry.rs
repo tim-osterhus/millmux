@@ -146,20 +146,32 @@ impl HostRegistry {
             SessionSelector::Name { name } => self
                 .sessions
                 .values()
-                .find(|record| record.meta.name.as_ref() == Some(name)),
+                .filter(|record| record.meta.name.as_ref() == Some(name))
+                .max_by_key(|record| resolution_rank(record)),
             SessionSelector::WorkspaceRole { workspace, role } => {
                 let identity = WorkspaceIdentity::capture(workspace).ok()?;
-                self.sessions.values().find(|record| {
-                    record.meta.role == *role
-                        && record
-                            .meta
-                            .workspace
-                            .as_ref()
-                            .is_some_and(|stored| workspace_identity_matches(stored, &identity))
-                })
+                self.sessions
+                    .values()
+                    .filter(|record| {
+                        record.meta.role == *role
+                            && record
+                                .meta
+                                .workspace
+                                .as_ref()
+                                .is_some_and(|stored| workspace_identity_matches(stored, &identity))
+                    })
+                    .max_by_key(|record| resolution_rank(record))
             }
         }
     }
+}
+
+fn resolution_rank(record: &SessionRecord) -> (bool, &str, SessionId) {
+    (
+        is_active_process_state(&record.meta.process_state),
+        record.meta.updated_at.as_str(),
+        record.meta.id,
+    )
 }
 
 fn load_session_dir(
@@ -302,7 +314,7 @@ fn is_active_process_state(state: &ProcessState) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeMap;
+    use std::{collections::BTreeMap, str::FromStr};
 
     use millrace_sessions_core::{
         state::{AttentionState, ProcessState},
@@ -350,5 +362,85 @@ mod tests {
             .unwrap();
 
         assert_eq!(inspected.session.session_id, meta.id);
+    }
+
+    #[test]
+    fn registry_workspace_role_resolution_prefers_running_session() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = temp.path().join("workspace");
+        fs::create_dir_all(&workspace).unwrap();
+        let paths = StatePaths::new(temp.path().join("state"));
+        fs::create_dir_all(&paths.sessions_dir).unwrap();
+
+        let exited = SessionId::from_str("00000000-0000-0000-0000-000000000001").unwrap();
+        let running = SessionId::from_str("ffffffff-ffff-ffff-ffff-ffffffffffff").unwrap();
+        write_session_meta(
+            &paths,
+            session_meta(
+                exited,
+                &workspace,
+                ProcessState::Exited,
+                "2026-05-20T18:00:00Z",
+            ),
+        );
+        write_session_meta(
+            &paths,
+            session_meta(
+                running,
+                &workspace,
+                ProcessState::Running,
+                "2026-05-20T18:01:00Z",
+            ),
+        );
+
+        let registry = HostRegistry::load(paths).unwrap();
+        let inspected = registry
+            .inspect(&SessionSelector::WorkspaceRole {
+                workspace,
+                role: SessionRole::MillraceDaemon,
+            })
+            .unwrap();
+
+        assert_eq!(inspected.session.session_id, running);
+    }
+
+    fn write_session_meta(paths: &StatePaths, meta: SessionMeta) {
+        let session_paths = paths.session_paths(meta.id);
+        fs::create_dir_all(&session_paths.root).unwrap();
+        write_json_atomic(&session_paths.meta_json, &meta).unwrap();
+    }
+
+    fn session_meta(
+        id: SessionId,
+        workspace: &Path,
+        process_state: ProcessState,
+        updated_at: &str,
+    ) -> SessionMeta {
+        SessionMeta {
+            id,
+            name: Some("daemon:millrace".to_string()),
+            role: SessionRole::MillraceDaemon,
+            process_state,
+            attention_state: AttentionState::Active,
+            workspace: Some(WorkspaceIdentity::capture(workspace).unwrap()),
+            cwd: workspace.to_path_buf(),
+            argv: vec![
+                "millrace".to_string(),
+                "run".to_string(),
+                "daemon".to_string(),
+            ],
+            monitor_profile: MonitorProfile::Basic,
+            env: BTreeMap::new(),
+            worker_pid: None,
+            child_pid: None,
+            child_pgid: None,
+            started_at: None,
+            ended_at: None,
+            exit_code: None,
+            exit_signal: None,
+            failure_message: None,
+            created_at: "2026-05-20T18:00:00Z".to_string(),
+            updated_at: updated_at.to_string(),
+        }
     }
 }

@@ -289,7 +289,14 @@ fn active_session_count(host: &TempHost) -> usize {
 
 fn daemon_sessions(host: &TempHost, workspace: &Path) -> Vec<Value> {
     let output = millmux_command(host)
-        .args(["list", "--json", "--role", "millrace-daemon", "--workspace"])
+        .args([
+            "list",
+            "--json",
+            "--all",
+            "--role",
+            "millrace-daemon",
+            "--workspace",
+        ])
         .arg(workspace)
         .assert()
         .success()
