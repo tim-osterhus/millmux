@@ -12,12 +12,95 @@ use std::{
 use millrace_sessions_core::{
     ids::{PaneId, SessionId, UiId},
     paths::{StatePaths, STATE_DIR_ENV},
-    protocol::{ControlErrorCode, SessionInspectResponse, SessionListResponse},
+    protocol::{
+        AttachFrameType, AttachInitialReplay, AttachStreamEncoding, ControlErrorCode,
+        SessionAttachResponse, SessionInspectResponse, SessionListResponse, StreamKind,
+        StreamSetup, M1_PROTOCOL_VERSION, M2_ATTACH_PROTOCOL_VERSION,
+    },
     state::{AttentionState, HostMeta, MonitorProfile, ProcessState, SessionMeta, SessionRole},
     storage::{read_json, read_json_lines, write_json_atomic},
     workspace::WorkspaceIdentity,
 };
 use serde_json::{json, Value};
+
+#[test]
+fn protocol_contract_v1_attach_response_omits_negotiation_fields() {
+    let session_id: SessionId = "818b61b1-a620-4a57-8e72-4d439d03840f".parse().unwrap();
+    let response = SessionAttachResponse {
+        schema_version: M1_PROTOCOL_VERSION,
+        protocol_version: M1_PROTOCOL_VERSION,
+        session_id,
+        stream: StreamSetup {
+            stream_id: "attach-v1".to_string(),
+            kind: StreamKind::Attach,
+            read_only: false,
+            input_owner: true,
+        },
+        negotiated_attach_protocol_version: None,
+        negotiated_stream_encoding: None,
+        negotiated_initial_replay: None,
+        accepted_frame_types: Vec::new(),
+    };
+
+    let value = serde_json::to_value(&response).unwrap();
+    assert_eq!(
+        value,
+        json!({
+            "schema_version": 1,
+            "protocol_version": 1,
+            "session_id": "818b61b1-a620-4a57-8e72-4d439d03840f",
+            "stream": {
+                "stream_id": "attach-v1",
+                "kind": "attach",
+                "read_only": false,
+                "input_owner": true
+            }
+        })
+    );
+}
+
+#[test]
+fn protocol_contract_v2_attach_response_confirms_negotiated_axes() {
+    let session_id: SessionId = "818b61b1-a620-4a57-8e72-4d439d03840f".parse().unwrap();
+    let response = SessionAttachResponse {
+        schema_version: M1_PROTOCOL_VERSION,
+        protocol_version: M1_PROTOCOL_VERSION,
+        session_id,
+        stream: StreamSetup {
+            stream_id: "attach-v2".to_string(),
+            kind: StreamKind::Attach,
+            read_only: true,
+            input_owner: false,
+        },
+        negotiated_attach_protocol_version: Some(M2_ATTACH_PROTOCOL_VERSION),
+        negotiated_stream_encoding: Some(AttachStreamEncoding::RawBytes),
+        negotiated_initial_replay: Some(AttachInitialReplay::None),
+        accepted_frame_types: vec![AttachFrameType::RawOutput],
+    };
+
+    let value = serde_json::to_value(&response).unwrap();
+    assert_eq!(
+        value,
+        json!({
+            "schema_version": 1,
+            "protocol_version": 1,
+            "session_id": "818b61b1-a620-4a57-8e72-4d439d03840f",
+            "stream": {
+                "stream_id": "attach-v2",
+                "kind": "attach",
+                "read_only": true,
+                "input_owner": false
+            },
+            "negotiated_attach_protocol_version": 2,
+            "negotiated_stream_encoding": "raw_bytes",
+            "negotiated_initial_replay": "none",
+            "accepted_frame_types": ["raw_output"]
+        })
+    );
+    assert!(!response
+        .accepted_frame_types
+        .contains(&AttachFrameType::StreamLagged));
+}
 
 #[test]
 fn protocol_contract_foreground_daemon_serves_read_only_jsonl_contract() {

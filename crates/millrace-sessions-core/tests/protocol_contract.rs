@@ -3,11 +3,13 @@ use std::{collections::BTreeMap, path::PathBuf};
 use millrace_sessions_core::{
     ids::{PaneId, SessionId, UiId},
     protocol::{
-        AttachReplayMode, AttachStreamFrame, ControlErrorBody, ControlErrorCode, ControlMethod,
-        ControlRequest, ControlResponse, SessionAttachRequest, SessionListRequest,
+        AttachFrameType, AttachInitialReplay, AttachReplayMode, AttachStreamEncoding,
+        AttachStreamFrame, ControlErrorBody, ControlErrorCode, ControlMethod, ControlRequest,
+        ControlResponse, SessionAttachRequest, SessionAttachResponse, SessionListRequest,
         SessionListResponse, SessionSelector, SessionStartRequest, SessionSummary,
-        TerminalDimensions, UiContextGetRequest, UiContextSetRequest, WorkerAttachRequest,
-        WorkerAttachStateResponse, WorkerControlMethod, WorkerControlRequest, M1_PROTOCOL_VERSION,
+        SnapshotUnavailableReason, StreamKind, StreamSetup, TerminalDimensions,
+        UiContextGetRequest, UiContextSetRequest, WorkerAttachRequest, WorkerAttachStateResponse,
+        WorkerControlMethod, WorkerControlRequest, M1_PROTOCOL_VERSION, M2_ATTACH_PROTOCOL_VERSION,
     },
     state::{
         AttentionState, MonitorProfile, ProcessState, SessionRole, UiContext, UiDaemonHealth,
@@ -162,6 +164,10 @@ fn session_attach_replay_modes_replace_legacy_scrollback_boolean() {
         read_only: true,
         replay: AttachReplayMode::LineScrollback,
         requested_terminal_size: None,
+        client_protocol_version: None,
+        accepted_frame_types: Vec::new(),
+        stream_encoding: None,
+        initial_replay: None,
     };
 
     let request = ControlRequest::with_params("attach-1", ControlMethod::SessionAttach, &params)
@@ -213,6 +219,10 @@ fn session_attach_terminal_snapshot_carries_requested_size() {
         read_only: false,
         replay: AttachReplayMode::TerminalSnapshot,
         requested_terminal_size: Some(TerminalDimensions { rows: 31, cols: 99 }),
+        client_protocol_version: None,
+        accepted_frame_types: Vec::new(),
+        stream_encoding: None,
+        initial_replay: None,
     };
 
     let request =
@@ -237,6 +247,229 @@ fn session_attach_terminal_snapshot_carries_requested_size() {
     assert_eq!(
         decoded.requested_terminal_size,
         Some(TerminalDimensions { rows: 31, cols: 99 })
+    );
+}
+
+#[test]
+fn session_attach_v2_negotiation_fields_are_additive() {
+    let session_id: SessionId = "018f5d8d-3e79-4a62-9bc5-51c3c7f4d5c8".parse().unwrap();
+    let params = SessionAttachRequest {
+        selector: SessionSelector::Id { session_id },
+        read_only: true,
+        replay: AttachReplayMode::TerminalSnapshot,
+        requested_terminal_size: Some(TerminalDimensions {
+            rows: 40,
+            cols: 120,
+        }),
+        client_protocol_version: Some(M2_ATTACH_PROTOCOL_VERSION),
+        accepted_frame_types: vec![
+            AttachFrameType::RawOutput,
+            AttachFrameType::SnapshotUnavailable,
+        ],
+        stream_encoding: Some(AttachStreamEncoding::RawBytes),
+        initial_replay: Some(AttachInitialReplay::ScreenSnapshot),
+    };
+
+    let request = ControlRequest::with_params("attach-v2", ControlMethod::SessionAttach, &params)
+        .expect("params serialize");
+
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(request.to_json_line().unwrap().trim_end())
+            .unwrap(),
+        json!({
+            "id": "attach-v2",
+            "method": "session.attach",
+            "params": {
+                "selector": {"type": "id", "session_id": "018f5d8d-3e79-4a62-9bc5-51c3c7f4d5c8"},
+                "read_only": true,
+                "replay": "terminal_snapshot",
+                "requested_terminal_size": {"rows": 40, "cols": 120},
+                "client_protocol_version": 2,
+                "accepted_frame_types": ["raw_output", "snapshot_unavailable"],
+                "stream_encoding": "raw_bytes",
+                "initial_replay": "screen_snapshot"
+            }
+        })
+    );
+
+    let decoded = request.params_as::<SessionAttachRequest>().unwrap();
+    assert_eq!(
+        decoded.negotiated_attach_protocol_version(),
+        Some(M2_ATTACH_PROTOCOL_VERSION)
+    );
+    assert_eq!(
+        decoded.negotiated_stream_encoding(),
+        Some(AttachStreamEncoding::RawBytes)
+    );
+    assert_eq!(
+        decoded.negotiated_initial_replay(),
+        Some(AttachInitialReplay::ScreenSnapshot)
+    );
+    assert_eq!(
+        decoded.negotiated_frame_types(),
+        vec![
+            AttachFrameType::RawOutput,
+            AttachFrameType::SnapshotUnavailable
+        ]
+    );
+    assert!(decoded.accepts_frame_type(AttachFrameType::SnapshotUnavailable));
+    assert!(!decoded.accepts_frame_type(AttachFrameType::StreamLagged));
+}
+
+#[test]
+fn session_attach_v2_missing_accepted_frame_type_suppresses_that_frame() {
+    let session_id: SessionId = "018f5d8d-3e79-4a62-9bc5-51c3c7f4d5c8".parse().unwrap();
+    let request: SessionAttachRequest = serde_json::from_value(json!({
+        "selector": {"type": "id", "session_id": session_id},
+        "client_protocol_version": 2,
+        "accepted_frame_types": ["raw_output"],
+        "stream_encoding": "raw_bytes",
+        "initial_replay": "none"
+    }))
+    .expect("v2 attach params deserialize");
+
+    assert!(request.accepts_frame_type(AttachFrameType::RawOutput));
+    assert!(!request.accepts_frame_type(AttachFrameType::StreamLagged));
+    assert!(!request.accepts_frame_type(AttachFrameType::SnapshotUnavailable));
+    assert!(!request.accepts_frame_type(AttachFrameType::ScreenSnapshot));
+}
+
+#[test]
+fn session_attach_v2_negotiates_only_batch0_implemented_frame_types() {
+    let session_id: SessionId = "018f5d8d-3e79-4a62-9bc5-51c3c7f4d5c8".parse().unwrap();
+    let request: SessionAttachRequest = serde_json::from_value(json!({
+        "selector": {"type": "id", "session_id": session_id},
+        "client_protocol_version": 2,
+        "accepted_frame_types": [
+            "raw_output",
+            "stream_lagged",
+            "snapshot_unavailable",
+            "screen_snapshot"
+        ],
+        "stream_encoding": "raw_bytes",
+        "initial_replay": "screen_snapshot"
+    }))
+    .expect("v2 attach params deserialize");
+
+    assert!(request.accepts_frame_type(AttachFrameType::StreamLagged));
+    assert!(request.accepts_frame_type(AttachFrameType::ScreenSnapshot));
+    assert_eq!(
+        request.negotiated_frame_types(),
+        vec![
+            AttachFrameType::RawOutput,
+            AttachFrameType::SnapshotUnavailable
+        ]
+    );
+}
+
+#[test]
+fn session_attach_v2_raw_replay_requires_raw_output_frame_acceptance() {
+    let session_id: SessionId = "018f5d8d-3e79-4a62-9bc5-51c3c7f4d5c8".parse().unwrap();
+    let request: SessionAttachRequest = serde_json::from_value(json!({
+        "selector": {"type": "id", "session_id": session_id},
+        "client_protocol_version": 2,
+        "accepted_frame_types": [],
+        "replay": "terminal_snapshot",
+        "initial_replay": "raw_replay"
+    }))
+    .expect("v2 attach params deserialize");
+
+    assert_eq!(request.negotiated_initial_replay(), None);
+    assert!(request.negotiated_frame_types().is_empty());
+}
+
+#[test]
+fn session_attach_v2_raw_stream_encoding_requires_raw_output_frame_acceptance() {
+    let session_id: SessionId = "018f5d8d-3e79-4a62-9bc5-51c3c7f4d5c8".parse().unwrap();
+    let request: SessionAttachRequest = serde_json::from_value(json!({
+        "selector": {"type": "id", "session_id": session_id},
+        "client_protocol_version": 2,
+        "accepted_frame_types": [],
+        "stream_encoding": "raw_bytes"
+    }))
+    .expect("v2 attach params deserialize");
+
+    assert_eq!(
+        request.negotiated_stream_encoding(),
+        Some(AttachStreamEncoding::Text)
+    );
+    assert!(request.negotiated_frame_types().is_empty());
+}
+
+#[test]
+fn session_attach_v2_initial_replay_none_overrides_legacy_replay() {
+    let session_id: SessionId = "018f5d8d-3e79-4a62-9bc5-51c3c7f4d5c8".parse().unwrap();
+    let request: SessionAttachRequest = serde_json::from_value(json!({
+        "selector": {"type": "id", "session_id": session_id},
+        "client_protocol_version": 2,
+        "accepted_frame_types": ["raw_output"],
+        "replay": "terminal_snapshot",
+        "initial_replay": "none"
+    }))
+    .expect("v2 attach params deserialize");
+
+    assert_eq!(
+        request.negotiated_initial_replay(),
+        Some(AttachInitialReplay::None)
+    );
+    assert!(request.negotiated_frame_types().is_empty());
+}
+
+#[test]
+fn session_attach_response_negotiation_fields_are_omitted_for_v1() {
+    let session_id: SessionId = "018f5d8d-3e79-4a62-9bc5-51c3c7f4d5c8".parse().unwrap();
+    let response = SessionAttachResponse {
+        schema_version: M1_PROTOCOL_VERSION,
+        protocol_version: M1_PROTOCOL_VERSION,
+        session_id,
+        stream: StreamSetup {
+            stream_id: "attach-1".to_string(),
+            kind: StreamKind::Attach,
+            read_only: false,
+            input_owner: true,
+        },
+        negotiated_attach_protocol_version: None,
+        negotiated_stream_encoding: None,
+        negotiated_initial_replay: None,
+        accepted_frame_types: Vec::new(),
+    };
+
+    let value = serde_json::to_value(&response).expect("response serializes");
+    assert_eq!(value["protocol_version"], M1_PROTOCOL_VERSION);
+    assert!(value.get("negotiated_attach_protocol_version").is_none());
+    assert!(value.get("negotiated_stream_encoding").is_none());
+    assert!(value.get("negotiated_initial_replay").is_none());
+    assert!(value.get("accepted_frame_types").is_none());
+
+    let decoded: SessionAttachResponse = serde_json::from_value(value).unwrap();
+    assert_eq!(decoded.negotiated_attach_protocol_version, None);
+    assert!(decoded.accepted_frame_types.is_empty());
+}
+
+#[test]
+fn snapshot_unavailable_frame_has_minimal_v2_envelope() {
+    let frame = AttachStreamFrame::SnapshotUnavailable {
+        reason: SnapshotUnavailableReason::SizeMismatch,
+        details: Some(json!({
+            "requested_rows": 40,
+            "requested_cols": 120,
+            "snapshot_rows": 24,
+            "snapshot_cols": 80
+        })),
+    };
+
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&frame.to_json_line().unwrap()).unwrap(),
+        json!({
+            "type": "snapshot_unavailable",
+            "reason": "size_mismatch",
+            "details": {
+                "requested_rows": 40,
+                "requested_cols": 120,
+                "snapshot_rows": 24,
+                "snapshot_cols": 80
+            }
+        })
     );
 }
 

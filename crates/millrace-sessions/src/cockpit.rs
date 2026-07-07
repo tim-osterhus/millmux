@@ -683,6 +683,10 @@ fn agent_attach_request(
         read_only,
         replay: AttachReplayMode::TerminalSnapshot,
         requested_terminal_size: Some(TerminalDimensions::new(rows, cols)),
+        client_protocol_version: None,
+        accepted_frame_types: Vec::new(),
+        stream_encoding: None,
+        initial_replay: None,
     }
 }
 
@@ -692,6 +696,10 @@ fn agent_raw_replay_attach_request(session_id: SessionId, read_only: bool) -> Se
         read_only,
         replay: AttachReplayMode::RawReplay,
         requested_terminal_size: None,
+        client_protocol_version: None,
+        accepted_frame_types: Vec::new(),
+        stream_encoding: None,
+        initial_replay: None,
     }
 }
 

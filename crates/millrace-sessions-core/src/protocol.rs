@@ -15,6 +15,7 @@ use crate::{
 };
 
 pub const M1_PROTOCOL_VERSION: u32 = 1;
+pub const M2_ATTACH_PROTOCOL_VERSION: u32 = 2;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ControlMethod {
@@ -322,6 +323,55 @@ impl fmt::Display for AttachReplayMode {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AttachFrameType {
+    RawOutput,
+    StreamLagged,
+    SnapshotUnavailable,
+    ScreenSnapshot,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AttachStreamEncoding {
+    #[default]
+    Text,
+    RawBytes,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AttachInitialReplay {
+    #[default]
+    None,
+    LineScrollback,
+    RawReplay,
+    ScreenSnapshot,
+}
+
+impl AttachInitialReplay {
+    pub fn from_legacy_replay(replay: AttachReplayMode) -> Self {
+        match replay {
+            AttachReplayMode::None => Self::None,
+            AttachReplayMode::LineScrollback => Self::LineScrollback,
+            AttachReplayMode::RawReplay | AttachReplayMode::TerminalSnapshot => Self::RawReplay,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SnapshotUnavailableReason {
+    NoSnapshot,
+    SizeMismatch,
+    UnsupportedSpawnMode,
+    PayloadTooLarge,
+    TerminalModelUnavailable,
+    PermissionDenied,
+    InternalError,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TerminalDimensions {
     pub rows: u16,
     pub cols: u16,
@@ -345,6 +395,95 @@ pub struct SessionAttachRequest {
     pub replay: AttachReplayMode,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub requested_terminal_size: Option<TerminalDimensions>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_protocol_version: Option<u32>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub accepted_frame_types: Vec<AttachFrameType>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stream_encoding: Option<AttachStreamEncoding>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub initial_replay: Option<AttachInitialReplay>,
+}
+
+impl SessionAttachRequest {
+    pub fn negotiated_attach_protocol_version(&self) -> Option<u32> {
+        self.client_protocol_version
+            .filter(|version| *version >= M2_ATTACH_PROTOCOL_VERSION)
+            .map(|version| version.min(M2_ATTACH_PROTOCOL_VERSION))
+    }
+
+    pub fn negotiated_stream_encoding(&self) -> Option<AttachStreamEncoding> {
+        self.negotiated_attach_protocol_version().map(|_| {
+            match self.stream_encoding.unwrap_or_default() {
+                AttachStreamEncoding::RawBytes
+                    if self.client_accepts_frame_type(AttachFrameType::RawOutput) =>
+                {
+                    AttachStreamEncoding::RawBytes
+                }
+                _ => AttachStreamEncoding::Text,
+            }
+        })
+    }
+
+    pub fn negotiated_initial_replay(&self) -> Option<AttachInitialReplay> {
+        self.negotiated_attach_protocol_version().and_then(|_| {
+            match self
+                .initial_replay
+                .unwrap_or_else(|| AttachInitialReplay::from_legacy_replay(self.replay))
+            {
+                AttachInitialReplay::RawReplay
+                    if !self.client_accepts_frame_type(AttachFrameType::RawOutput) =>
+                {
+                    None
+                }
+                AttachInitialReplay::ScreenSnapshot
+                    if !self.client_accepts_frame_type(AttachFrameType::SnapshotUnavailable) =>
+                {
+                    None
+                }
+                replay => Some(replay),
+            }
+        })
+    }
+
+    pub fn negotiated_frame_types(&self) -> Vec<AttachFrameType> {
+        let mut frame_types = Vec::new();
+        if self.negotiated_attach_protocol_version().is_none() {
+            return frame_types;
+        }
+
+        if self.negotiated_stream_encoding() == Some(AttachStreamEncoding::RawBytes)
+            && self.client_accepts_frame_type(AttachFrameType::RawOutput)
+        {
+            frame_types.push(AttachFrameType::RawOutput);
+        }
+
+        match self.negotiated_initial_replay() {
+            Some(AttachInitialReplay::RawReplay)
+                if self.client_accepts_frame_type(AttachFrameType::RawOutput)
+                    && !frame_types.contains(&AttachFrameType::RawOutput) =>
+            {
+                frame_types.push(AttachFrameType::RawOutput);
+            }
+            Some(AttachInitialReplay::ScreenSnapshot)
+                if self.client_accepts_frame_type(AttachFrameType::SnapshotUnavailable) =>
+            {
+                frame_types.push(AttachFrameType::SnapshotUnavailable);
+            }
+            _ => {}
+        }
+
+        frame_types
+    }
+
+    pub fn accepts_frame_type(&self, frame_type: AttachFrameType) -> bool {
+        self.client_accepts_frame_type(frame_type)
+    }
+
+    pub fn client_accepts_frame_type(&self, frame_type: AttachFrameType) -> bool {
+        self.negotiated_attach_protocol_version().is_some()
+            && self.accepted_frame_types.contains(&frame_type)
+    }
 }
 
 impl<'de> Deserialize<'de> for SessionAttachRequest {
@@ -363,6 +502,14 @@ impl<'de> Deserialize<'de> for SessionAttachRequest {
             requested_terminal_size: Option<TerminalDimensions>,
             #[serde(default)]
             include_scrollback: Option<bool>,
+            #[serde(default)]
+            client_protocol_version: Option<u32>,
+            #[serde(default)]
+            accepted_frame_types: Vec<AttachFrameType>,
+            #[serde(default)]
+            stream_encoding: Option<AttachStreamEncoding>,
+            #[serde(default)]
+            initial_replay: Option<AttachInitialReplay>,
         }
 
         let wire = Wire::deserialize(deserializer)?;
@@ -375,6 +522,10 @@ impl<'de> Deserialize<'de> for SessionAttachRequest {
                     .unwrap_or_default()
             }),
             requested_terminal_size: wire.requested_terminal_size,
+            client_protocol_version: wire.client_protocol_version,
+            accepted_frame_types: wire.accepted_frame_types,
+            stream_encoding: wire.stream_encoding,
+            initial_replay: wire.initial_replay,
         })
     }
 }
@@ -576,6 +727,14 @@ pub struct SessionAttachResponse {
     pub protocol_version: u32,
     pub session_id: SessionId,
     pub stream: StreamSetup,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub negotiated_attach_protocol_version: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub negotiated_stream_encoding: Option<AttachStreamEncoding>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub negotiated_initial_replay: Option<AttachInitialReplay>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub accepted_frame_types: Vec<AttachFrameType>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -748,12 +907,30 @@ impl<'de> Deserialize<'de> for AttachRawBytes {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum AttachStreamFrame {
-    Scrollback { lines: Vec<String> },
-    Output { text: String },
-    RawOutput { data: AttachRawBytes },
-    Input { text: String },
-    Resize { rows: u16, cols: u16 },
-    Error { error: ControlErrorBody },
+    Scrollback {
+        lines: Vec<String>,
+    },
+    Output {
+        text: String,
+    },
+    RawOutput {
+        data: AttachRawBytes,
+    },
+    SnapshotUnavailable {
+        reason: SnapshotUnavailableReason,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        details: Option<Value>,
+    },
+    Input {
+        text: String,
+    },
+    Resize {
+        rows: u16,
+        cols: u16,
+    },
+    Error {
+        error: ControlErrorBody,
+    },
     Close,
     Closed,
 }

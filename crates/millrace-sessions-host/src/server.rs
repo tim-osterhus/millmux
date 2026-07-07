@@ -19,15 +19,16 @@ use millrace_sessions_core::{
     ids::{SessionId, UiId},
     paths::{state_paths, StatePaths},
     protocol::{
-        AttachReplayMode, AttachStreamFrame, ControlErrorBody, ControlErrorCode, ControlResponse,
-        DoctorRequest, EventStreamFrame, HostStatusRequest, HostStatusResponse, LogLine,
-        LogStreamFrame, SessionAttachRequest, SessionAttachResponse, SessionDeleteRequest,
-        SessionDeleteResponse, SessionEventsRequest, SessionEventsResponse, SessionInspectRequest,
-        SessionInspectResponse, SessionKillRequest, SessionKillResponse, SessionListRequest,
-        SessionListResponse, SessionLogsRequest, SessionLogsResponse, SessionResizeRequest,
-        SessionResizeResponse, SessionSendRequest, SessionSendResponse, SessionStartRequest,
-        SessionStartResponse, SessionStopRequest, SessionStopResponse, SessionSummary, StreamKind,
-        StreamSetup, TerminalDimensions, UiContextCloseRequest, UiContextCloseResponse,
+        AttachFrameType, AttachInitialReplay, AttachReplayMode, AttachStreamEncoding,
+        AttachStreamFrame, ControlErrorBody, ControlErrorCode, ControlResponse, DoctorRequest,
+        EventStreamFrame, HostStatusRequest, HostStatusResponse, LogLine, LogStreamFrame,
+        SessionAttachRequest, SessionAttachResponse, SessionDeleteRequest, SessionDeleteResponse,
+        SessionEventsRequest, SessionEventsResponse, SessionInspectRequest, SessionInspectResponse,
+        SessionKillRequest, SessionKillResponse, SessionListRequest, SessionListResponse,
+        SessionLogsRequest, SessionLogsResponse, SessionResizeRequest, SessionResizeResponse,
+        SessionSendRequest, SessionSendResponse, SessionStartRequest, SessionStartResponse,
+        SessionStopRequest, SessionStopResponse, SessionSummary, SnapshotUnavailableReason,
+        StreamKind, StreamSetup, TerminalDimensions, UiContextCloseRequest, UiContextCloseResponse,
         UiContextGetRequest, UiContextGetResponse, UiContextListEntry, UiContextListRequest,
         UiContextListResponse, UiContextSetRequest, UiContextSetResponse, WorkerAckResponse,
         WorkerAttachRequest, WorkerAttachResponse, WorkerControlMethod, WorkerControlRequest,
@@ -1910,14 +1911,7 @@ async fn handle_attach_stream(
         .await?;
     writer.flush().await?;
 
-    let replay = params.replay;
-    let mut offset = attach_initial_offset(
-        cleanup.opened(),
-        replay,
-        params.requested_terminal_size,
-        &mut writer,
-    )
-    .await?;
+    let mut offset = attach_initial_offset(cleanup.opened(), &params, &mut writer).await?;
 
     loop {
         tokio::select! {
@@ -1940,7 +1934,7 @@ async fn handle_attach_stream(
                     Err(_) => Vec::new(),
                 };
                 if !next.is_empty() {
-                    let frame = attach_output_frame(replay, next);
+                    let frame = attach_live_output_frame(&params, next);
                     if writer.write_all(frame.to_json_line()?.as_bytes()).await.is_err() {
                         break;
                     }
@@ -2000,6 +1994,58 @@ impl Drop for AttachCleanupGuard {
 
 async fn attach_initial_offset(
     opened: &OpenAttach,
+    request: &SessionAttachRequest,
+    writer: &mut OwnedWriteHalf,
+) -> Result<u64, HostServerError> {
+    if opened.response.negotiated_attach_protocol_version.is_some() {
+        return attach_negotiated_initial_offset(opened, request, writer).await;
+    }
+
+    attach_legacy_initial_offset(
+        opened,
+        request.replay,
+        request.requested_terminal_size,
+        writer,
+    )
+    .await
+}
+
+async fn attach_negotiated_initial_offset(
+    opened: &OpenAttach,
+    request: &SessionAttachRequest,
+    writer: &mut OwnedWriteHalf,
+) -> Result<u64, HostServerError> {
+    match opened.response.negotiated_initial_replay {
+        None | Some(AttachInitialReplay::None) => Ok(file_len(&opened.paths.pty_log)),
+        Some(AttachInitialReplay::LineScrollback) => {
+            attach_line_scrollback(opened, writer).await?;
+            Ok(file_len(&opened.paths.pty_log))
+        }
+        Some(AttachInitialReplay::RawReplay) => {
+            attach_raw_initial_replay(opened, request.requested_terminal_size, writer).await
+        }
+        Some(AttachInitialReplay::ScreenSnapshot) => {
+            if opened
+                .response
+                .accepted_frame_types
+                .contains(&AttachFrameType::SnapshotUnavailable)
+            {
+                let frame = AttachStreamFrame::SnapshotUnavailable {
+                    reason: SnapshotUnavailableReason::TerminalModelUnavailable,
+                    details: Some(json!({
+                        "message": "screen_snapshot attach replay is not implemented by this host"
+                    })),
+                };
+                writer.write_all(frame.to_json_line()?.as_bytes()).await?;
+                writer.flush().await?;
+            }
+            Ok(file_len(&opened.paths.pty_log))
+        }
+    }
+}
+
+async fn attach_legacy_initial_offset(
+    opened: &OpenAttach,
     replay: AttachReplayMode,
     requested_terminal_size: Option<TerminalDimensions>,
     writer: &mut OwnedWriteHalf,
@@ -2007,42 +2053,79 @@ async fn attach_initial_offset(
     match replay {
         AttachReplayMode::None => Ok(file_len(&opened.paths.pty_log)),
         AttachReplayMode::LineScrollback => {
-            let mut offset = 0;
-            if let Ok(scrollback) =
-                ScrollbackBuffer::restore_snapshot(&opened.paths.scrollback_snapshot)
-            {
-                let frame = AttachStreamFrame::Scrollback {
-                    lines: scrollback.lines(),
-                };
-                writer.write_all(frame.to_json_line()?.as_bytes()).await?;
-                writer.flush().await?;
-                offset = file_len(&opened.paths.pty_log);
-            }
-            Ok(offset)
+            attach_line_scrollback(opened, writer).await?;
+            Ok(file_len(&opened.paths.pty_log))
         }
         AttachReplayMode::RawReplay | AttachReplayMode::TerminalSnapshot => {
-            let offset = file_len(&opened.paths.pty_log);
-            if let Some(restored) = restore_terminal_replay(
-                &opened.paths.terminal_snapshot,
-                &opened.paths.raw_replay_ring,
-                offset,
-            )
-            .unwrap_or(None)
-            {
-                if replay_matches_requested_size(
-                    replay,
-                    requested_terminal_size,
-                    &restored.snapshot,
-                ) && !restored.bytes.is_empty()
-                {
-                    let frame = AttachStreamFrame::raw_output(restored.bytes);
-                    writer.write_all(frame.to_json_line()?.as_bytes()).await?;
-                    writer.flush().await?;
-                }
-            }
-            Ok(offset)
+            attach_legacy_raw_initial_replay(opened, replay, requested_terminal_size, writer).await
         }
     }
+}
+
+async fn attach_line_scrollback(
+    opened: &OpenAttach,
+    writer: &mut OwnedWriteHalf,
+) -> Result<(), HostServerError> {
+    if let Ok(scrollback) = ScrollbackBuffer::restore_snapshot(&opened.paths.scrollback_snapshot) {
+        let frame = AttachStreamFrame::Scrollback {
+            lines: scrollback.lines(),
+        };
+        writer.write_all(frame.to_json_line()?.as_bytes()).await?;
+        writer.flush().await?;
+    }
+    Ok(())
+}
+
+async fn attach_raw_initial_replay(
+    opened: &OpenAttach,
+    requested_terminal_size: Option<TerminalDimensions>,
+    writer: &mut OwnedWriteHalf,
+) -> Result<u64, HostServerError> {
+    let offset = file_len(&opened.paths.pty_log);
+    if let Some(restored) = restore_terminal_replay(
+        &opened.paths.terminal_snapshot,
+        &opened.paths.raw_replay_ring,
+        offset,
+    )
+    .unwrap_or(None)
+    {
+        if replay_matches_requested_size(
+            AttachReplayMode::RawReplay,
+            requested_terminal_size,
+            &restored.snapshot,
+        ) && !restored.bytes.is_empty()
+        {
+            let frame = AttachStreamFrame::raw_output(restored.bytes);
+            writer.write_all(frame.to_json_line()?.as_bytes()).await?;
+            writer.flush().await?;
+        }
+    }
+    Ok(offset)
+}
+
+async fn attach_legacy_raw_initial_replay(
+    opened: &OpenAttach,
+    replay: AttachReplayMode,
+    requested_terminal_size: Option<TerminalDimensions>,
+    writer: &mut OwnedWriteHalf,
+) -> Result<u64, HostServerError> {
+    let offset = file_len(&opened.paths.pty_log);
+    if let Some(restored) = restore_terminal_replay(
+        &opened.paths.terminal_snapshot,
+        &opened.paths.raw_replay_ring,
+        offset,
+    )
+    .unwrap_or(None)
+    {
+        if replay_matches_requested_size(replay, requested_terminal_size, &restored.snapshot)
+            && !restored.bytes.is_empty()
+        {
+            let frame = attach_initial_output_frame(replay, restored.bytes);
+            writer.write_all(frame.to_json_line()?.as_bytes()).await?;
+            writer.flush().await?;
+        }
+    }
+    Ok(offset)
 }
 
 fn replay_matches_requested_size(
@@ -2060,8 +2143,22 @@ fn replay_matches_requested_size(
     }
 }
 
-fn attach_output_frame(replay: AttachReplayMode, bytes: Vec<u8>) -> AttachStreamFrame {
+fn attach_initial_output_frame(replay: AttachReplayMode, bytes: Vec<u8>) -> AttachStreamFrame {
     if replay.uses_raw_payloads() {
+        AttachStreamFrame::raw_output(bytes)
+    } else {
+        AttachStreamFrame::Output {
+            text: String::from_utf8_lossy(&bytes).to_string(),
+        }
+    }
+}
+
+fn attach_live_output_frame(request: &SessionAttachRequest, bytes: Vec<u8>) -> AttachStreamFrame {
+    if request.negotiated_stream_encoding() == Some(AttachStreamEncoding::RawBytes)
+        && request
+            .negotiated_frame_types()
+            .contains(&AttachFrameType::RawOutput)
+    {
         AttachStreamFrame::raw_output(bytes)
     } else {
         AttachStreamFrame::Output {
@@ -2120,6 +2217,10 @@ fn open_attach(
             read_only: worker.read_only,
             input_owner: worker.input_owner,
         },
+        negotiated_attach_protocol_version: request.negotiated_attach_protocol_version(),
+        negotiated_stream_encoding: request.negotiated_stream_encoding(),
+        negotiated_initial_replay: request.negotiated_initial_replay(),
+        accepted_frame_types: request.negotiated_frame_types(),
     };
 
     Ok(OpenAttach {
@@ -2404,6 +2505,39 @@ mod tests {
             AttachReplayMode::RawReplay,
             None,
             &snapshot
+        ));
+    }
+
+    #[test]
+    fn attach_live_output_requires_v2_raw_bytes_and_raw_output_acceptance() {
+        let session_id: SessionId = "818b61b1-a620-4a57-8e72-4d439d03840f".parse().unwrap();
+        let mut request = SessionAttachRequest {
+            selector: millrace_sessions_core::protocol::SessionSelector::Id { session_id },
+            read_only: false,
+            replay: AttachReplayMode::RawReplay,
+            requested_terminal_size: None,
+            client_protocol_version: None,
+            accepted_frame_types: Vec::new(),
+            stream_encoding: None,
+            initial_replay: None,
+        };
+
+        assert!(matches!(
+            attach_live_output_frame(&request, b"\xfflive".to_vec()),
+            AttachStreamFrame::Output { .. }
+        ));
+
+        request.client_protocol_version = Some(2);
+        request.stream_encoding = Some(AttachStreamEncoding::RawBytes);
+        assert!(matches!(
+            attach_live_output_frame(&request, b"\xfflive".to_vec()),
+            AttachStreamFrame::Output { .. }
+        ));
+
+        request.accepted_frame_types = vec![AttachFrameType::RawOutput];
+        assert!(matches!(
+            attach_live_output_frame(&request, b"\xfflive".to_vec()),
+            AttachStreamFrame::RawOutput { data } if data.as_slice() == b"\xfflive"
         ));
     }
 }

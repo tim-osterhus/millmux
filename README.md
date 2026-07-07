@@ -1,7 +1,7 @@
 # Millmux
 
-Millmux is a local, durable PTY session layer for long-running terminal
-processes.
+Millmux is a native local process/session substrate for long-running terminal
+and daemon-oriented work. The currently implemented substrate is PTY-centered.
 
 It gives operators and agents a narrow alternative to keeping important work
 alive inside tmux panes: start a process, detach, reattach, inspect logs, send
@@ -30,6 +30,20 @@ A Millmux session has three layers:
 
 Millmux keeps the terminal/session record durable. If the hosted process has
 its own application state, that application remains the source of truth.
+
+For Millrace workflows, keep three layers separate:
+
+- Millrace runtime truth: tasks, queues, incidents, approvals, recovery, and
+  completion evidence.
+- Millmux substrate truth: sessions, workers, process state, attach state,
+  logs, events, PTY evidence, terminal replay checkpoints, and UI context
+  records.
+- Renderer/client truth: human attach, console, cockpit, and any future tmux or
+  UI adapter.
+
+Rendering is an adapter, not substrate truth. Cockpit is an operator preview
+and control surface. Future raw attach work is the intended byte-exact
+terminal fidelity path.
 
 ## Install
 
@@ -374,6 +388,29 @@ Millmux is not a tmux clone, remote terminal server, web dashboard, restart
 policy engine, or second Millrace runtime. It intentionally keeps a narrower
 job: durable local PTY sessions, visible daemon/agent panes, lifecycle records,
 and a small control protocol that agents can poll.
+
+tmux may become an optional compatibility adapter or behavior oracle later. It
+is not the default substrate and does not own canonical Millmux session truth.
+
+`terminal.snapshot.json`, bounded raw replay, and future structured
+`screen_snapshot` responses are separate surfaces. The current
+`AttachReplayMode::TerminalSnapshot` wire name is legacy terminology for a
+size-gated raw replay checkpoint, not a structured screen snapshot.
+
+## Protocol Compatibility
+
+Existing JSONL clients remain protocol v1 unless they explicitly negotiate a
+newer attach protocol. v1 attach clients keep legacy request/response shapes,
+including `include_scrollback` compatibility, and must not receive future-only
+attach frames such as `stream_lagged`, `screen_snapshot`, or
+`snapshot_unavailable`.
+
+Legacy raw replay/checkpoint responses may still use `RawOutput` for initial
+replay bytes. Public host `session.attach` live-output streams require v2
+negotiation with `stream_encoding = "raw_bytes"` and a negotiated
+`raw_output` frame type. The lower-level worker observe path remains a legacy
+internal control surface until the worker-backed streaming batch folds it into
+the same capability gate.
 
 ## Evidence
 

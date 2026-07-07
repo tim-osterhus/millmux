@@ -14,9 +14,10 @@ use millrace_sessions_core::{
     events::{read_events, SessionEventKind},
     paths::{StatePaths, STATE_DIR_ENV},
     protocol::{
-        AttachStreamFrame, ControlErrorCode, ControlResponse, SessionAttachResponse,
-        SessionDeleteResponse, SessionEventsResponse, SessionKillResponse, SessionLogsResponse,
-        SessionResizeResponse, SessionSendResponse, SessionStartResponse, SessionStopResponse,
+        AttachFrameType, AttachInitialReplay, AttachStreamFrame, ControlErrorCode, ControlResponse,
+        SessionAttachResponse, SessionDeleteResponse, SessionEventsResponse, SessionKillResponse,
+        SessionLogsResponse, SessionResizeResponse, SessionSendResponse, SessionStartResponse,
+        SessionStopResponse, SnapshotUnavailableReason,
     },
     scrollback::{restore_terminal_replay, TerminalSnapshot, TerminalStateBuffer},
     state::{ProcessState, SessionMeta, WorkerMeta},
@@ -981,6 +982,145 @@ fn attach_terminal_snapshot_skips_stale_raw_replay() {
     reader.read_line(&mut frame_line).unwrap();
     let frame = AttachStreamFrame::from_json_line(&frame_line).unwrap();
     assert_eq!(frame, AttachStreamFrame::Closed);
+
+    daemon.kill();
+}
+
+#[test]
+fn attach_v2_initial_replay_none_suppresses_legacy_terminal_snapshot_replay() {
+    let temp = tempfile::tempdir().unwrap();
+    let paths = StatePaths::new(temp.path().join("state"));
+    let workspace = temp.path().join("workspace");
+    fs::create_dir_all(&workspace).unwrap();
+    let mut daemon = DaemonChild::spawn(&paths);
+    wait_for_socket(&paths.control_sock);
+
+    let start = start_session(&paths, &workspace, "v2-none-raw-attach-shell", "sleep 5");
+    let session_paths = paths.session_paths(start.session.session_id);
+    wait_for_worker_socket(&session_paths.worker_sock);
+    wait_for_running_meta(&session_paths.meta_json);
+    let raw = b"\x1b[?1049hv2-none raw\r\n".to_vec();
+    persist_terminal_replay_fixture(&session_paths, &raw, raw.len() as u64);
+
+    let mut stream = UnixStream::connect(&paths.control_sock).expect("connect attach stream");
+    stream
+        .write_all(
+            format!(
+                "{}\n",
+                serde_json::to_string(&json!({
+                    "id": "attach-v2-none",
+                    "method": "session.attach",
+                    "params": {
+                        "selector": {"type": "id", "session_id": start.session.session_id},
+                        "replay": "terminal_snapshot",
+                        "requested_terminal_size": {"rows": 24, "cols": 80},
+                        "client_protocol_version": 2,
+                        "accepted_frame_types": ["raw_output"],
+                        "stream_encoding": "raw_bytes",
+                        "initial_replay": "none"
+                    }
+                }))
+                .unwrap()
+            )
+            .as_bytes(),
+        )
+        .unwrap();
+
+    let mut reader = BufReader::new(stream.try_clone().unwrap());
+    let mut response_line = String::new();
+    reader.read_line(&mut response_line).unwrap();
+    let response: ControlResponse = serde_json::from_str(response_line.trim_end()).unwrap();
+    assert!(response.ok, "{response:#?}");
+    let attach: SessionAttachResponse = response.result_as().unwrap();
+    assert_eq!(
+        attach.negotiated_initial_replay,
+        Some(AttachInitialReplay::None)
+    );
+    assert_eq!(
+        attach.accepted_frame_types,
+        vec![AttachFrameType::RawOutput]
+    );
+
+    stream
+        .write_all(AttachStreamFrame::Close.to_json_line().unwrap().as_bytes())
+        .unwrap();
+    let mut frame_line = String::new();
+    reader.read_line(&mut frame_line).unwrap();
+    let frame = AttachStreamFrame::from_json_line(&frame_line).unwrap();
+    assert_eq!(frame, AttachStreamFrame::Closed);
+
+    daemon.kill();
+}
+
+#[test]
+fn attach_v2_screen_snapshot_reports_unavailable_without_overclaiming_frames() {
+    let temp = tempfile::tempdir().unwrap();
+    let paths = StatePaths::new(temp.path().join("state"));
+    let workspace = temp.path().join("workspace");
+    fs::create_dir_all(&workspace).unwrap();
+    let mut daemon = DaemonChild::spawn(&paths);
+    wait_for_socket(&paths.control_sock);
+
+    let start = start_session(&paths, &workspace, "v2-screen-snapshot-shell", "sleep 5");
+    let session_paths = paths.session_paths(start.session.session_id);
+    wait_for_worker_socket(&session_paths.worker_sock);
+    wait_for_running_meta(&session_paths.meta_json);
+
+    let mut stream = UnixStream::connect(&paths.control_sock).expect("connect attach stream");
+    stream
+        .write_all(
+            format!(
+                "{}\n",
+                serde_json::to_string(&json!({
+                    "id": "attach-v2-screen",
+                    "method": "session.attach",
+                    "params": {
+                        "selector": {"type": "id", "session_id": start.session.session_id},
+                        "client_protocol_version": 2,
+                        "accepted_frame_types": [
+                            "stream_lagged",
+                            "snapshot_unavailable",
+                            "screen_snapshot"
+                        ],
+                        "initial_replay": "screen_snapshot"
+                    }
+                }))
+                .unwrap()
+            )
+            .as_bytes(),
+        )
+        .unwrap();
+
+    let mut reader = BufReader::new(stream.try_clone().unwrap());
+    let mut response_line = String::new();
+    reader.read_line(&mut response_line).unwrap();
+    let response: ControlResponse = serde_json::from_str(response_line.trim_end()).unwrap();
+    assert!(response.ok, "{response:#?}");
+    let attach: SessionAttachResponse = response.result_as().unwrap();
+    assert_eq!(
+        attach.negotiated_initial_replay,
+        Some(AttachInitialReplay::ScreenSnapshot)
+    );
+    assert_eq!(
+        attach.accepted_frame_types,
+        vec![AttachFrameType::SnapshotUnavailable]
+    );
+
+    let mut frame_line = String::new();
+    reader.read_line(&mut frame_line).unwrap();
+    let frame = AttachStreamFrame::from_json_line(&frame_line).unwrap();
+    assert!(matches!(
+        frame,
+        AttachStreamFrame::SnapshotUnavailable {
+            reason: SnapshotUnavailableReason::TerminalModelUnavailable,
+            ..
+        }
+    ));
+
+    stream
+        .write_all(AttachStreamFrame::Close.to_json_line().unwrap().as_bytes())
+        .unwrap();
+    wait_for_event_kind(&session_paths.events_jsonl, SessionEventKind::AttachClosed);
 
     daemon.kill();
 }

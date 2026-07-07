@@ -127,6 +127,10 @@ impl AttachArgs {
                 AttachReplayMode::LineScrollback
             },
             requested_terminal_size: None,
+            client_protocol_version: None,
+            accepted_frame_types: Vec::new(),
+            stream_encoding: None,
+            initial_replay: None,
         })
     }
 }
