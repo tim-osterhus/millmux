@@ -690,7 +690,7 @@ fn check_attach_stream_lag(record: &SessionRecord, issues: &mut Vec<DoctorIssue>
         Some(record.paths.events_jsonl.clone()),
         false,
         Some(
-            "reattach with raw replay or inspect pty.log; slow attach clients should drain frames promptly"
+            "request millmux screen for structured state, reattach with raw replay from pty.replay, or inspect pty.log and events.jsonl; slow attach clients should drain frames promptly"
                 .to_string(),
         ),
         Some(json!({
@@ -702,6 +702,9 @@ fn check_attach_stream_lag(record: &SessionRecord, issues: &mut Vec<DoctorIssue>
             "current_pty_log_offset": last_event.fields.get("current_pty_log_offset"),
             "reason": last_event.fields.get("reason"),
             "pty_log": record.paths.pty_log.display().to_string(),
+            "events_jsonl": record.paths.events_jsonl.display().to_string(),
+            "terminal_snapshot": record.paths.terminal_snapshot.display().to_string(),
+            "raw_replay_ring": record.paths.raw_replay_ring.display().to_string(),
         })),
     ));
 }
@@ -733,14 +736,17 @@ fn check_legacy_line_scrollback(record: &SessionRecord, issues: &mut Vec<DoctorI
         Some(record.paths.scrollback_snapshot.clone()),
         repairable,
         Some(
-            "ignore legacy line scrollback for agent TUI replay; archive with ARCHIVE_STALE only when the session is stale or no longer needed; preserve pty.log and events.jsonl as raw evidence"
+            "use millmux screen for structured screen state; ignore legacy line scrollback for agent TUI replay; archive with ARCHIVE_STALE only when the session is stale or no longer needed; preserve pty.log, events.jsonl, terminal.snapshot.json, and pty.replay as evidence"
                 .to_string(),
         ),
         Some(json!({
             "detected_sequence": sequence_name,
             "line_count": lines.len(),
+            "screen_command": format!("millmux screen {} --json", record.meta.id),
             "pty_log": record.paths.pty_log.display().to_string(),
             "events_jsonl": record.paths.events_jsonl.display().to_string(),
+            "terminal_snapshot": record.paths.terminal_snapshot.display().to_string(),
+            "raw_replay_ring": record.paths.raw_replay_ring.display().to_string(),
             "scrollback_snapshot": record.paths.scrollback_snapshot.display().to_string(),
         })),
     ));

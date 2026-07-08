@@ -21,9 +21,10 @@ use millrace_sessions_core::{
     ids::{SessionId, UiId},
     paths::{state_paths, CONTROL_SOCK_ENV, STATE_DIR_ENV, UI_ID_ENV},
     protocol::{
-        AttachReplayMode, AttachStreamFrame, ControlErrorCode, SessionAttachRequest,
-        SessionListRequest, SessionLogsRequest, SessionSelector, SessionStartRequest,
-        TerminalDimensions, UiContextSetRequest,
+        AttachFrameType, AttachInitialReplay, AttachReplayMode, AttachStreamEncoding,
+        AttachStreamFrame, ControlErrorCode, SessionAttachRequest, SessionListRequest,
+        SessionLogsRequest, SessionSelector, SessionStartRequest, TerminalDimensions,
+        UiContextSetRequest, M2_ATTACH_PROTOCOL_VERSION,
     },
     state::{MonitorProfile, ProcessState, SessionRole, SpawnMode, UiEvent, UiEventKind},
 };
@@ -49,7 +50,7 @@ const REDRAW_INTERVAL: Duration = Duration::from_millis(33);
 const ATTACH_POLL_INTERVAL: Duration = Duration::from_millis(5);
 const ATTACH_DRAIN_INTERVAL: Duration = Duration::from_millis(1);
 const SNAPSHOT_SEED_TIMEOUT: Duration = Duration::from_millis(3_000);
-const SNAPSHOT_SEED_FRAME_WAIT: Duration = Duration::from_millis(50);
+const SNAPSHOT_SEED_FRAME_WAIT: Duration = Duration::from_millis(1_000);
 const SNAPSHOT_SEED_OUTPUT_QUIET: Duration = Duration::from_millis(75);
 const SNAPSHOT_SEED_RETRY_INTERVAL: Duration = Duration::from_millis(25);
 const TERMINAL_SCROLLBACK: usize = 4000;
@@ -699,10 +700,10 @@ fn agent_raw_replay_attach_request(session_id: SessionId, read_only: bool) -> Se
         read_only,
         replay: AttachReplayMode::RawReplay,
         requested_terminal_size: None,
-        client_protocol_version: None,
-        accepted_frame_types: Vec::new(),
-        stream_encoding: None,
-        initial_replay: None,
+        client_protocol_version: Some(M2_ATTACH_PROTOCOL_VERSION),
+        accepted_frame_types: vec![AttachFrameType::RawOutput],
+        stream_encoding: Some(AttachStreamEncoding::RawBytes),
+        initial_replay: Some(AttachInitialReplay::RawReplay),
     }
 }
 
@@ -1151,6 +1152,19 @@ mod tests {
         assert!(request.read_only);
         assert_eq!(request.replay, AttachReplayMode::RawReplay);
         assert_eq!(request.requested_terminal_size, None);
+        assert_eq!(
+            request.client_protocol_version,
+            Some(M2_ATTACH_PROTOCOL_VERSION)
+        );
+        assert_eq!(
+            request.accepted_frame_types,
+            vec![AttachFrameType::RawOutput]
+        );
+        assert_eq!(
+            request.stream_encoding,
+            Some(AttachStreamEncoding::RawBytes)
+        );
+        assert_eq!(request.initial_replay, Some(AttachInitialReplay::RawReplay));
     }
 
     #[test]

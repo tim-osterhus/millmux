@@ -294,7 +294,7 @@ fn doctor_archive_preserves_private_session_artifacts() {
 }
 
 #[test]
-fn doctor_archive_preserves_unsafe_agent_terminal_evidence() {
+fn doctor_screen_guidance_preserves_unsafe_agent_terminal_evidence() {
     let temp = tempfile::tempdir().unwrap();
     let paths = prepared_state(temp.path());
     let mut stale = sample_meta(ProcessState::Lost, temp.path());
@@ -325,8 +325,12 @@ fn doctor_archive_preserves_unsafe_agent_terminal_evidence() {
     );
     assert!(issue.repairable);
     let suggested_action = issue.suggested_action.as_deref().unwrap_or_default();
+    assert!(suggested_action.contains("millmux screen"));
     assert!(suggested_action.contains("ARCHIVE_STALE"));
-    assert!(suggested_action.contains("preserve pty.log and events.jsonl"));
+    assert!(suggested_action.contains("preserve pty.log"));
+    assert!(suggested_action.contains("events.jsonl"));
+    assert!(suggested_action.contains("terminal.snapshot.json"));
+    assert!(suggested_action.contains("pty.replay"));
     assert!(session_paths.pty_log.exists());
     assert!(session_paths.events_jsonl.exists());
 
@@ -357,7 +361,7 @@ fn doctor_archive_preserves_unsafe_agent_terminal_evidence() {
 }
 
 #[test]
-fn doctor_reports_attach_stream_lagged_events() {
+fn doctor_screen_guidance_reports_attach_stream_lagged_events() {
     let temp = tempfile::tempdir().unwrap();
     let paths = prepared_state(temp.path());
     let session = sample_meta(ProcessState::Exited, temp.path());
@@ -390,6 +394,11 @@ fn doctor_reports_attach_stream_lagged_events() {
     assert_eq!(issue.severity, DoctorSeverity::Warning);
     assert_eq!(issue.session_id, Some(session.id));
     assert_eq!(issue.path.as_ref(), Some(&session_paths.events_jsonl));
+    assert!(issue
+        .suggested_action
+        .as_deref()
+        .unwrap_or_default()
+        .contains("millmux screen"));
     assert!(issue
         .suggested_action
         .as_deref()

@@ -21,19 +21,21 @@ use millrace_sessions_core::{
     protocol::{
         AttachStreamFrame, ControlErrorBody, ControlErrorCode, ControlResponse, DoctorRequest,
         EventStreamFrame, HostStatusRequest, HostStatusResponse, LogLine, LogStream,
-        LogStreamFrame, SessionArtifacts, SessionAttachRequest, SessionAttachResponse,
+        LogStreamFrame, ScreenFrame, SessionArtifacts, SessionAttachRequest, SessionAttachResponse,
         SessionCapabilities, SessionDeleteRequest, SessionDeleteResponse, SessionEventsRequest,
         SessionEventsResponse, SessionInspectRequest, SessionInspectResponse, SessionKillRequest,
         SessionKillResponse, SessionListRequest, SessionListResponse, SessionLogsRequest,
-        SessionLogsResponse, SessionResizeRequest, SessionResizeResponse, SessionSendRequest,
-        SessionSendResponse, SessionStartRequest, SessionStartResponse, SessionStopRequest,
-        SessionStopResponse, SessionSummary, StreamKind, StreamSetup, UiContextCloseRequest,
+        SessionLogsResponse, SessionResizeRequest, SessionResizeResponse, SessionScreenRequest,
+        SessionScreenResponse, SessionSendRequest, SessionSendResponse, SessionStartRequest,
+        SessionStartResponse, SessionStopRequest, SessionStopResponse, SessionSummary,
+        SnapshotUnavailableReason, StreamKind, StreamSetup, UiContextCloseRequest,
         UiContextCloseResponse, UiContextGetRequest, UiContextGetResponse, UiContextListEntry,
         UiContextListRequest, UiContextListResponse, UiContextSetRequest, UiContextSetResponse,
         WorkerAckResponse, WorkerAttachRequest, WorkerAttachResponse, WorkerControlMethod,
         WorkerControlRequest, WorkerControlResponse, WorkerResizeRequest, WorkerResizeResponse,
         WorkerSendRequest, WorkerSendResponse, M1_PROTOCOL_VERSION,
     },
+    scrollback::TerminalSnapshot,
     state::{
         AttentionState, HostMeta, MonitorProfile, ProcessState, SessionLiveness, SessionMeta,
         SessionPaths, SessionRole, UiContext, UiContextPaths, UiEvent, UiEventKind, WorkerMeta,
@@ -265,6 +267,7 @@ pub fn dispatch_json_line(line: &str, paths: &StatePaths, host: &HostMeta) -> Co
         "session.start" => dispatch_session_start(id, params, paths),
         "session.list" => dispatch_session_list(id, params, paths),
         "session.inspect" => dispatch_session_inspect(id, params, paths),
+        "session.screen" => dispatch_session_screen(id, params, paths),
         "session.logs" => dispatch_session_logs(id, params, paths),
         "session.events" => dispatch_session_events(id, params, paths),
         "session.send" => dispatch_session_send(id, params, paths),
@@ -709,6 +712,24 @@ fn dispatch_session_inspect(id: String, params: Value, paths: &StatePaths) -> Co
     }
 }
 
+fn dispatch_session_screen(id: String, params: Value, paths: &StatePaths) -> ControlResponse {
+    let request = match serde_json::from_value::<SessionScreenRequest>(params) {
+        Ok(request) => request,
+        Err(error) => {
+            return error_response(
+                id,
+                ControlErrorCode::InvalidRequest,
+                format!("invalid session.screen params: {error}"),
+            )
+        }
+    };
+
+    match build_screen_response(paths, &request) {
+        Ok(result) => success_response(id, &result),
+        Err(error) => ControlResponse::failure(id, error),
+    }
+}
+
 fn dispatch_session_logs(id: String, params: Value, paths: &StatePaths) -> ControlResponse {
     let request = match serde_json::from_value::<SessionLogsRequest>(params) {
         Ok(request) => request,
@@ -969,6 +990,182 @@ fn build_events_response(
         events,
         follow: include_follow.then(|| stream_setup(StreamKind::Events, true, false)),
     })
+}
+
+fn build_screen_response(
+    paths: &StatePaths,
+    request: &SessionScreenRequest,
+) -> Result<SessionScreenResponse, ControlErrorBody> {
+    let inspected = resolve_session(paths, &request.selector)?;
+    let frame = read_session_screen_frame(&inspected, request);
+    Ok(SessionScreenResponse {
+        protocol_version: M1_PROTOCOL_VERSION,
+        session_id: inspected.session.session_id,
+        frame,
+    })
+}
+
+fn read_session_screen_frame(
+    inspected: &SessionInspectResponse,
+    request: &SessionScreenRequest,
+) -> ScreenFrame {
+    if !inspected.session.capabilities.screen || !inspected.session.spawn_mode.is_pty() {
+        return screen_unavailable(
+            SnapshotUnavailableReason::UnsupportedSpawnMode,
+            json!({
+                "session_id": inspected.session.session_id,
+                "spawn_mode": inspected.session.spawn_mode,
+                "capability": "screen",
+            }),
+        );
+    }
+
+    let snapshot_path = &inspected.paths.terminal_snapshot;
+    let snapshot_metadata = match fs::metadata(snapshot_path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return screen_unavailable(
+                SnapshotUnavailableReason::NoSnapshot,
+                json!({
+                    "snapshot_state": "missing_file",
+                    "terminal_snapshot": snapshot_path,
+                }),
+            )
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
+            return screen_unavailable(
+                SnapshotUnavailableReason::PermissionDenied,
+                json!({
+                    "snapshot_state": "permission_denied",
+                    "terminal_snapshot": snapshot_path,
+                    "error": error.to_string(),
+                }),
+            )
+        }
+        Err(error) => {
+            return screen_unavailable(
+                SnapshotUnavailableReason::InternalError,
+                json!({
+                    "snapshot_state": "metadata_error",
+                    "terminal_snapshot": snapshot_path,
+                    "error": error.to_string(),
+                }),
+            )
+        }
+    };
+
+    if snapshot_metadata.len() == 0 {
+        return screen_unavailable(
+            SnapshotUnavailableReason::NoSnapshot,
+            json!({
+                "snapshot_state": "empty_file",
+                "terminal_snapshot": snapshot_path,
+            }),
+        );
+    }
+
+    let snapshot = match read_json::<TerminalSnapshot>(snapshot_path) {
+        Ok(snapshot) => snapshot,
+        Err(error) => {
+            return screen_unavailable(
+                SnapshotUnavailableReason::InternalError,
+                json!({
+                    "snapshot_state": "invalid_json",
+                    "terminal_snapshot": snapshot_path,
+                    "error": error.to_string(),
+                }),
+            )
+        }
+    };
+
+    let Some(screen_snapshot) = snapshot.structured_screen.clone() else {
+        return screen_unavailable(
+            SnapshotUnavailableReason::TerminalModelUnavailable,
+            json!({
+                "snapshot_state": "structured_screen_missing",
+                "terminal_snapshot": snapshot_path,
+            }),
+        );
+    };
+
+    if screen_snapshot.rows == 0 || screen_snapshot.cols == 0 || screen_snapshot.cells.is_empty() {
+        return screen_unavailable(
+            SnapshotUnavailableReason::NoSnapshot,
+            json!({
+                "snapshot_state": "empty_snapshot",
+                "terminal_snapshot": snapshot_path,
+                "rows": screen_snapshot.rows,
+                "cols": screen_snapshot.cols,
+            }),
+        );
+    }
+
+    if let Some(size) = request.requested_terminal_size {
+        if screen_snapshot.rows != size.rows || screen_snapshot.cols != size.cols {
+            return screen_unavailable(
+                SnapshotUnavailableReason::SizeMismatch,
+                json!({
+                    "snapshot_state": "size_mismatch",
+                    "terminal_snapshot": snapshot_path,
+                    "requested_rows": size.rows,
+                    "requested_cols": size.cols,
+                    "snapshot_rows": screen_snapshot.rows,
+                    "snapshot_cols": screen_snapshot.cols,
+                }),
+            );
+        }
+    }
+
+    let current_pty_offset = inspected
+        .paths
+        .pty_log
+        .exists()
+        .then(|| file_len(&inspected.paths.pty_log));
+    if current_pty_offset.is_some_and(|offset| snapshot.pty_log_offset != offset) {
+        return screen_unavailable(
+            SnapshotUnavailableReason::StaleSnapshot,
+            json!({
+                "snapshot_state": "stale_pty_log_offset",
+                "terminal_snapshot": snapshot_path,
+                "pty_log": inspected.paths.pty_log,
+                "snapshot_pty_log_offset": snapshot.pty_log_offset,
+                "current_pty_log_offset": current_pty_offset,
+            }),
+        );
+    }
+
+    if inspected.paths.raw_replay_ring.exists()
+        && snapshot.raw_replay_end_offset != snapshot.pty_log_offset
+    {
+        return screen_unavailable(
+            SnapshotUnavailableReason::StaleSnapshot,
+            json!({
+                "snapshot_state": "stale_raw_replay_offset",
+                "terminal_snapshot": snapshot_path,
+                "raw_replay_ring": inspected.paths.raw_replay_ring,
+                "raw_replay_end_offset": snapshot.raw_replay_end_offset,
+                "snapshot_pty_log_offset": snapshot.pty_log_offset,
+            }),
+        );
+    }
+
+    if let Err(error) = screen_snapshot.validate_for_wire() {
+        return ScreenFrame::SnapshotUnavailable {
+            reason: error.unavailable_reason(),
+            details: error.unavailable_details(),
+        };
+    }
+
+    ScreenFrame::ScreenSnapshot {
+        snapshot: screen_snapshot,
+    }
+}
+
+fn screen_unavailable(reason: SnapshotUnavailableReason, details: Value) -> ScreenFrame {
+    ScreenFrame::SnapshotUnavailable {
+        reason,
+        details: Some(details),
+    }
 }
 
 fn ensure_capability(

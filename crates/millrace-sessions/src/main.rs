@@ -116,6 +116,15 @@ async fn run() -> Result<(), MillmuxCliError> {
                 output::render_inspect(&result)
             })?;
         }
+        CliCommand::Screen(args) => {
+            let client = ready_client().await?;
+            let result = client.screen(&args.request()?).await?;
+            write_stdout(if args.json {
+                output::render_json(&result)?
+            } else {
+                output::render_screen(&result)
+            })?;
+        }
         CliCommand::Logs(args) => {
             let client = ready_client().await?;
             let request = args.request()?;

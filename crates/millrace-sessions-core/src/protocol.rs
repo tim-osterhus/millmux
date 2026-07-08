@@ -18,6 +18,9 @@ pub const M1_PROTOCOL_VERSION: u32 = 1;
 pub const M2_ATTACH_PROTOCOL_VERSION: u32 = 2;
 pub const SESSION_CAPABILITIES_SCHEMA_VERSION: u32 = 1;
 pub const SESSION_ARTIFACTS_SCHEMA_VERSION: u32 = 1;
+pub const SCREEN_SNAPSHOT_SCHEMA_VERSION: u32 = 1;
+pub const MAX_SCREEN_SNAPSHOT_CELLS: usize = 80_000;
+pub const MAX_SCREEN_SNAPSHOT_JSON_BYTES: usize = 4 * 1024 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ControlMethod {
@@ -33,6 +36,8 @@ pub enum ControlMethod {
     SessionList,
     #[serde(rename = "session.inspect")]
     SessionInspect,
+    #[serde(rename = "session.screen")]
+    SessionScreen,
     #[serde(rename = "session.logs")]
     SessionLogs,
     #[serde(rename = "session.events")]
@@ -287,6 +292,13 @@ pub struct SessionInspectRequest {
     pub selector: SessionSelector,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionScreenRequest {
+    pub selector: SessionSelector,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub requested_terminal_size: Option<TerminalDimensions>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AttachReplayMode {
@@ -369,6 +381,7 @@ impl AttachInitialReplay {
 #[serde(rename_all = "snake_case")]
 pub enum SnapshotUnavailableReason {
     NoSnapshot,
+    StaleSnapshot,
     SizeMismatch,
     UnsupportedSpawnMode,
     PayloadTooLarge,
@@ -453,7 +466,9 @@ impl SessionAttachRequest {
                     None
                 }
                 AttachInitialReplay::ScreenSnapshot
-                    if !self.client_accepts_frame_type(AttachFrameType::SnapshotUnavailable) =>
+                    if !self.client_accepts_frame_type(AttachFrameType::ScreenSnapshot)
+                        || !self
+                            .client_accepts_frame_type(AttachFrameType::SnapshotUnavailable) =>
                 {
                     None
                 }
@@ -493,8 +508,10 @@ impl SessionAttachRequest {
                 frame_types.push(AttachFrameType::RawOutput);
             }
             Some(AttachInitialReplay::ScreenSnapshot)
-                if self.client_accepts_frame_type(AttachFrameType::SnapshotUnavailable) =>
+                if self.client_accepts_frame_type(AttachFrameType::ScreenSnapshot)
+                    && self.client_accepts_frame_type(AttachFrameType::SnapshotUnavailable) =>
             {
+                frame_types.push(AttachFrameType::ScreenSnapshot);
                 frame_types.push(AttachFrameType::SnapshotUnavailable);
             }
             _ => {}
@@ -647,6 +664,260 @@ pub struct DoctorResponse {
     pub repairs: Vec<DoctorRepair>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionScreenResponse {
+    pub protocol_version: u32,
+    pub session_id: SessionId,
+    #[serde(flatten)]
+    pub frame: ScreenFrame,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ScreenFrame {
+    ScreenSnapshot {
+        #[serde(flatten)]
+        snapshot: ScreenSnapshot,
+    },
+    SnapshotUnavailable {
+        reason: SnapshotUnavailableReason,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        details: Option<Value>,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ScreenSnapshot {
+    pub schema_version: u32,
+    pub rows: u16,
+    pub cols: u16,
+    pub cursor: ScreenCursor,
+    pub alternate_screen: bool,
+    pub cells: Vec<Vec<ScreenCell>>,
+    pub source: ScreenSnapshotSource,
+    pub captured_at: String,
+}
+
+impl ScreenSnapshot {
+    pub fn validate_for_wire(&self) -> Result<(), ScreenSnapshotValidationError> {
+        let cell_count = usize::from(self.rows).saturating_mul(usize::from(self.cols));
+        if cell_count > MAX_SCREEN_SNAPSHOT_CELLS {
+            return Err(ScreenSnapshotValidationError::TooManyCells {
+                rows: self.rows,
+                cols: self.cols,
+                cell_count,
+                max_cells: MAX_SCREEN_SNAPSHOT_CELLS,
+            });
+        }
+
+        if self.cells.len() != usize::from(self.rows) {
+            return Err(ScreenSnapshotValidationError::InvalidShape(format!(
+                "screen_snapshot rows={} but cells has {} rows",
+                self.rows,
+                self.cells.len()
+            )));
+        }
+
+        for (row_index, row) in self.cells.iter().enumerate() {
+            if row.len() != usize::from(self.cols) {
+                return Err(ScreenSnapshotValidationError::InvalidShape(format!(
+                    "screen_snapshot row {row_index} has {} cells; expected {}",
+                    row.len(),
+                    self.cols
+                )));
+            }
+        }
+
+        let serialized_bytes = serde_json::to_vec(self)
+            .map_err(ScreenSnapshotValidationError::Serialize)?
+            .len();
+        if serialized_bytes > MAX_SCREEN_SNAPSHOT_JSON_BYTES {
+            return Err(ScreenSnapshotValidationError::PayloadTooLarge {
+                rows: self.rows,
+                cols: self.cols,
+                cell_count,
+                serialized_bytes,
+                max_serialized_bytes: MAX_SCREEN_SNAPSHOT_JSON_BYTES,
+            });
+        }
+
+        Ok(())
+    }
+
+    pub fn plain_lines(&self) -> Vec<String> {
+        self.cells
+            .iter()
+            .map(|row| {
+                row.iter()
+                    .filter(|cell| !cell.continuation)
+                    .map(|cell| cell.symbol.as_str())
+                    .collect::<String>()
+                    .trim_end()
+                    .to_string()
+            })
+            .collect()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ScreenCursor {
+    pub row: u16,
+    pub col: u16,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub visible: Option<bool>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ScreenSnapshotSource {
+    pub pty_log_offset: u64,
+    pub raw_replay_start_offset: u64,
+    pub raw_replay_end_offset: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ScreenCell {
+    pub symbol: String,
+    #[serde(default = "default_screen_cell_width", skip_serializing_if = "is_one")]
+    pub width: u8,
+    #[serde(default, skip_serializing_if = "ScreenColor::is_default")]
+    pub fg: ScreenColor,
+    #[serde(default, skip_serializing_if = "ScreenColor::is_default")]
+    pub bg: ScreenColor,
+    #[serde(default, skip_serializing_if = "ScreenStyle::is_default")]
+    pub style: ScreenStyle,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub continuation: bool,
+}
+
+impl ScreenCell {
+    pub fn blank() -> Self {
+        Self {
+            symbol: " ".to_string(),
+            width: 1,
+            fg: ScreenColor::Default,
+            bg: ScreenColor::Default,
+            style: ScreenStyle::default(),
+            continuation: false,
+        }
+    }
+
+    pub fn default_symbol(symbol: impl Into<String>) -> Self {
+        Self {
+            symbol: symbol.into(),
+            ..Self::blank()
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ScreenColor {
+    Default,
+    Indexed { index: u8 },
+    Rgb { r: u8, g: u8, b: u8 },
+}
+
+impl Default for ScreenColor {
+    fn default() -> Self {
+        Self::Default
+    }
+}
+
+impl ScreenColor {
+    fn is_default(&self) -> bool {
+        matches!(self, Self::Default)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct ScreenStyle {
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub bold: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub dim: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub italic: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub underline: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub inverse: bool,
+}
+
+impl ScreenStyle {
+    fn is_default(&self) -> bool {
+        self == &Self::default()
+    }
+}
+
+fn default_screen_cell_width() -> u8 {
+    1
+}
+
+fn is_one(value: &u8) -> bool {
+    *value == 1
+}
+
+#[derive(Debug)]
+pub enum ScreenSnapshotValidationError {
+    InvalidShape(String),
+    TooManyCells {
+        rows: u16,
+        cols: u16,
+        cell_count: usize,
+        max_cells: usize,
+    },
+    PayloadTooLarge {
+        rows: u16,
+        cols: u16,
+        cell_count: usize,
+        serialized_bytes: usize,
+        max_serialized_bytes: usize,
+    },
+    Serialize(serde_json::Error),
+}
+
+impl ScreenSnapshotValidationError {
+    pub fn unavailable_reason(&self) -> SnapshotUnavailableReason {
+        match self {
+            Self::TooManyCells { .. } | Self::PayloadTooLarge { .. } => {
+                SnapshotUnavailableReason::PayloadTooLarge
+            }
+            Self::InvalidShape(_) | Self::Serialize(_) => SnapshotUnavailableReason::InternalError,
+        }
+    }
+
+    pub fn unavailable_details(&self) -> Option<Value> {
+        match self {
+            Self::InvalidShape(message) => Some(serde_json::json!({ "message": message })),
+            Self::TooManyCells {
+                rows,
+                cols,
+                cell_count,
+                max_cells,
+            } => Some(serde_json::json!({
+                "rows": rows,
+                "cols": cols,
+                "cell_count": cell_count,
+                "max_cells": max_cells
+            })),
+            Self::PayloadTooLarge {
+                rows,
+                cols,
+                cell_count,
+                serialized_bytes,
+                max_serialized_bytes,
+            } => Some(serde_json::json!({
+                "rows": rows,
+                "cols": cols,
+                "cell_count": cell_count,
+                "serialized_bytes": serialized_bytes,
+                "max_serialized_bytes": max_serialized_bytes
+            })),
+            Self::Serialize(error) => Some(serde_json::json!({ "message": error.to_string() })),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DoctorStatus {
@@ -763,7 +1034,7 @@ impl SessionCapabilities {
                 raw_attach: true,
                 send: true,
                 resize: true,
-                screen: false,
+                screen: true,
             },
             SpawnMode::Pipe => Self {
                 schema_version: SESSION_CAPABILITIES_SCHEMA_VERSION,
@@ -1101,6 +1372,10 @@ pub enum AttachStreamFrame {
     RawInput {
         data: AttachRawBytes,
     },
+    ScreenSnapshot {
+        #[serde(flatten)]
+        snapshot: ScreenSnapshot,
+    },
     SnapshotUnavailable {
         reason: SnapshotUnavailableReason,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1139,6 +1414,29 @@ impl AttachStreamFrame {
         Self::RawInput {
             data: AttachRawBytes::new(bytes),
         }
+    }
+
+    pub fn screen_snapshot(
+        snapshot: ScreenSnapshot,
+    ) -> Result<Self, ScreenSnapshotValidationError> {
+        snapshot.validate_for_wire()?;
+        let frame = Self::ScreenSnapshot { snapshot };
+        let serialized_bytes = serde_json::to_vec(&frame)
+            .map_err(ScreenSnapshotValidationError::Serialize)?
+            .len();
+        if serialized_bytes > MAX_SCREEN_SNAPSHOT_JSON_BYTES {
+            let Self::ScreenSnapshot { snapshot } = &frame else {
+                unreachable!("frame was just constructed as screen_snapshot");
+            };
+            return Err(ScreenSnapshotValidationError::PayloadTooLarge {
+                rows: snapshot.rows,
+                cols: snapshot.cols,
+                cell_count: usize::from(snapshot.rows).saturating_mul(usize::from(snapshot.cols)),
+                serialized_bytes,
+                max_serialized_bytes: MAX_SCREEN_SNAPSHOT_JSON_BYTES,
+            });
+        }
+        Ok(frame)
     }
 
     pub fn to_json_line(&self) -> serde_json::Result<String> {
@@ -1360,7 +1658,9 @@ impl WorkerAttachRequest {
                     None
                 }
                 AttachInitialReplay::ScreenSnapshot
-                    if !self.client_accepts_frame_type(AttachFrameType::SnapshotUnavailable) =>
+                    if !self.client_accepts_frame_type(AttachFrameType::ScreenSnapshot)
+                        || !self
+                            .client_accepts_frame_type(AttachFrameType::SnapshotUnavailable) =>
                 {
                     None
                 }
@@ -1400,8 +1700,10 @@ impl WorkerAttachRequest {
                 frame_types.push(AttachFrameType::RawOutput);
             }
             Some(AttachInitialReplay::ScreenSnapshot)
-                if self.client_accepts_frame_type(AttachFrameType::SnapshotUnavailable) =>
+                if self.client_accepts_frame_type(AttachFrameType::ScreenSnapshot)
+                    && self.client_accepts_frame_type(AttachFrameType::SnapshotUnavailable) =>
             {
+                frame_types.push(AttachFrameType::ScreenSnapshot);
                 frame_types.push(AttachFrameType::SnapshotUnavailable);
             }
             _ => {}
@@ -1533,6 +1835,7 @@ mod tests {
             (ControlMethod::SessionAttach, "session.attach"),
             (ControlMethod::SessionList, "session.list"),
             (ControlMethod::SessionInspect, "session.inspect"),
+            (ControlMethod::SessionScreen, "session.screen"),
             (ControlMethod::SessionLogs, "session.logs"),
             (ControlMethod::SessionEvents, "session.events"),
             (ControlMethod::SessionSend, "session.send"),

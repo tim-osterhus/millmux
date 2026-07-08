@@ -175,6 +175,8 @@ do not keep stale owner values.
 | `millmux attach <session> --raw` | Negotiate v2 raw-byte output for byte-exact shell/TUI fidelity. |
 | `millmux send <session> --text ...` | Send input to the PTY. |
 | `millmux resize <session> --rows N --cols N` | Resize the hosted PTY. |
+| `millmux screen <session> --json` | Read structured screen state or structured unavailable metadata. |
+| `millmux screen <session> --text` | Render a plain text view from structured screen state. |
 | `millmux logs <session>` | Read or follow PTY output or stream-tagged pipe output. |
 | `millmux events <session>` | Read or follow structured session events. |
 | `millmux inspect <session> --json` | Inspect metadata, paths, argv, workspace binding, and worker state. |
@@ -426,9 +428,10 @@ session logs.
 
 Doctor also reports `unsafe_legacy_line_scrollback` when agent-like sessions
 still have legacy `scrollback.snapshot` lines containing likely full-screen TUI
-control sequences. The guidance is to ignore that line scrollback for agent TUI
-replay, or archive the session only when it is stale or no longer needed, while
-preserving `pty.log`, `events.jsonl`, and other raw evidence.
+control sequences. The guidance is to use `millmux screen` for structured
+screen state, ignore that line scrollback for agent TUI replay, or archive the
+session only when it is stale or no longer needed, while preserving `pty.log`,
+`events.jsonl`, `terminal.snapshot.json`, `pty.replay`, and other raw evidence.
 
 Doctor validates artifact shape by spawn mode: PTY sessions should have PTY
 artifacts, pipe sessions should have `stdout.log` and `stderr.log`, and
@@ -452,10 +455,15 @@ and a small control protocol that agents can poll.
 tmux may become an optional compatibility adapter or behavior oracle later. It
 is not the default substrate and does not own canonical Millmux session truth.
 
-`terminal.snapshot.json`, bounded raw replay, and future structured
-`screen_snapshot` responses are separate surfaces. The current
+`terminal.snapshot.json`, bounded raw replay, and structured `screen_snapshot`
+responses are separate surfaces. The current
 `AttachReplayMode::TerminalSnapshot` wire name is legacy terminology for a
 size-gated raw replay checkpoint, not a structured screen snapshot.
+The one-shot `session.screen` / `millmux screen` surface returns a
+`screen_snapshot` frame when structured state is available or
+`snapshot_unavailable` metadata for unsupported pipe sessions and missing,
+stale, size-mismatched, or otherwise unusable snapshots. Text output is derived
+from that structured response, not from legacy line scrollback.
 
 ## Protocol Compatibility
 

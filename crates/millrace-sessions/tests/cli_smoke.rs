@@ -8,7 +8,11 @@ use millrace_sessions_core::{
     events::{append_event, SessionEvent, SessionEventKind},
     ids::{SessionId, UiId},
     paths::StatePaths,
-    scrollback::ScrollbackBuffer,
+    protocol::{
+        ScreenCell, ScreenCursor, ScreenSnapshot, ScreenSnapshotSource,
+        SCREEN_SNAPSHOT_SCHEMA_VERSION,
+    },
+    scrollback::{ScrollbackBuffer, TerminalSnapshot},
     state::{AttentionState, MonitorProfile, ProcessState, SessionMeta, SessionRole, SpawnMode},
     storage::{append_raw_pty_log, write_json_atomic},
 };
@@ -163,6 +167,94 @@ fn seed_large_output_session(host: &TempHost) -> String {
     session_id.to_string()
 }
 
+fn seed_screen_session(host: &TempHost) -> String {
+    let paths = StatePaths::new(host.state_dir().to_path_buf());
+    let session_id = SessionId::new();
+    let session_paths = paths.session_paths(session_id);
+    let meta = SessionMeta {
+        id: session_id,
+        name: Some("screen-cli".to_string()),
+        role: SessionRole::Agent,
+        process_state: ProcessState::Running,
+        attention_state: AttentionState::Active,
+        workspace: None,
+        cwd: host.state_dir().to_path_buf(),
+        argv: vec!["fixture-agent".to_string()],
+        spawn_mode: SpawnMode::Pty,
+        monitor_profile: MonitorProfile::Auto,
+        env: BTreeMap::new(),
+        worker_pid: None,
+        child_pid: None,
+        child_pgid: None,
+        started_at: Some("2026-07-08T00:00:00Z".to_string()),
+        ended_at: None,
+        stop_requested_at: None,
+        stop_reason: None,
+        exit_code: None,
+        exit_signal: None,
+        failure_message: None,
+        created_at: "2026-07-08T00:00:00Z".to_string(),
+        updated_at: "2026-07-08T00:00:01Z".to_string(),
+    };
+    write_json_atomic(&session_paths.meta_json, &meta).expect("seed screen session meta");
+    append_raw_pty_log(&session_paths.pty_log, b"agent ready").expect("seed screen pty log");
+    let screen = vec!["agent ready".to_string(), "next".to_string()];
+    let snapshot = TerminalSnapshot {
+        schema_version: 1,
+        rows: 2,
+        cols: 16,
+        cursor_row: 0,
+        cursor_col: 11,
+        alternate_screen: false,
+        pty_log_offset: 11,
+        raw_replay_start_offset: 0,
+        raw_replay_end_offset: 11,
+        captured_at: "2026-07-08T00:00:01Z".to_string(),
+        structured_screen: Some(structured_screen_fixture(2, 16, 11, &screen)),
+        screen,
+    };
+    write_json_atomic(&session_paths.terminal_snapshot, &snapshot).expect("seed terminal snapshot");
+    fs::write(&session_paths.raw_replay_ring, b"agent ready").expect("seed raw replay");
+    session_id.to_string()
+}
+
+fn structured_screen_fixture(
+    rows: u16,
+    cols: u16,
+    offset: u64,
+    lines: &[String],
+) -> ScreenSnapshot {
+    let mut cells = Vec::with_capacity(usize::from(rows));
+    for row_index in 0..usize::from(rows) {
+        let line = lines.get(row_index).map(String::as_str).unwrap_or("");
+        let mut row = line
+            .chars()
+            .take(usize::from(cols))
+            .map(|ch| ScreenCell::default_symbol(ch.to_string()))
+            .collect::<Vec<_>>();
+        row.resize_with(usize::from(cols), ScreenCell::blank);
+        cells.push(row);
+    }
+    ScreenSnapshot {
+        schema_version: SCREEN_SNAPSHOT_SCHEMA_VERSION,
+        rows,
+        cols,
+        cursor: ScreenCursor {
+            row: 0,
+            col: 11,
+            visible: Some(true),
+        },
+        alternate_screen: false,
+        cells,
+        source: ScreenSnapshotSource {
+            pty_log_offset: offset,
+            raw_replay_start_offset: 0,
+            raw_replay_end_offset: offset,
+        },
+        captured_at: "2026-07-08T00:00:01Z".to_string(),
+    }
+}
+
 #[test]
 fn cli_smoke_list_json_autostarts_host_and_prints_raw_result() {
     let host = TempHost::new();
@@ -247,6 +339,39 @@ fn cli_smoke_short_reader_pipelines_exit_cleanly_for_json_and_line_outputs() {
     assert_short_reader_pipeline(&host, &["inspect", &session_id]);
     assert_short_reader_pipeline(&host, &["logs", &session_id]);
     assert_short_reader_pipeline(&host, &["events", "--json", &session_id]);
+}
+
+#[test]
+fn cli_smoke_screen_json_and_text_use_structured_snapshot() {
+    let host = TempHost::new();
+    millmux_command(&host)
+        .args(["list", "--json"])
+        .assert()
+        .success();
+    let session_id = seed_screen_session(&host);
+
+    let output = millmux_command(&host)
+        .args(["screen", "--json", &session_id])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let value: Value = serde_json::from_slice(&output).expect("screen json");
+    assert_eq!(value["type"], "screen_snapshot");
+    assert_eq!(value["cells"][0][0]["symbol"], "a");
+    assert!(value.get("id").is_none());
+    assert!(value.get("ok").is_none());
+
+    let text_output = millmux_command(&host)
+        .args(["screen", "--text", &session_id])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let text = String::from_utf8(text_output).expect("screen text output");
+    assert!(text.contains("agent ready"), "{text}");
 }
 
 #[test]

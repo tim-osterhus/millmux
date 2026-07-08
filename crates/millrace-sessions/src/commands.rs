@@ -8,9 +8,9 @@ use millrace_sessions_core::{
         AttachFrameType, AttachInitialReplay, AttachReplayMode, AttachStreamEncoding,
         DoctorRepairMode, DoctorRequest, SessionAttachRequest, SessionDeleteRequest,
         SessionEventsRequest, SessionInspectRequest, SessionKillRequest, SessionListRequest,
-        SessionLogsRequest, SessionResizeRequest, SessionSelector, SessionSendRequest,
-        SessionStartRequest, SessionStopRequest, UiContextGetRequest, UiContextListRequest,
-        M2_ATTACH_PROTOCOL_VERSION,
+        SessionLogsRequest, SessionResizeRequest, SessionScreenRequest, SessionSelector,
+        SessionSendRequest, SessionStartRequest, SessionStopRequest, UiContextGetRequest,
+        UiContextListRequest, M2_ATTACH_PROTOCOL_VERSION,
     },
     state::{MonitorProfile, SessionRole, SpawnMode},
 };
@@ -33,6 +33,7 @@ pub enum CliCommand {
     List(ListArgs),
     Status(StatusArgs),
     Inspect(InspectArgs),
+    Screen(ScreenArgs),
     Logs(LogsArgs),
     Events(EventsArgs),
     Send(SendArgs),
@@ -53,6 +54,7 @@ impl CliCommand {
             | Self::List(_)
             | Self::Status(_)
             | Self::Inspect(_)
+            | Self::Screen(_)
             | Self::Attach(_)
             | Self::Logs(_)
             | Self::Events(_)
@@ -260,6 +262,25 @@ impl InspectArgs {
     pub fn request(&self) -> Result<SessionInspectRequest, CommandError> {
         Ok(SessionInspectRequest {
             selector: self.selector.required()?,
+        })
+    }
+}
+
+#[derive(Debug, Args)]
+pub struct ScreenArgs {
+    #[command(flatten)]
+    pub selector: SelectorArgs,
+    #[arg(long, conflicts_with = "text")]
+    pub json: bool,
+    #[arg(long)]
+    pub text: bool,
+}
+
+impl ScreenArgs {
+    pub fn request(&self) -> Result<SessionScreenRequest, CommandError> {
+        Ok(SessionScreenRequest {
+            selector: self.selector.required()?,
+            requested_terminal_size: None,
         })
     }
 }

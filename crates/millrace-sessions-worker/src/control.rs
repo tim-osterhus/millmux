@@ -19,12 +19,12 @@ use millrace_sessions_core::{
     protocol::{
         AttachFrameType, AttachInitialReplay, AttachReplayMode, AttachStreamEncoding,
         AttachStreamFrame, AttachStreamLagReason, ControlErrorBody, ControlErrorCode,
-        SnapshotUnavailableReason, TerminalDimensions, WorkerAckResponse, WorkerAttachRequest,
-        WorkerAttachResponse, WorkerAttachStateResponse, WorkerControlMethod, WorkerControlRequest,
-        WorkerControlResponse, WorkerReleaseAttachRequest, WorkerResizeRequest,
-        WorkerResizeResponse, WorkerSendRequest, WorkerSendResponse,
+        ScreenSnapshot, SnapshotUnavailableReason, TerminalDimensions, WorkerAckResponse,
+        WorkerAttachRequest, WorkerAttachResponse, WorkerAttachStateResponse, WorkerControlMethod,
+        WorkerControlRequest, WorkerControlResponse, WorkerReleaseAttachRequest,
+        WorkerResizeRequest, WorkerResizeResponse, WorkerSendRequest, WorkerSendResponse,
     },
-    scrollback::{restore_terminal_replay, ScrollbackBuffer, TerminalStateBuffer},
+    scrollback::{restore_terminal_replay_bytes, ScrollbackBuffer, TerminalStateBuffer},
     state::{SessionPaths, WorkerMeta},
     storage::{read_json, write_json_atomic},
 };
@@ -35,7 +35,7 @@ use nix::{
 };
 use portable_pty::{MasterPty, PtySize};
 
-const ATTACH_OBSERVER_QUEUE_CAPACITY: usize = 64;
+const ATTACH_OBSERVER_QUEUE_CAPACITY: usize = 8;
 const ATTACH_INPUT_QUEUE_CAPACITY: usize = 8;
 const ATTACH_INPUT_MAX_BYTES: usize = 512;
 const ATTACH_INPUT_MAX_TOTAL_BYTES: usize = 1024;
@@ -43,7 +43,7 @@ const ATTACH_INPUT_WRITE_CHUNK: usize = 128;
 const ATTACH_INPUT_DRAIN_TIMEOUT: Duration = Duration::from_secs(1);
 const ATTACH_OBSERVER_CLOSE_AFTER_DROPPED_BYTES: u64 = 16 * 1024 * 1024;
 const ATTACH_STREAM_POLL: Duration = Duration::from_millis(25);
-const ATTACH_STREAM_WRITE_TIMEOUT: Duration = Duration::from_secs(1);
+const ATTACH_STREAM_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Clone)]
 pub struct WorkerControlHandle {
@@ -194,6 +194,7 @@ struct AttachObserver {
     stream_id: String,
     sender: SyncSender<AttachObserverMessage>,
     shutdown: UnixStream,
+    pending_lag_notice: Arc<Mutex<Option<AttachLagNotice>>>,
     accepted_frame_types: Vec<AttachFrameType>,
     dropped_bytes: u64,
     dropped_from_offset: Option<u64>,
@@ -218,7 +219,18 @@ impl AttachObserver {
             .dropped_bytes
             .saturating_add(output.end_offset.saturating_sub(output.start_offset));
         self.lag_pending = self.accepts_frame_type(AttachFrameType::StreamLagged);
-        self.lag_notice()
+        let notice = self.lag_notice();
+        self.store_pending_lag_notice(&notice);
+        notice
+    }
+
+    fn store_pending_lag_notice(&self, notice: &AttachLagNotice) {
+        if !self.accepts_frame_type(AttachFrameType::StreamLagged) {
+            return;
+        }
+        if let Ok(mut pending) = self.pending_lag_notice.lock() {
+            *pending = Some(notice.clone());
+        }
     }
 
     fn trim_output(&self, output: &AttachOutput) -> Option<AttachOutput> {
@@ -696,7 +708,7 @@ fn handle_observe_attach(
     };
     if let Some(size) = params
         .requested_terminal_size
-        .filter(|size| attach_resize_required(&runtime.paths, *size))
+        .filter(|size| attach_resize_required(&runtime, *size))
     {
         if let Err(error) = resize_pty(
             &runtime,
@@ -718,6 +730,7 @@ fn handle_observe_attach(
     writer_stream.set_write_timeout(Some(ATTACH_STREAM_WRITE_TIMEOUT))?;
     let writer = Arc::new(Mutex::new(writer_stream));
     let (sender, receiver) = mpsc::sync_channel(ATTACH_OBSERVER_QUEUE_CAPACITY);
+    let pending_lag_notice = Arc::new(Mutex::new(None));
     let replay_cutoff = {
         let mut state = runtime.state.lock().expect("control state poisoned");
         let live_start_offset = file_len(&runtime.paths.pty_log);
@@ -725,6 +738,7 @@ fn handle_observe_attach(
             stream_id: params.stream_id.clone(),
             sender,
             shutdown: stream.try_clone()?,
+            pending_lag_notice: Arc::clone(&pending_lag_notice),
             accepted_frame_types: params.negotiated_frame_types(),
             dropped_bytes: 0,
             dropped_from_offset: None,
@@ -736,10 +750,9 @@ fn handle_observe_attach(
         live_start_offset
     };
 
-    write_worker_response_locked(
-        &writer,
-        WorkerControlResponse::success(request.id, &attach).map_err(MillmuxError::Json)?,
-    )?;
+    let response =
+        WorkerControlResponse::success(request.id, &attach).map_err(MillmuxError::Json)?;
+    write_worker_response_locked(&writer, response)?;
 
     let closed = Arc::new(AtomicBool::new(false));
     let (input_sender, input_receiver) = mpsc::sync_channel(ATTACH_INPUT_QUEUE_CAPACITY);
@@ -773,9 +786,12 @@ fn handle_observe_attach(
         let _ = done_sender.send(());
     });
 
-    write_initial_replay(&writer, &runtime.paths, &params, replay_cutoff, &closed)?;
+    write_initial_replay(&writer, &runtime, &params, replay_cutoff, &closed)?;
 
     loop {
+        if write_pending_lag_notice(&writer, &params, &pending_lag_notice).is_err() {
+            break;
+        }
         if done_receiver.try_recv().is_ok() {
             match input_drained_receiver.recv_timeout(ATTACH_INPUT_DRAIN_TIMEOUT) {
                 Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => {}
@@ -830,6 +846,35 @@ fn handle_observe_attach(
     Ok(())
 }
 
+fn write_pending_lag_notice(
+    writer: &Arc<Mutex<UnixStream>>,
+    params: &WorkerAttachRequest,
+    pending_lag_notice: &Arc<Mutex<Option<AttachLagNotice>>>,
+) -> MillmuxResult<()> {
+    if !params
+        .negotiated_frame_types()
+        .contains(&AttachFrameType::StreamLagged)
+    {
+        return Ok(());
+    }
+    let notice = pending_lag_notice
+        .lock()
+        .ok()
+        .and_then(|mut pending| pending.take());
+    let Some(notice) = notice else {
+        return Ok(());
+    };
+    let frame = AttachStreamFrame::StreamLagged {
+        dropped_bytes: notice.dropped_bytes,
+        dropped_from_offset: notice.dropped_from_offset,
+        dropped_to_offset: notice.dropped_to_offset,
+        current_pty_log_offset: notice.current_pty_log_offset,
+        reason: AttachStreamLagReason::ObserverBackpressure,
+        recover: "request_screen_or_reattach_raw_replay".to_string(),
+    };
+    write_attach_frame_locked(writer, &frame)
+}
+
 struct InputReleaseGuard {
     runtime: Arc<ControlRuntime>,
     stream_id: Option<String>,
@@ -871,7 +916,7 @@ fn scrollback_frames(paths: &SessionPaths) -> Vec<AttachStreamFrame> {
 
 fn write_initial_replay(
     writer: &Arc<Mutex<UnixStream>>,
-    paths: &SessionPaths,
+    runtime: &ControlRuntime,
     params: &WorkerAttachRequest,
     replay_cutoff: u64,
     closed: &AtomicBool,
@@ -880,11 +925,11 @@ fn write_initial_replay(
         return Ok(());
     }
     if params.negotiated_attach_protocol_version().is_some() {
-        return write_negotiated_initial_replay(writer, paths, params, replay_cutoff, closed);
+        return write_negotiated_initial_replay(writer, runtime, params, replay_cutoff, closed);
     }
     write_legacy_initial_replay(
         writer,
-        paths,
+        &runtime.paths,
         params.replay,
         params.requested_terminal_size,
         replay_cutoff,
@@ -894,17 +939,19 @@ fn write_initial_replay(
 
 fn write_negotiated_initial_replay(
     writer: &Arc<Mutex<UnixStream>>,
-    paths: &SessionPaths,
+    runtime: &ControlRuntime,
     params: &WorkerAttachRequest,
     replay_cutoff: u64,
     closed: &AtomicBool,
 ) -> MillmuxResult<()> {
     match params.negotiated_initial_replay() {
         None | Some(AttachInitialReplay::None) => Ok(()),
-        Some(AttachInitialReplay::LineScrollback) => write_line_scrollback(writer, paths, closed),
+        Some(AttachInitialReplay::LineScrollback) => {
+            write_line_scrollback(writer, &runtime.paths, closed)
+        }
         Some(AttachInitialReplay::RawReplay) => write_raw_initial_replay(
             writer,
-            paths,
+            &runtime.paths,
             AttachReplayMode::RawReplay,
             params.requested_terminal_size,
             replay_cutoff,
@@ -914,18 +961,56 @@ fn write_negotiated_initial_replay(
             if closed.load(Ordering::SeqCst) {
                 return Ok(());
             }
-            if params
-                .negotiated_frame_types()
-                .contains(&AttachFrameType::SnapshotUnavailable)
-            {
-                let frame = AttachStreamFrame::SnapshotUnavailable {
-                    reason: SnapshotUnavailableReason::TerminalModelUnavailable,
-                    details: None,
-                };
-                write_attach_frame_locked(writer, &frame)?;
-            }
+            let frame =
+                screen_snapshot_initial_replay_frame(runtime, params.requested_terminal_size);
+            write_attach_frame_locked(writer, &frame)?;
             Ok(())
         }
+    }
+}
+
+fn screen_snapshot_initial_replay_frame(
+    runtime: &ControlRuntime,
+    requested_terminal_size: Option<TerminalDimensions>,
+) -> AttachStreamFrame {
+    let snapshot = match runtime.terminal_state.lock() {
+        Ok(terminal_state) => terminal_state.screen_snapshot(),
+        Err(_) => {
+            return AttachStreamFrame::SnapshotUnavailable {
+                reason: SnapshotUnavailableReason::InternalError,
+                details: Some(serde_json::json!({
+                    "message": "terminal state lock poisoned"
+                })),
+            };
+        }
+    };
+    screen_snapshot_frame(snapshot, requested_terminal_size)
+}
+
+fn screen_snapshot_frame(
+    snapshot: ScreenSnapshot,
+    requested_terminal_size: Option<TerminalDimensions>,
+) -> AttachStreamFrame {
+    if let Some(size) = requested_terminal_size {
+        if snapshot.rows != size.rows || snapshot.cols != size.cols {
+            return AttachStreamFrame::SnapshotUnavailable {
+                reason: SnapshotUnavailableReason::SizeMismatch,
+                details: Some(serde_json::json!({
+                    "requested_rows": size.rows,
+                    "requested_cols": size.cols,
+                    "snapshot_rows": snapshot.rows,
+                    "snapshot_cols": snapshot.cols
+                })),
+            };
+        }
+    }
+
+    match AttachStreamFrame::screen_snapshot(snapshot) {
+        Ok(frame) => frame,
+        Err(error) => AttachStreamFrame::SnapshotUnavailable {
+            reason: error.unavailable_reason(),
+            details: error.unavailable_details(),
+        },
     }
 }
 
@@ -981,15 +1066,19 @@ fn write_raw_initial_replay(
     if closed.load(Ordering::SeqCst) {
         return Ok(());
     }
-    if let Some(restored) = restore_terminal_replay(
+    if let Some(restored) = restore_terminal_replay_bytes(
         &paths.terminal_snapshot,
         &paths.raw_replay_ring,
         replay_cutoff,
     )
     .unwrap_or(None)
     {
-        if !replay_matches_requested_size(replay, requested_terminal_size, &restored.snapshot)
-            || restored.bytes.is_empty()
+        if !replay_matches_requested_size(
+            replay,
+            requested_terminal_size,
+            restored.metadata.rows,
+            restored.metadata.cols,
+        ) || restored.bytes.is_empty()
         {
             return Ok(());
         }
@@ -1005,28 +1094,25 @@ fn write_raw_initial_replay(
 fn replay_matches_requested_size(
     replay: AttachReplayMode,
     requested_terminal_size: Option<TerminalDimensions>,
-    snapshot: &millrace_sessions_core::scrollback::TerminalSnapshot,
+    rows: u16,
+    cols: u16,
 ) -> bool {
     match (replay, requested_terminal_size) {
         (AttachReplayMode::RawReplay, None) => true,
         (AttachReplayMode::RawReplay | AttachReplayMode::TerminalSnapshot, Some(size)) => {
-            snapshot.same_size(size.rows, size.cols)
+            rows == size.rows && cols == size.cols
         }
         (AttachReplayMode::TerminalSnapshot, None) => false,
         _ => true,
     }
 }
 
-fn attach_resize_required(paths: &SessionPaths, size: TerminalDimensions) -> bool {
-    let current_offset = file_len(&paths.pty_log);
-    match restore_terminal_replay(
-        &paths.terminal_snapshot,
-        &paths.raw_replay_ring,
-        current_offset,
-    ) {
-        Ok(Some(replay)) => !replay.snapshot.same_size(size.rows, size.cols),
-        _ => true,
-    }
+fn attach_resize_required(runtime: &ControlRuntime, size: TerminalDimensions) -> bool {
+    runtime
+        .terminal_state
+        .lock()
+        .map(|terminal_state| !terminal_state.same_size(size.rows, size.cols))
+        .unwrap_or(true)
 }
 
 fn file_len(path: &Path) -> u64 {
@@ -1366,13 +1452,16 @@ fn core_error(error: MillmuxError) -> ControlErrorBody {
 
 #[cfg(test)]
 mod tests {
+    use std::io::{BufRead, BufReader};
+
     use millrace_sessions_core::{
         ids::SessionId,
         paths::StatePaths,
-        scrollback::{TerminalSnapshot, TerminalStateBuffer},
-        state::{ProcessState, SpawnMode},
+        scrollback::TerminalStateBuffer,
+        state::{ProcessState, SpawnMode, WorkerMeta},
         storage::append_raw_pty_log,
     };
+    use portable_pty::{native_pty_system, PtySize};
 
     use super::*;
 
@@ -1441,6 +1530,7 @@ mod tests {
             stream_id: "quiet".to_string(),
             sender,
             shutdown,
+            pending_lag_notice: Arc::new(Mutex::new(None)),
             accepted_frame_types: Vec::new(),
             dropped_bytes: 0,
             dropped_from_offset: None,
@@ -1513,6 +1603,7 @@ mod tests {
             stream_id: "stream-slow".to_string(),
             sender,
             shutdown,
+            pending_lag_notice: Arc::new(Mutex::new(None)),
             accepted_frame_types: vec![AttachFrameType::StreamLagged],
             dropped_bytes: 0,
             dropped_from_offset: None,
@@ -1553,24 +1644,11 @@ mod tests {
 
     #[test]
     fn worker_terminal_snapshot_replay_requires_requested_matching_size() {
-        let snapshot = TerminalSnapshot {
-            schema_version: 1,
-            rows: 24,
-            cols: 80,
-            cursor_row: 0,
-            cursor_col: 0,
-            alternate_screen: true,
-            pty_log_offset: 10,
-            raw_replay_start_offset: 0,
-            raw_replay_end_offset: 10,
-            captured_at: "2026-05-26T00:00:00Z".to_string(),
-            screen: vec!["ready".to_string()],
-        };
-
         assert!(replay_matches_requested_size(
             AttachReplayMode::TerminalSnapshot,
             Some(TerminalDimensions { rows: 24, cols: 80 }),
-            &snapshot
+            24,
+            80
         ));
         assert!(!replay_matches_requested_size(
             AttachReplayMode::TerminalSnapshot,
@@ -1578,17 +1656,20 @@ mod tests {
                 rows: 30,
                 cols: 100
             }),
-            &snapshot
+            24,
+            80
         ));
         assert!(!replay_matches_requested_size(
             AttachReplayMode::TerminalSnapshot,
             None,
-            &snapshot
+            24,
+            80
         ));
         assert!(replay_matches_requested_size(
             AttachReplayMode::RawReplay,
             None,
-            &snapshot
+            24,
+            80
         ));
     }
 
@@ -1608,13 +1689,32 @@ mod tests {
                 &session_paths.raw_replay_ring,
             )
             .unwrap();
+        let runtime = ControlRuntime {
+            paths: session_paths,
+            writer: Arc::new(Mutex::new(Box::new(Vec::new()))),
+            master: Arc::new(Mutex::new(
+                native_pty_system()
+                    .openpty(PtySize {
+                        rows: 24,
+                        cols: 80,
+                        pixel_width: 0,
+                        pixel_height: 0,
+                    })
+                    .unwrap()
+                    .master,
+            )),
+            terminal_state: Arc::new(Mutex::new(state)),
+            child_pid: None,
+            child_pgid: None,
+            state: Arc::new(Mutex::new(ControlState::default())),
+        };
 
         assert!(!attach_resize_required(
-            &session_paths,
+            &runtime,
             TerminalDimensions { rows: 24, cols: 80 }
         ));
         assert!(attach_resize_required(
-            &session_paths,
+            &runtime,
             TerminalDimensions {
                 rows: 30,
                 cols: 100
@@ -1651,6 +1751,154 @@ mod tests {
         assert!(matches!(
             attach_live_output_frame(&request, b"\xfflive".to_vec()),
             AttachStreamFrame::RawOutput { data } if data.as_slice() == b"\xfflive"
+        ));
+    }
+
+    #[test]
+    fn worker_observe_attach_raw_replay_none_writes_response_before_frames() {
+        let temp = tempfile::tempdir().unwrap();
+        let state_paths = StatePaths::new(temp.path().join("state"));
+        let session_id = SessionId::new();
+        let session_paths = state_paths.session_paths(session_id);
+        fs::create_dir_all(&session_paths.root).unwrap();
+        write_json_atomic(
+            &session_paths.worker_json,
+            &WorkerMeta {
+                session_id,
+                pid: std::process::id(),
+                child_pid: None,
+                child_pgid: None,
+                spawn_mode: SpawnMode::Pty,
+                process_state: ProcessState::Running,
+                started_at: "2026-07-08T00:00:00Z".to_string(),
+                ended_at: None,
+                stop_requested_at: None,
+                stop_reason: None,
+                exit_code: None,
+                exit_signal: None,
+                attached_clients: 0,
+                input_owner: None,
+                updated_at: "2026-07-08T00:00:00Z".to_string(),
+            },
+        )
+        .unwrap();
+
+        let runtime = Arc::new(ControlRuntime {
+            paths: session_paths,
+            writer: Arc::new(Mutex::new(Box::new(Vec::new()))),
+            master: Arc::new(Mutex::new(
+                native_pty_system()
+                    .openpty(PtySize {
+                        rows: 24,
+                        cols: 80,
+                        pixel_width: 0,
+                        pixel_height: 0,
+                    })
+                    .unwrap()
+                    .master,
+            )),
+            terminal_state: Arc::new(Mutex::new(TerminalStateBuffer::new(24, 80, 128, 0))),
+            child_pid: None,
+            child_pgid: None,
+            state: Arc::new(Mutex::new(ControlState::default())),
+        });
+        let (mut client, server) = UnixStream::pair().unwrap();
+        let mut attach_request = raw_worker_attach_request("raw-observer", true);
+        attach_request.requested_terminal_size = Some(TerminalDimensions { rows: 24, cols: 80 });
+        attach_request.accepted_frame_types = vec![
+            AttachFrameType::RawOutput,
+            AttachFrameType::StreamLagged,
+            AttachFrameType::SnapshotUnavailable,
+            AttachFrameType::ScreenSnapshot,
+        ];
+        let request = WorkerControlRequest::with_params(
+            "observe-raw",
+            WorkerControlMethod::ObserveAttach,
+            &attach_request,
+        )
+        .unwrap();
+
+        client
+            .write_all(request.to_json_line().unwrap().as_bytes())
+            .unwrap();
+        let handle = thread::spawn(move || handle_connection(server, runtime));
+
+        let mut reader = BufReader::new(client.try_clone().unwrap());
+        let mut line = String::new();
+        reader
+            .read_line(&mut line)
+            .expect("read observe attach response");
+        assert!(!line.is_empty(), "worker closed before observe response");
+        let response = WorkerControlResponse::from_json_line(line.trim_end()).unwrap();
+        assert!(response.ok, "{response:#?}");
+        let attach: WorkerAttachResponse = response.result_as().unwrap();
+        assert_eq!(
+            attach.negotiated_initial_replay,
+            Some(AttachInitialReplay::None)
+        );
+        assert_eq!(
+            attach.accepted_frame_types,
+            vec![AttachFrameType::RawOutput, AttachFrameType::StreamLagged]
+        );
+
+        client
+            .write_all(AttachStreamFrame::Close.to_json_line().unwrap().as_bytes())
+            .unwrap();
+        handle.join().unwrap().unwrap();
+    }
+
+    #[test]
+    fn worker_screen_snapshot_initial_replay_uses_structured_frame_not_raw_output() {
+        let mut terminal_state = TerminalStateBuffer::new(3, 10, 128, 0);
+        terminal_state.process_output(b"ready");
+
+        let frame = screen_snapshot_frame(
+            terminal_state.screen_snapshot(),
+            Some(TerminalDimensions { rows: 3, cols: 10 }),
+        );
+
+        assert!(matches!(
+            &frame,
+            AttachStreamFrame::ScreenSnapshot { snapshot }
+                if snapshot.rows == 3
+                    && snapshot.cols == 10
+                    && snapshot.cells[0][0].symbol == "r"
+        ));
+        assert!(!matches!(&frame, AttachStreamFrame::RawOutput { .. }));
+    }
+
+    #[test]
+    fn worker_screen_snapshot_initial_replay_reports_size_mismatch() {
+        let terminal_state = TerminalStateBuffer::new(3, 10, 128, 0);
+
+        let frame = screen_snapshot_frame(
+            terminal_state.screen_snapshot(),
+            Some(TerminalDimensions { rows: 4, cols: 10 }),
+        );
+
+        assert!(matches!(
+            &frame,
+            AttachStreamFrame::SnapshotUnavailable {
+                reason: SnapshotUnavailableReason::SizeMismatch,
+                details: Some(_),
+            }
+        ));
+    }
+
+    #[test]
+    fn worker_screen_snapshot_initial_replay_reports_payload_too_large() {
+        let terminal_state = TerminalStateBuffer::new(1, 1, 128, 0);
+        let mut snapshot = terminal_state.screen_snapshot();
+        snapshot.cells[0][0].symbol = "x".repeat(5 * 1024 * 1024);
+
+        let frame = screen_snapshot_frame(snapshot, Some(TerminalDimensions { rows: 1, cols: 1 }));
+
+        assert!(matches!(
+            &frame,
+            AttachStreamFrame::SnapshotUnavailable {
+                reason: SnapshotUnavailableReason::PayloadTooLarge,
+                details: Some(_),
+            }
         ));
     }
 

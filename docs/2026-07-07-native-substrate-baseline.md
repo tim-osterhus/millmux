@@ -38,10 +38,13 @@ Rendering is an adapter. Cockpit is an operator preview and control surface,
 not the correctness path for byte-exact terminal interaction. Raw attach is the
 intended byte-exact fidelity path as that follow-up work lands.
 
-`terminal.snapshot.json`, bounded raw replay, and future structured
-`screen_snapshot` responses are distinct concepts. The current
+`terminal.snapshot.json`, bounded raw replay, and structured `screen_snapshot`
+responses are distinct concepts. The current
 `AttachReplayMode::TerminalSnapshot` name remains legacy protocol terminology
 for a size-gated raw replay checkpoint, not a structured screen snapshot.
+As of the Batch 5 handoff work, `session.screen` / `millmux screen` is the
+one-shot screen read surface and reports either `screen_snapshot` or structured
+`snapshot_unavailable` metadata.
 
 ## Batch 0 Scope
 

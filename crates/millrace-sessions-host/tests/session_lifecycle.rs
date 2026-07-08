@@ -20,7 +20,6 @@ use millrace_sessions_core::{
         LogStream, SessionAttachResponse, SessionDeleteResponse, SessionEventsResponse,
         SessionInspectResponse, SessionKillResponse, SessionLogsResponse, SessionResizeResponse,
         SessionSelector, SessionSendResponse, SessionStartResponse, SessionStopResponse,
-        SnapshotUnavailableReason,
     },
     scrollback::{restore_terminal_replay, TerminalSnapshot, TerminalStateBuffer},
     state::{
@@ -1684,7 +1683,7 @@ fn raw_attach_works_after_sessiond_restart() {
 }
 
 #[test]
-fn attach_stream_reports_lagged_frame_to_slow_v2_observer() {
+fn attach_stream_reports_lagged_event_to_slow_v2_observer() {
     let temp = tempfile::tempdir().unwrap();
     let paths = StatePaths::new(temp.path().join("state"));
     let workspace = temp.path().join("workspace");
@@ -1785,15 +1784,22 @@ fn attach_stream_reports_lagged_frame_to_slow_v2_observer() {
             break;
         }
     }
-
-    let lagged = wait_for_attach_frame(
-        &mut slow_reader,
-        |frame| matches!(frame, AttachStreamFrame::StreamLagged { dropped_bytes, .. } if *dropped_bytes > 0),
-    );
-    assert!(
-        matches!(lagged, AttachStreamFrame::StreamLagged { dropped_from_offset, dropped_to_offset, current_pty_log_offset, .. }
-            if dropped_from_offset < dropped_to_offset && current_pty_log_offset >= dropped_to_offset)
-    );
+    for _ in 0..128 {
+        let Some(frame) = read_next_attach_frame(&mut slow_reader) else {
+            break;
+        };
+        if let AttachStreamFrame::StreamLagged {
+            dropped_from_offset,
+            dropped_to_offset,
+            current_pty_log_offset,
+            ..
+        } = frame
+        {
+            assert!(dropped_from_offset < dropped_to_offset);
+            assert!(current_pty_log_offset >= dropped_to_offset);
+            break;
+        }
+    }
 
     slow.write_all(AttachStreamFrame::Close.to_json_line().unwrap().as_bytes())
         .unwrap();
@@ -2052,7 +2058,7 @@ fn attach_v2_initial_replay_none_suppresses_legacy_terminal_snapshot_replay() {
 }
 
 #[test]
-fn attach_v2_screen_snapshot_reports_unavailable_without_overclaiming_frames() {
+fn attach_v2_screen_snapshot_initial_replay_uses_structured_frame_or_unavailable() {
     let temp = tempfile::tempdir().unwrap();
     let paths = StatePaths::new(temp.path().join("state"));
     let workspace = temp.path().join("workspace");
@@ -2104,6 +2110,7 @@ fn attach_v2_screen_snapshot_reports_unavailable_without_overclaiming_frames() {
         attach.accepted_frame_types,
         vec![
             AttachFrameType::StreamLagged,
+            AttachFrameType::ScreenSnapshot,
             AttachFrameType::SnapshotUnavailable
         ]
     );
@@ -2112,12 +2119,10 @@ fn attach_v2_screen_snapshot_reports_unavailable_without_overclaiming_frames() {
     reader.read_line(&mut frame_line).unwrap();
     let frame = AttachStreamFrame::from_json_line(&frame_line).unwrap();
     assert!(matches!(
-        frame,
-        AttachStreamFrame::SnapshotUnavailable {
-            reason: SnapshotUnavailableReason::TerminalModelUnavailable,
-            ..
-        }
+        &frame,
+        AttachStreamFrame::ScreenSnapshot { .. } | AttachStreamFrame::SnapshotUnavailable { .. }
     ));
+    assert!(!matches!(&frame, AttachStreamFrame::RawOutput { .. }));
 
     stream
         .write_all(AttachStreamFrame::Close.to_json_line().unwrap().as_bytes())

@@ -16,10 +16,11 @@ use millrace_sessions_core::{
         SessionDeleteResponse, SessionEventsRequest, SessionEventsResponse, SessionInspectRequest,
         SessionInspectResponse, SessionKillRequest, SessionKillResponse, SessionListRequest,
         SessionListResponse, SessionLogsRequest, SessionLogsResponse, SessionResizeRequest,
-        SessionResizeResponse, SessionSendRequest, SessionSendResponse, SessionStartRequest,
-        SessionStartResponse, SessionStopRequest, SessionStopResponse, UiContextCloseRequest,
-        UiContextCloseResponse, UiContextGetRequest, UiContextGetResponse, UiContextListRequest,
-        UiContextListResponse, UiContextSetRequest, UiContextSetResponse,
+        SessionResizeResponse, SessionScreenRequest, SessionScreenResponse, SessionSendRequest,
+        SessionSendResponse, SessionStartRequest, SessionStartResponse, SessionStopRequest,
+        SessionStopResponse, UiContextCloseRequest, UiContextCloseResponse, UiContextGetRequest,
+        UiContextGetResponse, UiContextListRequest, UiContextListResponse, UiContextSetRequest,
+        UiContextSetResponse,
     },
 };
 use serde::{de::DeserializeOwned, Serialize};
@@ -107,6 +108,13 @@ impl SessionControlClient {
         request: &SessionInspectRequest,
     ) -> Result<SessionInspectResponse, ClientError> {
         self.request(ControlMethod::SessionInspect, request).await
+    }
+
+    pub async fn screen(
+        &self,
+        request: &SessionScreenRequest,
+    ) -> Result<SessionScreenResponse, ClientError> {
+        self.request(ControlMethod::SessionScreen, request).await
     }
 
     pub async fn logs(

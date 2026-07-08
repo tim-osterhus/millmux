@@ -1,10 +1,10 @@
 use millrace_sessions_core::{
     protocol::{
         DoctorResponse, EventStreamFrame, HostStatusResponse, LogLine, LogStream, LogStreamFrame,
-        SessionDeleteResponse, SessionEventsResponse, SessionInspectResponse, SessionKillResponse,
-        SessionListResponse, SessionLogsResponse, SessionResizeResponse, SessionSendResponse,
-        SessionStartResponse, SessionStopResponse, SessionSummary, UiContextGetResponse,
-        UiContextListResponse,
+        ScreenFrame, SessionDeleteResponse, SessionEventsResponse, SessionInspectResponse,
+        SessionKillResponse, SessionListResponse, SessionLogsResponse, SessionResizeResponse,
+        SessionScreenResponse, SessionSendResponse, SessionStartResponse, SessionStopResponse,
+        SessionSummary, UiContextGetResponse, UiContextListResponse,
     },
     state::{AttentionState, ProcessState, SessionRole},
 };
@@ -123,6 +123,33 @@ pub fn render_events(result: &SessionEventsResponse) -> String {
         push_event_line(&mut output, event);
     }
     output
+}
+
+pub fn render_screen(result: &SessionScreenResponse) -> String {
+    match &result.frame {
+        ScreenFrame::ScreenSnapshot { snapshot } => {
+            let mut output = String::new();
+            for line in snapshot.plain_lines() {
+                output.push_str(&line);
+                output.push('\n');
+            }
+            output
+        }
+        ScreenFrame::SnapshotUnavailable { reason, details } => {
+            let snapshot_state = details
+                .as_ref()
+                .and_then(|details| details.get("snapshot_state"))
+                .and_then(Value::as_str);
+            match snapshot_state {
+                Some(snapshot_state) => format!(
+                    "screen unavailable reason={} snapshot_state={}\n",
+                    json_string(reason),
+                    snapshot_state
+                ),
+                None => format!("screen unavailable reason={}\n", json_string(reason)),
+            }
+        }
+    }
 }
 
 pub fn render_log_stream_frame(frame: &LogStreamFrame) -> String {

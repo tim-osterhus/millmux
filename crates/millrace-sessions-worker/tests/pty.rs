@@ -1,5 +1,6 @@
 use std::{collections::BTreeMap, fs, io::Read, path::PathBuf};
 
+use millrace_sessions_core::{protocol::ScreenColor, scrollback::TerminalStateBuffer};
 use millrace_sessions_worker::pty::{spawn_pty, PtyCommandSpec};
 
 #[test]
@@ -45,4 +46,25 @@ fn pty_rejects_empty_argv_without_shell_fallback() {
         error.to_string().contains("argv"),
         "error should explain argv validation: {error}"
     );
+}
+
+#[test]
+fn pty_screen_snapshot_model_preserves_cells_styles_and_wide_continuations() {
+    let mut state = TerminalStateBuffer::new(2, 8, 256, 0);
+    state.process_output("\x1b[31;1mA\x1b[0m界".as_bytes());
+
+    let snapshot = state.screen_snapshot();
+
+    assert_eq!(snapshot.rows, 2);
+    assert_eq!(snapshot.cols, 8);
+    assert_eq!(snapshot.cells[0][0].symbol, "A");
+    assert!(snapshot.cells[0][0].style.bold);
+    assert_eq!(snapshot.cells[0][0].fg, ScreenColor::Indexed { index: 1 });
+    assert_eq!(snapshot.cells[0][1].symbol, "界");
+    assert_eq!(snapshot.cells[0][1].width, 2);
+    assert!(snapshot.cells[0][2].continuation);
+    assert_eq!(snapshot.cells[0][3].symbol, " ");
+    assert_eq!(snapshot.cells[0][3].width, 1);
+    assert_eq!(snapshot.cells[0][3].fg, ScreenColor::Default);
+    assert!(!snapshot.cells[0][3].style.bold);
 }

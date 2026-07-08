@@ -5,6 +5,10 @@ use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 
 use crate::{
     error::MillmuxResult,
+    protocol::{
+        ScreenCell, ScreenColor, ScreenCursor, ScreenSnapshot, ScreenSnapshotSource, ScreenStyle,
+        SCREEN_SNAPSHOT_SCHEMA_VERSION,
+    },
     storage::{read_json, write_json_atomic, write_private_bytes_atomic},
 };
 
@@ -160,8 +164,12 @@ pub struct TerminalSnapshot {
     pub raw_replay_start_offset: u64,
     pub raw_replay_end_offset: u64,
     pub captured_at: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub structured_screen: Option<ScreenSnapshot>,
     pub screen: Vec<String>,
 }
+
+pub type TerminalReplayCheckpoint = TerminalSnapshot;
 
 impl TerminalSnapshot {
     pub fn replay_is_fresh(&self, current_pty_offset: u64, raw_replay_len: usize) -> bool {
@@ -184,6 +192,36 @@ pub struct TerminalReplay {
     pub bytes: Vec<u8>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct TerminalReplayMetadata {
+    pub rows: u16,
+    pub cols: u16,
+    pub pty_log_offset: u64,
+    pub raw_replay_start_offset: u64,
+    pub raw_replay_end_offset: u64,
+}
+
+impl TerminalReplayMetadata {
+    pub fn replay_is_fresh(&self, current_pty_offset: u64, raw_replay_len: usize) -> bool {
+        self.pty_log_offset == current_pty_offset
+            && self.raw_replay_end_offset == current_pty_offset
+            && self
+                .raw_replay_end_offset
+                .saturating_sub(self.raw_replay_start_offset)
+                == raw_replay_len as u64
+    }
+
+    pub fn same_size(&self, rows: u16, cols: u16) -> bool {
+        self.rows == rows && self.cols == cols
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TerminalReplayBytes {
+    pub metadata: TerminalReplayMetadata,
+    pub bytes: Vec<u8>,
+}
+
 pub fn restore_terminal_replay(
     snapshot_path: impl AsRef<Path>,
     raw_replay_path: impl AsRef<Path>,
@@ -202,6 +240,26 @@ pub fn restore_terminal_replay(
     }
 
     Ok(Some(TerminalReplay { snapshot, bytes }))
+}
+
+pub fn restore_terminal_replay_bytes(
+    snapshot_path: impl AsRef<Path>,
+    raw_replay_path: impl AsRef<Path>,
+    current_pty_offset: u64,
+) -> MillmuxResult<Option<TerminalReplayBytes>> {
+    let snapshot_path = snapshot_path.as_ref();
+    let raw_replay_path = raw_replay_path.as_ref();
+    if !snapshot_path.exists() || !raw_replay_path.exists() {
+        return Ok(None);
+    }
+
+    let metadata: TerminalReplayMetadata = read_json(snapshot_path)?;
+    let bytes = fs::read(raw_replay_path)?;
+    if !metadata.replay_is_fresh(current_pty_offset, bytes.len()) {
+        return Ok(None);
+    }
+
+    Ok(Some(TerminalReplayBytes { metadata, bytes }))
 }
 
 pub struct TerminalStateBuffer {
@@ -269,23 +327,17 @@ impl TerminalStateBuffer {
         self.parser.screen_mut().set_size(rows.max(1), cols.max(1));
     }
 
+    pub fn same_size(&self, rows: u16, cols: u16) -> bool {
+        let (current_rows, current_cols) = self.parser.screen().size();
+        current_rows == rows && current_cols == cols
+    }
+
     pub fn snapshot(&self) -> TerminalSnapshot {
         let screen = self.parser.screen();
         let (rows, cols) = screen.size();
         let (cursor_row, cursor_col) = screen.cursor_position();
-        let mut screen_lines = Vec::with_capacity(usize::from(rows));
-
-        for row in 0..rows {
-            let mut line = String::with_capacity(usize::from(cols));
-            for col in 0..cols {
-                if let Some(cell) = screen.cell(row, col) {
-                    line.push_str(cell.contents());
-                } else {
-                    line.push(' ');
-                }
-            }
-            screen_lines.push(line.trim_end().to_string());
-        }
+        let structured_screen = self.screen_snapshot();
+        let screen_lines = structured_screen.plain_lines();
 
         TerminalSnapshot {
             schema_version: 1,
@@ -298,7 +350,47 @@ impl TerminalStateBuffer {
             raw_replay_start_offset: self.raw_replay.start_offset(),
             raw_replay_end_offset: self.raw_replay.end_offset(),
             captured_at: now_rfc3339(),
+            structured_screen: Some(structured_screen),
             screen: screen_lines,
+        }
+    }
+
+    pub fn screen_snapshot(&self) -> ScreenSnapshot {
+        let screen = self.parser.screen();
+        let (rows, cols) = screen.size();
+        let (cursor_row, cursor_col) = screen.cursor_position();
+        let mut cells = Vec::with_capacity(usize::from(rows));
+
+        for row in 0..rows {
+            let mut snapshot_row = Vec::with_capacity(usize::from(cols));
+            for col in 0..cols {
+                snapshot_row.push(
+                    screen
+                        .cell(row, col)
+                        .map(screen_cell_from_vt100)
+                        .unwrap_or_else(ScreenCell::blank),
+                );
+            }
+            cells.push(snapshot_row);
+        }
+
+        ScreenSnapshot {
+            schema_version: SCREEN_SNAPSHOT_SCHEMA_VERSION,
+            rows,
+            cols,
+            cursor: ScreenCursor {
+                row: cursor_row,
+                col: cursor_col,
+                visible: Some(!screen.hide_cursor()),
+            },
+            alternate_screen: screen.alternate_screen(),
+            cells,
+            source: ScreenSnapshotSource {
+                pty_log_offset: self.pty_log_offset,
+                raw_replay_start_offset: self.raw_replay.start_offset(),
+                raw_replay_end_offset: self.raw_replay.end_offset(),
+            },
+            captured_at: now_rfc3339(),
         }
     }
 
@@ -309,6 +401,36 @@ impl TerminalStateBuffer {
     ) -> MillmuxResult<()> {
         write_private_bytes_atomic(raw_replay_path, self.raw_replay.bytes())?;
         write_json_atomic(snapshot_path, &self.snapshot())
+    }
+}
+
+fn screen_cell_from_vt100(cell: &vt100::Cell) -> ScreenCell {
+    let continuation = cell.is_wide_continuation();
+    ScreenCell {
+        symbol: if continuation || !cell.has_contents() {
+            " ".to_string()
+        } else {
+            cell.contents().to_string()
+        },
+        width: if cell.is_wide() { 2 } else { 1 },
+        fg: screen_color_from_vt100(cell.fgcolor()),
+        bg: screen_color_from_vt100(cell.bgcolor()),
+        style: ScreenStyle {
+            bold: cell.bold(),
+            dim: cell.dim(),
+            italic: cell.italic(),
+            underline: cell.underline(),
+            inverse: cell.inverse(),
+        },
+        continuation,
+    }
+}
+
+fn screen_color_from_vt100(color: vt100::Color) -> ScreenColor {
+    match color {
+        vt100::Color::Default => ScreenColor::Default,
+        vt100::Color::Idx(index) => ScreenColor::Indexed { index },
+        vt100::Color::Rgb(r, g, b) => ScreenColor::Rgb { r, g, b },
     }
 }
 
@@ -496,6 +618,25 @@ mod tests {
                 .expect("fresh replay");
         assert_eq!(restored.snapshot, snapshot);
         assert_eq!(restored.bytes, fs::read(&replay_path).unwrap());
+
+        let lightweight =
+            restore_terminal_replay_bytes(&snapshot_path, &replay_path, snapshot.pty_log_offset)
+                .unwrap()
+                .expect("fresh lightweight replay");
+        assert_eq!(
+            (lightweight.metadata.rows, lightweight.metadata.cols),
+            (5, 20)
+        );
+        assert_eq!(lightweight.metadata.pty_log_offset, snapshot.pty_log_offset);
+        assert_eq!(
+            lightweight.metadata.raw_replay_start_offset,
+            snapshot.raw_replay_start_offset
+        );
+        assert_eq!(
+            lightweight.metadata.raw_replay_end_offset,
+            snapshot.raw_replay_end_offset
+        );
+        assert_eq!(lightweight.bytes, fs::read(&replay_path).unwrap());
     }
 
     #[test]
@@ -528,5 +669,37 @@ mod tests {
         assert!(snapshot.same_size(9, 30));
         assert!(!snapshot.same_size(5, 20));
         assert!(snapshot.screen.iter().any(|line| line.contains("resized")));
+    }
+
+    #[test]
+    fn screen_snapshot_records_wide_and_default_cells() {
+        let mut state = TerminalStateBuffer::new(3, 6, 64, 0);
+
+        state.process_output("A\u{754c}".as_bytes());
+        let snapshot = state.screen_snapshot();
+
+        assert_eq!((snapshot.rows, snapshot.cols), (3, 6));
+        assert_eq!(snapshot.cursor.row, 0);
+        assert_eq!(snapshot.cursor.col, 3);
+        assert_eq!(snapshot.cursor.visible, Some(true));
+        assert_eq!(snapshot.source.pty_log_offset, 4);
+
+        let first = &snapshot.cells[0][0];
+        assert_eq!(first.symbol, "A");
+        assert_eq!(first.width, 1);
+        assert!(!first.continuation);
+
+        let wide = &snapshot.cells[0][1];
+        assert_eq!(wide.symbol, "\u{754c}");
+        assert_eq!(wide.width, 2);
+        assert!(!wide.continuation);
+
+        let continuation = &snapshot.cells[0][2];
+        assert_eq!(continuation.symbol, " ");
+        assert_eq!(continuation.width, 1);
+        assert!(continuation.continuation);
+
+        let blank = &snapshot.cells[0][3];
+        assert_eq!(blank, &ScreenCell::blank());
     }
 }

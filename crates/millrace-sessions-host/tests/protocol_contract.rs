@@ -13,10 +13,13 @@ use millrace_sessions_core::{
     ids::{PaneId, SessionId, UiId},
     paths::{StatePaths, STATE_DIR_ENV},
     protocol::{
-        AttachFrameType, AttachInitialReplay, AttachStreamEncoding, ControlErrorCode,
-        SessionAttachRequest, SessionAttachResponse, SessionInspectResponse, SessionListResponse,
-        SessionSelector, StreamKind, StreamSetup, M1_PROTOCOL_VERSION, M2_ATTACH_PROTOCOL_VERSION,
+        AttachFrameType, AttachInitialReplay, AttachStreamEncoding, ControlErrorCode, ScreenCell,
+        ScreenCursor, ScreenSnapshot, ScreenSnapshotSource, SessionAttachRequest,
+        SessionAttachResponse, SessionInspectResponse, SessionListResponse, SessionScreenResponse,
+        SessionSelector, StreamKind, StreamSetup, TerminalDimensions, M1_PROTOCOL_VERSION,
+        M2_ATTACH_PROTOCOL_VERSION, SCREEN_SNAPSHOT_SCHEMA_VERSION,
     },
+    scrollback::TerminalSnapshot,
     state::{
         AttentionState, HostMeta, MonitorProfile, ProcessState, SessionMeta, SessionRole, SpawnMode,
     },
@@ -24,6 +27,8 @@ use millrace_sessions_core::{
     workspace::WorkspaceIdentity,
 };
 use serde_json::{json, Value};
+
+use millrace_sessions_host::server::dispatch_json_line;
 
 #[test]
 fn protocol_contract_v1_attach_response_omits_negotiation_fields() {
@@ -446,6 +451,102 @@ fn protocol_contract_foreground_daemon_persists_ui_context_contract() {
     child.kill();
 }
 
+#[test]
+fn session_screen_returns_structured_snapshot_from_terminal_checkpoint() {
+    let temp = tempfile::tempdir().unwrap();
+    let paths = StatePaths::new(temp.path().join("state"));
+    fs::create_dir_all(&paths.sessions_dir).unwrap();
+    let workspace = temp.path().join("workspace");
+    fs::create_dir_all(&workspace).unwrap();
+    let session = sample_session(&workspace);
+    write_session_meta(&paths, &session);
+    seed_pty_log(&paths, session.id, b"ready");
+    seed_terminal_snapshot(&paths, session.id, 1, 8, 5, vec!["ready".to_string()]);
+
+    let response = dispatch_json_line(
+        &screen_request("screen-1", session.id, None),
+        &paths,
+        &host_meta(&paths),
+    );
+
+    assert!(response.ok, "{response:#?}");
+    let result = response.result_as::<SessionScreenResponse>().unwrap();
+    let value = serde_json::to_value(&result).unwrap();
+    assert_eq!(value["type"], "screen_snapshot");
+    assert_eq!(value["rows"], 1);
+    assert_eq!(value["cols"], 8);
+    assert_eq!(value["cells"][0][0]["symbol"], "r");
+    assert!(value.get("data").is_none());
+}
+
+#[test]
+fn session_screen_reports_pipe_sessions_as_structured_unavailable() {
+    let temp = tempfile::tempdir().unwrap();
+    let paths = StatePaths::new(temp.path().join("state"));
+    fs::create_dir_all(&paths.sessions_dir).unwrap();
+    let workspace = temp.path().join("workspace");
+    fs::create_dir_all(&workspace).unwrap();
+    let mut session = sample_session(&workspace);
+    session.spawn_mode = SpawnMode::Pipe;
+    write_session_meta(&paths, &session);
+
+    let result = dispatch_screen(&paths, session.id, None);
+
+    assert_eq!(result["type"], "snapshot_unavailable");
+    assert_eq!(result["reason"], "unsupported_spawn_mode");
+    assert_eq!(result["details"]["capability"], "screen");
+}
+
+#[test]
+fn session_screen_distinguishes_missing_empty_stale_and_size_mismatch() {
+    let temp = tempfile::tempdir().unwrap();
+    let paths = StatePaths::new(temp.path().join("state"));
+    fs::create_dir_all(&paths.sessions_dir).unwrap();
+    let workspace = temp.path().join("workspace");
+    fs::create_dir_all(&workspace).unwrap();
+
+    let missing = sample_session(&workspace);
+    write_session_meta(&paths, &missing);
+    seed_pty_log(&paths, missing.id, b"ready");
+    let missing_result = dispatch_screen(&paths, missing.id, None);
+    assert_eq!(missing_result["reason"], "no_snapshot");
+    assert_eq!(missing_result["details"]["snapshot_state"], "missing_file");
+
+    let empty = sample_session(&workspace);
+    write_session_meta(&paths, &empty);
+    seed_pty_log(&paths, empty.id, b"ready");
+    fs::write(&paths.session_paths(empty.id).terminal_snapshot, b"").unwrap();
+    let empty_result = dispatch_screen(&paths, empty.id, None);
+    assert_eq!(empty_result["reason"], "no_snapshot");
+    assert_eq!(empty_result["details"]["snapshot_state"], "empty_file");
+
+    let stale = sample_session(&workspace);
+    write_session_meta(&paths, &stale);
+    seed_pty_log(&paths, stale.id, b"ready-new");
+    seed_terminal_snapshot(&paths, stale.id, 1, 8, 5, vec!["ready".to_string()]);
+    let stale_result = dispatch_screen(&paths, stale.id, None);
+    assert_eq!(stale_result["reason"], "stale_snapshot");
+    assert_eq!(
+        stale_result["details"]["snapshot_state"],
+        "stale_pty_log_offset"
+    );
+
+    let mismatch = sample_session(&workspace);
+    write_session_meta(&paths, &mismatch);
+    seed_pty_log(&paths, mismatch.id, b"ready");
+    seed_terminal_snapshot(&paths, mismatch.id, 1, 8, 5, vec!["ready".to_string()]);
+    let mismatch_result = dispatch_screen(
+        &paths,
+        mismatch.id,
+        Some(TerminalDimensions { rows: 2, cols: 8 }),
+    );
+    assert_eq!(mismatch_result["reason"], "size_mismatch");
+    assert_eq!(
+        mismatch_result["details"]["snapshot_state"],
+        "size_mismatch"
+    );
+}
+
 fn request_json(paths: &StatePaths, value: Value) -> Value {
     request_line(
         paths,
@@ -568,6 +669,126 @@ fn write_session_meta(paths: &StatePaths, meta: &SessionMeta) {
     let session_paths = paths.session_paths(meta.id);
     fs::create_dir_all(&session_paths.root).unwrap();
     write_json_atomic(&session_paths.meta_json, meta).unwrap();
+}
+
+fn dispatch_screen(
+    paths: &StatePaths,
+    session_id: SessionId,
+    requested_terminal_size: Option<TerminalDimensions>,
+) -> Value {
+    let response = dispatch_json_line(
+        &screen_request("screen-fixture", session_id, requested_terminal_size),
+        paths,
+        &host_meta(paths),
+    );
+    assert!(response.ok, "{response:#?}");
+    response.result.unwrap()
+}
+
+fn screen_request(
+    id: &str,
+    session_id: SessionId,
+    requested_terminal_size: Option<TerminalDimensions>,
+) -> String {
+    let mut params = json!({
+        "selector": {
+            "type": "id",
+            "session_id": session_id
+        }
+    });
+    if let Some(size) = requested_terminal_size {
+        params["requested_terminal_size"] = json!({
+            "rows": size.rows,
+            "cols": size.cols
+        });
+    }
+    format!(
+        "{}\n",
+        serde_json::to_string(&json!({
+            "id": id,
+            "method": "session.screen",
+            "params": params
+        }))
+        .unwrap()
+    )
+}
+
+fn seed_pty_log(paths: &StatePaths, session_id: SessionId, bytes: &[u8]) {
+    fs::write(&paths.session_paths(session_id).pty_log, bytes).unwrap();
+}
+
+fn seed_terminal_snapshot(
+    paths: &StatePaths,
+    session_id: SessionId,
+    rows: u16,
+    cols: u16,
+    offset: u64,
+    screen: Vec<String>,
+) {
+    let snapshot = TerminalSnapshot {
+        schema_version: 1,
+        rows,
+        cols,
+        cursor_row: 0,
+        cursor_col: 0,
+        alternate_screen: false,
+        pty_log_offset: offset,
+        raw_replay_start_offset: 0,
+        raw_replay_end_offset: offset,
+        captured_at: "2026-07-08T00:00:00Z".to_string(),
+        structured_screen: Some(structured_screen_fixture(rows, cols, offset, &screen)),
+        screen,
+    };
+    let session_paths = paths.session_paths(session_id);
+    write_json_atomic(&session_paths.terminal_snapshot, &snapshot).unwrap();
+    fs::write(&session_paths.raw_replay_ring, b"ready").unwrap();
+}
+
+fn structured_screen_fixture(
+    rows: u16,
+    cols: u16,
+    offset: u64,
+    lines: &[String],
+) -> ScreenSnapshot {
+    let mut cells = Vec::with_capacity(usize::from(rows));
+    for row_index in 0..usize::from(rows) {
+        let line = lines.get(row_index).map(String::as_str).unwrap_or("");
+        let mut row = line
+            .chars()
+            .take(usize::from(cols))
+            .map(|ch| ScreenCell::default_symbol(ch.to_string()))
+            .collect::<Vec<_>>();
+        row.resize_with(usize::from(cols), ScreenCell::blank);
+        cells.push(row);
+    }
+    ScreenSnapshot {
+        schema_version: SCREEN_SNAPSHOT_SCHEMA_VERSION,
+        rows,
+        cols,
+        cursor: ScreenCursor {
+            row: 0,
+            col: 0,
+            visible: Some(true),
+        },
+        alternate_screen: false,
+        cells,
+        source: ScreenSnapshotSource {
+            pty_log_offset: offset,
+            raw_replay_start_offset: 0,
+            raw_replay_end_offset: offset,
+        },
+        captured_at: "2026-07-08T00:00:00Z".to_string(),
+    }
+}
+
+fn host_meta(paths: &StatePaths) -> HostMeta {
+    HostMeta {
+        pid: std::process::id(),
+        state_root: paths.root.clone(),
+        control_socket: paths.control_sock.clone(),
+        started_at: "2026-07-08T00:00:00Z".to_string(),
+        updated_at: "2026-07-08T00:00:00Z".to_string(),
+    }
 }
 
 fn sample_session(workspace: impl AsRef<Path>) -> SessionMeta {

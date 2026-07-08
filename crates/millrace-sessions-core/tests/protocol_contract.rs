@@ -5,13 +5,15 @@ use millrace_sessions_core::{
     protocol::{
         AttachFrameType, AttachInitialReplay, AttachReplayMode, AttachStreamEncoding,
         AttachStreamFrame, AttachStreamLagReason, ControlErrorBody, ControlErrorCode,
-        ControlMethod, ControlRequest, ControlResponse, LogLine, LogStream, SessionArtifacts,
-        SessionAttachRequest, SessionAttachResponse, SessionCapabilities, SessionListRequest,
-        SessionListResponse, SessionSelector, SessionStartRequest, SessionSummary,
-        SnapshotUnavailableReason, StreamKind, StreamSetup, TerminalDimensions,
-        UiContextGetRequest, UiContextSetRequest, WorkerAttachRequest, WorkerAttachResponse,
-        WorkerAttachStateResponse, WorkerControlMethod, WorkerControlRequest, M1_PROTOCOL_VERSION,
-        M2_ATTACH_PROTOCOL_VERSION,
+        ControlMethod, ControlRequest, ControlResponse, LogLine, LogStream, ScreenCell,
+        ScreenColor, ScreenCursor, ScreenFrame, ScreenSnapshot, ScreenSnapshotSource, ScreenStyle,
+        SessionArtifacts, SessionAttachRequest, SessionAttachResponse, SessionCapabilities,
+        SessionListRequest, SessionListResponse, SessionScreenResponse, SessionSelector,
+        SessionStartRequest, SessionSummary, SnapshotUnavailableReason, StreamKind, StreamSetup,
+        TerminalDimensions, UiContextGetRequest, UiContextSetRequest, WorkerAttachRequest,
+        WorkerAttachResponse, WorkerAttachStateResponse, WorkerControlMethod, WorkerControlRequest,
+        M1_PROTOCOL_VERSION, M2_ATTACH_PROTOCOL_VERSION, MAX_SCREEN_SNAPSHOT_CELLS,
+        SCREEN_SNAPSHOT_SCHEMA_VERSION,
     },
     state::{
         AttentionState, MonitorProfile, ProcessState, SessionRole, SpawnMode, UiContext,
@@ -200,7 +202,7 @@ fn session_list_request_and_response_match_m1_jsonl_contract() {
                         "raw_attach": true,
                         "send": true,
                         "resize": true,
-                        "screen": false
+                        "screen": true
                     },
                     "artifacts": {
                         "schema_version": 1
@@ -391,6 +393,7 @@ fn session_attach_v2_negotiation_fields_are_additive() {
         client_protocol_version: Some(M2_ATTACH_PROTOCOL_VERSION),
         accepted_frame_types: vec![
             AttachFrameType::RawOutput,
+            AttachFrameType::ScreenSnapshot,
             AttachFrameType::SnapshotUnavailable,
         ],
         stream_encoding: Some(AttachStreamEncoding::RawBytes),
@@ -412,7 +415,7 @@ fn session_attach_v2_negotiation_fields_are_additive() {
                 "replay": "terminal_snapshot",
                 "requested_terminal_size": {"rows": 40, "cols": 120},
                 "client_protocol_version": 2,
-                "accepted_frame_types": ["raw_output", "snapshot_unavailable"],
+                "accepted_frame_types": ["raw_output", "screen_snapshot", "snapshot_unavailable"],
                 "stream_encoding": "raw_bytes",
                 "initial_replay": "screen_snapshot"
             }
@@ -436,9 +439,11 @@ fn session_attach_v2_negotiation_fields_are_additive() {
         decoded.negotiated_frame_types(),
         vec![
             AttachFrameType::RawOutput,
+            AttachFrameType::ScreenSnapshot,
             AttachFrameType::SnapshotUnavailable
         ]
     );
+    assert!(decoded.accepts_frame_type(AttachFrameType::ScreenSnapshot));
     assert!(decoded.accepts_frame_type(AttachFrameType::SnapshotUnavailable));
     assert!(!decoded.accepts_frame_type(AttachFrameType::StreamLagged));
 }
@@ -519,6 +524,7 @@ fn session_attach_v2_negotiates_batch1_stream_lagged_frame_type() {
         vec![
             AttachFrameType::RawOutput,
             AttachFrameType::StreamLagged,
+            AttachFrameType::ScreenSnapshot,
             AttachFrameType::SnapshotUnavailable
         ]
     );
@@ -632,6 +638,235 @@ fn snapshot_unavailable_frame_has_minimal_v2_envelope() {
                 "snapshot_cols": 80
             }
         })
+    );
+}
+
+#[test]
+fn snapshot_unavailable_reasons_are_enumerated_contract_values() {
+    let reasons = [
+        (SnapshotUnavailableReason::NoSnapshot, "no_snapshot"),
+        (SnapshotUnavailableReason::StaleSnapshot, "stale_snapshot"),
+        (SnapshotUnavailableReason::SizeMismatch, "size_mismatch"),
+        (
+            SnapshotUnavailableReason::UnsupportedSpawnMode,
+            "unsupported_spawn_mode",
+        ),
+        (
+            SnapshotUnavailableReason::PayloadTooLarge,
+            "payload_too_large",
+        ),
+        (
+            SnapshotUnavailableReason::TerminalModelUnavailable,
+            "terminal_model_unavailable",
+        ),
+        (
+            SnapshotUnavailableReason::PermissionDenied,
+            "permission_denied",
+        ),
+        (SnapshotUnavailableReason::InternalError, "internal_error"),
+    ];
+
+    for (reason, wire) in reasons {
+        assert_eq!(
+            serde_json::to_string(&reason).unwrap(),
+            format!("\"{wire}\"")
+        );
+        assert_eq!(
+            serde_json::from_str::<SnapshotUnavailableReason>(&format!("\"{wire}\"")).unwrap(),
+            reason
+        );
+    }
+}
+
+#[test]
+fn screen_snapshot_attach_frame_uses_flattened_v1_schema() {
+    let mut wide = ScreenCell::default_symbol("界");
+    wide.width = 2;
+    wide.fg = ScreenColor::Indexed { index: 2 };
+    wide.bg = ScreenColor::Rgb {
+        r: 10,
+        g: 20,
+        b: 30,
+    };
+    wide.style = ScreenStyle {
+        bold: true,
+        dim: false,
+        italic: true,
+        underline: true,
+        inverse: false,
+    };
+    let mut continuation = ScreenCell::blank();
+    continuation.continuation = true;
+
+    let frame = AttachStreamFrame::screen_snapshot(ScreenSnapshot {
+        schema_version: SCREEN_SNAPSHOT_SCHEMA_VERSION,
+        rows: 1,
+        cols: 3,
+        cursor: ScreenCursor {
+            row: 0,
+            col: 2,
+            visible: Some(true),
+        },
+        alternate_screen: true,
+        cells: vec![vec![wide, continuation, ScreenCell::blank()]],
+        source: ScreenSnapshotSource {
+            pty_log_offset: 123456,
+            raw_replay_start_offset: 122000,
+            raw_replay_end_offset: 123456,
+        },
+        captured_at: "2026-07-08T00:00:00Z".to_string(),
+    })
+    .expect("snapshot is within limits");
+
+    let frame_line = frame.to_json_line().unwrap();
+    assert_eq!(
+        AttachStreamFrame::from_json_line(&frame_line).unwrap(),
+        frame
+    );
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&frame_line).unwrap(),
+        json!({
+            "type": "screen_snapshot",
+            "schema_version": 1,
+            "rows": 1,
+            "cols": 3,
+            "cursor": {"row": 0, "col": 2, "visible": true},
+            "alternate_screen": true,
+            "cells": [[
+                {
+                    "symbol": "界",
+                    "width": 2,
+                    "fg": {"type": "indexed", "index": 2},
+                    "bg": {"type": "rgb", "r": 10, "g": 20, "b": 30},
+                    "style": {
+                        "bold": true,
+                        "italic": true,
+                        "underline": true
+                    }
+                },
+                {
+                    "symbol": " ",
+                    "continuation": true
+                },
+                {
+                    "symbol": " "
+                }
+            ]],
+            "source": {
+                "pty_log_offset": 123456,
+                "raw_replay_start_offset": 122000,
+                "raw_replay_end_offset": 123456
+            },
+            "captured_at": "2026-07-08T00:00:00Z"
+        })
+    );
+}
+
+#[test]
+fn screen_snapshot_validation_enforces_cell_and_payload_bounds() {
+    let too_many_cells = ScreenSnapshot {
+        schema_version: SCREEN_SNAPSHOT_SCHEMA_VERSION,
+        rows: 400,
+        cols: 400,
+        cursor: ScreenCursor {
+            row: 0,
+            col: 0,
+            visible: Some(true),
+        },
+        alternate_screen: false,
+        cells: Vec::new(),
+        source: ScreenSnapshotSource {
+            pty_log_offset: 0,
+            raw_replay_start_offset: 0,
+            raw_replay_end_offset: 0,
+        },
+        captured_at: "2026-07-08T00:00:00Z".to_string(),
+    };
+    let error = too_many_cells.validate_for_wire().unwrap_err();
+    assert_eq!(
+        error.unavailable_reason(),
+        SnapshotUnavailableReason::PayloadTooLarge
+    );
+    assert_eq!(
+        error.unavailable_details().unwrap()["max_cells"],
+        MAX_SCREEN_SNAPSHOT_CELLS
+    );
+
+    let mut huge = ScreenCell::blank();
+    huge.symbol = "x".repeat(5 * 1024 * 1024);
+    let huge_snapshot = ScreenSnapshot {
+        schema_version: SCREEN_SNAPSHOT_SCHEMA_VERSION,
+        rows: 1,
+        cols: 1,
+        cursor: ScreenCursor {
+            row: 0,
+            col: 0,
+            visible: Some(true),
+        },
+        alternate_screen: false,
+        cells: vec![vec![huge]],
+        source: ScreenSnapshotSource {
+            pty_log_offset: 0,
+            raw_replay_start_offset: 0,
+            raw_replay_end_offset: 0,
+        },
+        captured_at: "2026-07-08T00:00:00Z".to_string(),
+    };
+    let frame = AttachStreamFrame::screen_snapshot(huge_snapshot).unwrap_err();
+    assert_eq!(
+        frame.unavailable_reason(),
+        SnapshotUnavailableReason::PayloadTooLarge
+    );
+    assert!(
+        frame.unavailable_details().unwrap()["serialized_bytes"]
+            .as_u64()
+            .unwrap()
+            > 4 * 1024 * 1024
+    );
+}
+
+#[test]
+fn session_screen_response_uses_structured_screen_snapshot_frame() {
+    let session_id: SessionId = "818b61b1-a620-4a57-8e72-4d439d03840f".parse().unwrap();
+    let response = SessionScreenResponse {
+        protocol_version: M1_PROTOCOL_VERSION,
+        session_id,
+        frame: ScreenFrame::ScreenSnapshot {
+            snapshot: ScreenSnapshot {
+                schema_version: SCREEN_SNAPSHOT_SCHEMA_VERSION,
+                rows: 1,
+                cols: 2,
+                cursor: ScreenCursor {
+                    row: 0,
+                    col: 1,
+                    visible: Some(true),
+                },
+                alternate_screen: false,
+                cells: vec![vec![
+                    ScreenCell::default_symbol("o"),
+                    ScreenCell::default_symbol("k"),
+                ]],
+                source: ScreenSnapshotSource {
+                    pty_log_offset: 7,
+                    raw_replay_start_offset: 0,
+                    raw_replay_end_offset: 7,
+                },
+                captured_at: "2026-07-08T00:00:00Z".to_string(),
+            },
+        },
+    };
+
+    let value = serde_json::to_value(&response).unwrap();
+    assert_eq!(value["type"], "screen_snapshot");
+    assert_eq!(value["cells"][0][0]["symbol"], "o");
+    assert!(
+        value["cells"][0][0].get("fg").is_none(),
+        "default foreground is omitted from compact screen cells"
+    );
+    assert_eq!(value["source"]["pty_log_offset"], 7);
+    assert!(
+        value.get("data").is_none(),
+        "screen is not a raw_output frame"
     );
 }
 
