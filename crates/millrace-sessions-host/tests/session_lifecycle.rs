@@ -1493,6 +1493,197 @@ fn attach_stream_delivers_queued_input_before_close_release() {
 }
 
 #[test]
+fn raw_attach_stream_forwards_binary_input_live_output_and_resize() {
+    let temp = tempfile::tempdir().unwrap();
+    let paths = StatePaths::new(temp.path().join("state"));
+    let workspace = temp.path().join("workspace");
+    fs::create_dir_all(&workspace).unwrap();
+    let mut daemon = DaemonChild::spawn(&paths);
+    wait_for_socket(&paths.control_sock);
+
+    let start = start_session(
+        &paths,
+        &workspace,
+        "raw-attach-io-shell",
+        concat!(
+            "stty raw -echo; ",
+            "printf 'ready\\n'; ",
+            "dd bs=1 count=6 2>/dev/null | od -An -tx1 | tr -d ' \\n'; ",
+            "printf '\\n'; ",
+            "printf '\\377\\000\\033[31mraw-live'; ",
+            "while [ ! -f go-resize ]; do sleep 0.05; done; ",
+            "stty size; sleep 1"
+        ),
+    );
+    let session_paths = paths.session_paths(start.session.session_id);
+    wait_for_worker_socket(&session_paths.worker_sock);
+    wait_for_running_meta(&session_paths.meta_json);
+    wait_for_file_contains(&session_paths.pty_log, "ready");
+
+    let mut stream =
+        open_raw_attach_stream(&paths, start.session.session_id, false, Some((26, 88)));
+    let attach = read_attach_response(&stream);
+    assert!(attach.stream.input_owner);
+    assert_eq!(
+        attach.accepted_frame_types,
+        vec![
+            AttachFrameType::RawOutput,
+            AttachFrameType::RawInput,
+            AttachFrameType::StreamLagged
+        ]
+    );
+    wait_for_terminal_snapshot_size(&session_paths.terminal_snapshot, 26, 88);
+
+    let mut reader = BufReader::new(stream.try_clone().unwrap());
+    stream
+        .write_all(
+            AttachStreamFrame::raw_input(vec![0xff, 0x00, 0x1b, b'[', b'A', 0x03])
+                .to_json_line()
+                .unwrap()
+                .as_bytes(),
+        )
+        .unwrap();
+    wait_for_file_bytes_contains(&session_paths.pty_log, b"ff001b5b4103");
+    let seen = wait_for_raw_output_contains(&mut reader, b"\xff\0\x1b[31mraw-live");
+    assert!(
+        !contains_bytes(&seen, "\u{fffd}".as_bytes()),
+        "raw live output passed through UTF-8 replacement: {seen:?}"
+    );
+
+    stream
+        .write_all(
+            AttachStreamFrame::Resize { rows: 34, cols: 90 }
+                .to_json_line()
+                .unwrap()
+                .as_bytes(),
+        )
+        .unwrap();
+    wait_for_terminal_snapshot_size(&session_paths.terminal_snapshot, 34, 90);
+    fs::write(workspace.join("go-resize"), b"go").unwrap();
+    wait_for_file_bytes_contains(&session_paths.pty_log, b"34 90");
+
+    stream
+        .write_all(AttachStreamFrame::Close.to_json_line().unwrap().as_bytes())
+        .unwrap();
+    wait_for_event_kind(&session_paths.events_jsonl, SessionEventKind::AttachClosed);
+
+    daemon.kill();
+}
+
+#[test]
+fn raw_attach_rejects_raw_input_without_negotiated_writable_owner() {
+    let temp = tempfile::tempdir().unwrap();
+    let paths = StatePaths::new(temp.path().join("state"));
+    let workspace = temp.path().join("workspace");
+    fs::create_dir_all(&workspace).unwrap();
+    let mut daemon = DaemonChild::spawn(&paths);
+    wait_for_socket(&paths.control_sock);
+
+    let start = start_session(
+        &paths,
+        &workspace,
+        "raw-attach-reject-shell",
+        "printf 'ready\\n'; sleep 5",
+    );
+    let session_paths = paths.session_paths(start.session.session_id);
+    wait_for_worker_socket(&session_paths.worker_sock);
+    wait_for_running_meta(&session_paths.meta_json);
+    wait_for_file_contains(&session_paths.pty_log, "ready");
+
+    let mut legacy = open_attach_stream(&paths, start.session.session_id, false);
+    let legacy_attach = read_attach_response(&legacy);
+    assert!(legacy_attach.stream.input_owner);
+    assert_attach_raw_input_error(&mut legacy, ControlErrorCode::InvalidRequest);
+    legacy
+        .write_all(AttachStreamFrame::Close.to_json_line().unwrap().as_bytes())
+        .unwrap();
+    wait_for_attach_closed_count(&session_paths.events_jsonl, 1);
+
+    let mut text_v2 = open_v2_text_attach_stream(&paths, start.session.session_id);
+    let text_attach = read_attach_response(&text_v2);
+    assert!(text_attach.stream.input_owner);
+    assert_attach_raw_input_error(&mut text_v2, ControlErrorCode::InvalidRequest);
+    text_v2
+        .write_all(AttachStreamFrame::Close.to_json_line().unwrap().as_bytes())
+        .unwrap();
+    wait_for_attach_closed_count(&session_paths.events_jsonl, 2);
+
+    let mut read_only = open_raw_attach_stream(&paths, start.session.session_id, true, None);
+    let read_only_attach = read_attach_response(&read_only);
+    assert!(!read_only_attach.stream.input_owner);
+    assert_attach_raw_input_error(&mut read_only, ControlErrorCode::InvalidRequest);
+    read_only
+        .write_all(AttachStreamFrame::Close.to_json_line().unwrap().as_bytes())
+        .unwrap();
+    wait_for_attach_closed_count(&session_paths.events_jsonl, 3);
+
+    let owner = open_raw_attach_stream(&paths, start.session.session_id, false, None);
+    let owner_attach = read_attach_response(&owner);
+    assert!(owner_attach.stream.input_owner);
+    let non_owner = request_json(
+        &paths,
+        json!({
+            "id": "raw-non-owner",
+            "method": "session.attach",
+            "params": {
+                "selector": {"type": "id", "session_id": start.session.session_id},
+                "client_protocol_version": 2,
+                "accepted_frame_types": ["raw_output", "raw_input"],
+                "stream_encoding": "raw_bytes",
+                "initial_replay": "none"
+            }
+        }),
+    );
+    assert_error(
+        &non_owner,
+        "raw-non-owner",
+        ControlErrorCode::InputOwnerConflict,
+    );
+
+    daemon.kill();
+}
+
+#[test]
+fn raw_attach_works_after_sessiond_restart() {
+    let temp = tempfile::tempdir().unwrap();
+    let paths = StatePaths::new(temp.path().join("state"));
+    let workspace = temp.path().join("workspace");
+    fs::create_dir_all(&workspace).unwrap();
+    let mut daemon = DaemonChild::spawn(&paths);
+    wait_for_socket(&paths.control_sock);
+
+    let start = start_session(
+        &paths,
+        &workspace,
+        "raw-after-restart-shell",
+        "printf 'ready\\n'; while [ ! -f go-raw-restart ]; do sleep 0.05; done; printf '\\377raw-after-restart'",
+    );
+    let session_paths = paths.session_paths(start.session.session_id);
+    wait_for_worker_socket(&session_paths.worker_sock);
+    wait_for_running_meta(&session_paths.meta_json);
+    wait_for_file_contains(&session_paths.pty_log, "ready");
+    let worker_before: WorkerMeta = read_json(&session_paths.worker_json).unwrap();
+
+    daemon.kill();
+    assert_process_alive(worker_before.pid, "worker before raw restart attach");
+
+    let mut restarted = DaemonChild::spawn(&paths);
+    wait_for_socket(&paths.control_sock);
+
+    let stream = open_raw_attach_stream(&paths, start.session.session_id, true, None);
+    let attach = read_attach_response(&stream);
+    assert!(attach.stream.read_only);
+    assert!(!attach.stream.input_owner);
+    assert!(attach.confirms_raw_stream());
+    let mut reader = BufReader::new(stream.try_clone().unwrap());
+
+    fs::write(workspace.join("go-raw-restart"), b"go").expect("release raw restart fixture");
+    wait_for_raw_output_contains(&mut reader, b"\xffraw-after-restart");
+
+    restarted.kill();
+}
+
+#[test]
 fn attach_stream_reports_lagged_frame_to_slow_v2_observer() {
     let temp = tempfile::tempdir().unwrap();
     let paths = StatePaths::new(temp.path().join("state"));
@@ -2278,6 +2469,93 @@ fn open_attach_stream_with_replay(
     stream
 }
 
+fn open_raw_attach_stream(
+    paths: &StatePaths,
+    session_id: millrace_sessions_core::ids::SessionId,
+    read_only: bool,
+    requested_size: Option<(u16, u16)>,
+) -> UnixStream {
+    let mut stream = UnixStream::connect(&paths.control_sock).expect("connect raw attach stream");
+    let mut params = json!({
+        "selector": {"type": "id", "session_id": session_id},
+        "read_only": read_only,
+        "replay": "none",
+        "client_protocol_version": 2,
+        "accepted_frame_types": if read_only {
+            json!(["raw_output", "stream_lagged"])
+        } else {
+            json!(["raw_output", "raw_input", "stream_lagged"])
+        },
+        "stream_encoding": "raw_bytes",
+        "initial_replay": "none"
+    });
+    if let Some((rows, cols)) = requested_size {
+        params["requested_terminal_size"] = json!({ "rows": rows, "cols": cols });
+    }
+    stream
+        .write_all(
+            format!(
+                "{}\n",
+                serde_json::to_string(&json!({
+                    "id": if read_only { "raw-attach-observer" } else { "raw-attach-owner" },
+                    "method": "session.attach",
+                    "params": params
+                }))
+                .unwrap()
+            )
+            .as_bytes(),
+        )
+        .unwrap();
+    stream
+}
+
+fn open_v2_text_attach_stream(
+    paths: &StatePaths,
+    session_id: millrace_sessions_core::ids::SessionId,
+) -> UnixStream {
+    let mut stream = UnixStream::connect(&paths.control_sock).expect("connect text attach stream");
+    stream
+        .write_all(
+            format!(
+                "{}\n",
+                serde_json::to_string(&json!({
+                    "id": "v2-text-attach",
+                    "method": "session.attach",
+                    "params": {
+                        "selector": {"type": "id", "session_id": session_id},
+                        "client_protocol_version": 2,
+                        "accepted_frame_types": ["raw_output", "raw_input"],
+                        "stream_encoding": "text",
+                        "initial_replay": "none"
+                    }
+                }))
+                .unwrap()
+            )
+            .as_bytes(),
+        )
+        .unwrap();
+    stream
+}
+
+fn assert_attach_raw_input_error(stream: &mut UnixStream, code: ControlErrorCode) {
+    stream
+        .write_all(
+            AttachStreamFrame::raw_input(vec![0xff, 0x00, 0x1b])
+                .to_json_line()
+                .unwrap()
+                .as_bytes(),
+        )
+        .unwrap();
+    let mut reader = BufReader::new(stream.try_clone().unwrap());
+    let frame = wait_for_attach_frame(&mut reader, |frame| {
+        matches!(frame, AttachStreamFrame::Error { .. })
+    });
+    assert!(
+        matches!(&frame, AttachStreamFrame::Error { error } if error.code == code),
+        "expected attach error {code:?}, got {frame:?}"
+    );
+}
+
 fn assert_process_alive(pid: u32, label: &str) {
     assert!(
         kill(Pid::from_raw(pid as i32), None).is_ok(),
@@ -2324,6 +2602,33 @@ fn wait_for_attach_frame(
         }
     }
     panic!("timed out waiting for matching attach frame");
+}
+
+fn wait_for_raw_output_contains(reader: &mut BufReader<UnixStream>, needle: &[u8]) -> Vec<u8> {
+    let started = Instant::now();
+    let mut seen = Vec::new();
+    while started.elapsed() < Duration::from_secs(10) {
+        if let Some(frame) = read_next_attach_frame(reader) {
+            match frame {
+                AttachStreamFrame::RawOutput { data } => seen.extend_from_slice(data.as_slice()),
+                AttachStreamFrame::Output { text } => seen.extend_from_slice(text.as_bytes()),
+                AttachStreamFrame::Error { error } => panic!("attach stream error: {error:?}"),
+                AttachStreamFrame::Closed => break,
+                _ => {}
+            }
+            if contains_bytes(&seen, needle) {
+                return seen;
+            }
+        }
+    }
+    panic!("timed out waiting for raw output {needle:?}; saw {seen:?}");
+}
+
+fn contains_bytes(haystack: &[u8], needle: &[u8]) -> bool {
+    needle.is_empty()
+        || haystack
+            .windows(needle.len())
+            .any(|window| window == needle)
 }
 
 fn spawn_attach_drain(stream: UnixStream) -> thread::JoinHandle<usize> {
@@ -2421,6 +2726,20 @@ fn wait_for_worker_socket(path: &Path) {
 
 fn wait_for_file_contains(path: &Path, needle: &str) {
     wait_for_file_contains_timeout(path, needle, Duration::from_secs(5));
+}
+
+fn wait_for_file_bytes_contains(path: &Path, needle: &[u8]) {
+    let started = Instant::now();
+    while started.elapsed() < Duration::from_secs(5) {
+        if fs::read(path)
+            .map(|raw| contains_bytes(&raw, needle))
+            .unwrap_or(false)
+        {
+            return;
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
+    panic!("{} did not contain bytes {needle:?}", path.display());
 }
 
 fn wait_for_file_contains_timeout(path: &Path, needle: &str, timeout: Duration) {

@@ -331,6 +331,7 @@ impl fmt::Display for AttachReplayMode {
 #[serde(rename_all = "snake_case")]
 pub enum AttachFrameType {
     RawOutput,
+    RawInput,
     StreamLagged,
     SnapshotUnavailable,
     ScreenSnapshot,
@@ -417,6 +418,10 @@ pub struct SessionAttachRequest {
 }
 
 impl SessionAttachRequest {
+    pub fn requests_raw_stream(&self) -> bool {
+        self.stream_encoding == Some(AttachStreamEncoding::RawBytes)
+    }
+
     pub fn negotiated_attach_protocol_version(&self) -> Option<u32> {
         self.client_protocol_version
             .filter(|version| *version >= M2_ATTACH_PROTOCOL_VERSION)
@@ -467,6 +472,13 @@ impl SessionAttachRequest {
             && self.client_accepts_frame_type(AttachFrameType::RawOutput)
         {
             frame_types.push(AttachFrameType::RawOutput);
+        }
+
+        if self.negotiated_stream_encoding() == Some(AttachStreamEncoding::RawBytes)
+            && !self.read_only
+            && self.client_accepts_frame_type(AttachFrameType::RawInput)
+        {
+            frame_types.push(AttachFrameType::RawInput);
         }
 
         if self.client_accepts_frame_type(AttachFrameType::StreamLagged) {
@@ -748,7 +760,7 @@ impl SessionCapabilities {
             SpawnMode::Pty => Self {
                 schema_version: SESSION_CAPABILITIES_SCHEMA_VERSION,
                 attach: true,
-                raw_attach: false,
+                raw_attach: true,
                 send: true,
                 resize: true,
                 screen: false,
@@ -863,6 +875,23 @@ pub struct SessionAttachResponse {
     pub negotiated_initial_replay: Option<AttachInitialReplay>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub accepted_frame_types: Vec<AttachFrameType>,
+}
+
+impl SessionAttachResponse {
+    pub fn confirms_raw_stream(&self) -> bool {
+        self.negotiated_attach_protocol_version == Some(M2_ATTACH_PROTOCOL_VERSION)
+            && self.negotiated_stream_encoding == Some(AttachStreamEncoding::RawBytes)
+            && self
+                .accepted_frame_types
+                .contains(&AttachFrameType::RawOutput)
+    }
+
+    pub fn confirms_raw_input(&self) -> bool {
+        !self.stream.input_owner
+            || self
+                .accepted_frame_types
+                .contains(&AttachFrameType::RawInput)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1069,6 +1098,9 @@ pub enum AttachStreamFrame {
     RawOutput {
         data: AttachRawBytes,
     },
+    RawInput {
+        data: AttachRawBytes,
+    },
     SnapshotUnavailable {
         reason: SnapshotUnavailableReason,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1099,6 +1131,12 @@ pub enum AttachStreamFrame {
 impl AttachStreamFrame {
     pub fn raw_output(bytes: impl Into<Vec<u8>>) -> Self {
         Self::RawOutput {
+            data: AttachRawBytes::new(bytes),
+        }
+    }
+
+    pub fn raw_input(bytes: impl Into<Vec<u8>>) -> Self {
+        Self::RawInput {
             data: AttachRawBytes::new(bytes),
         }
     }
@@ -1341,6 +1379,13 @@ impl WorkerAttachRequest {
             && self.client_accepts_frame_type(AttachFrameType::RawOutput)
         {
             frame_types.push(AttachFrameType::RawOutput);
+        }
+
+        if self.negotiated_stream_encoding() == Some(AttachStreamEncoding::RawBytes)
+            && !self.read_only
+            && self.client_accepts_frame_type(AttachFrameType::RawInput)
+        {
+            frame_types.push(AttachFrameType::RawInput);
         }
 
         if self.client_accepts_frame_type(AttachFrameType::StreamLagged) {

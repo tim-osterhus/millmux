@@ -197,7 +197,7 @@ fn session_list_request_and_response_match_m1_jsonl_contract() {
                     "capabilities": {
                         "schema_version": 1,
                         "attach": true,
-                        "raw_attach": false,
+                        "raw_attach": true,
                         "send": true,
                         "resize": true,
                         "screen": false
@@ -456,9 +456,43 @@ fn session_attach_v2_missing_accepted_frame_type_suppresses_that_frame() {
     .expect("v2 attach params deserialize");
 
     assert!(request.accepts_frame_type(AttachFrameType::RawOutput));
+    assert!(!request.accepts_frame_type(AttachFrameType::RawInput));
     assert!(!request.accepts_frame_type(AttachFrameType::StreamLagged));
     assert!(!request.accepts_frame_type(AttachFrameType::SnapshotUnavailable));
     assert!(!request.accepts_frame_type(AttachFrameType::ScreenSnapshot));
+}
+
+#[test]
+fn session_attach_v2_negotiates_raw_input_only_for_writable_raw_streams() {
+    let session_id: SessionId = "018f5d8d-3e79-4a62-9bc5-51c3c7f4d5c8".parse().unwrap();
+    let writable: SessionAttachRequest = serde_json::from_value(json!({
+        "selector": {"type": "id", "session_id": session_id},
+        "client_protocol_version": 2,
+        "accepted_frame_types": ["raw_output", "raw_input"],
+        "stream_encoding": "raw_bytes",
+        "initial_replay": "none"
+    }))
+    .expect("writable v2 attach params deserialize");
+
+    assert_eq!(
+        writable.negotiated_frame_types(),
+        vec![AttachFrameType::RawOutput, AttachFrameType::RawInput]
+    );
+
+    let read_only: SessionAttachRequest = serde_json::from_value(json!({
+        "selector": {"type": "id", "session_id": session_id},
+        "read_only": true,
+        "client_protocol_version": 2,
+        "accepted_frame_types": ["raw_output", "raw_input"],
+        "stream_encoding": "raw_bytes",
+        "initial_replay": "none"
+    }))
+    .expect("read-only v2 attach params deserialize");
+
+    assert_eq!(
+        read_only.negotiated_frame_types(),
+        vec![AttachFrameType::RawOutput]
+    );
 }
 
 #[test]
@@ -765,6 +799,24 @@ fn raw_attach_output_frame_serializes_bytes_as_base64() {
     assert!(matches!(
         AttachStreamFrame::from_json_line(&encoded).expect("frame deserializes"),
         AttachStreamFrame::RawOutput { data } if data.as_slice() == [0x00, 0xff, b'A']
+    ));
+}
+
+#[test]
+fn raw_attach_input_frame_serializes_bytes_as_base64() {
+    let frame = AttachStreamFrame::raw_input(vec![0xff, 0x00, 0x1b, b'[', b'A']);
+    let encoded = frame.to_json_line().expect("frame serializes");
+
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(encoded.trim_end()).unwrap(),
+        json!({
+            "type": "raw_input",
+            "data": "/wAbW0E="
+        })
+    );
+    assert!(matches!(
+        AttachStreamFrame::from_json_line(&encoded).expect("frame deserializes"),
+        AttachStreamFrame::RawInput { data } if data.as_slice() == [0xff, 0x00, 0x1b, b'[', b'A']
     ));
 }
 

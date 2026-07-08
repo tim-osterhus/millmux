@@ -14,8 +14,8 @@ use millrace_sessions_core::{
     paths::{StatePaths, STATE_DIR_ENV},
     protocol::{
         AttachFrameType, AttachInitialReplay, AttachStreamEncoding, ControlErrorCode,
-        SessionAttachResponse, SessionInspectResponse, SessionListResponse, StreamKind,
-        StreamSetup, M1_PROTOCOL_VERSION, M2_ATTACH_PROTOCOL_VERSION,
+        SessionAttachRequest, SessionAttachResponse, SessionInspectResponse, SessionListResponse,
+        SessionSelector, StreamKind, StreamSetup, M1_PROTOCOL_VERSION, M2_ATTACH_PROTOCOL_VERSION,
     },
     state::{
         AttentionState, HostMeta, MonitorProfile, ProcessState, SessionMeta, SessionRole, SpawnMode,
@@ -102,6 +102,89 @@ fn protocol_contract_v2_attach_response_confirms_negotiated_axes() {
     assert!(!response
         .accepted_frame_types
         .contains(&AttachFrameType::StreamLagged));
+}
+
+#[test]
+fn protocol_contract_raw_attach_request_keeps_stream_and_replay_axes_separate() {
+    let session_id: SessionId = "818b61b1-a620-4a57-8e72-4d439d03840f".parse().unwrap();
+    let request = SessionAttachRequest {
+        selector: SessionSelector::Id { session_id },
+        read_only: true,
+        replay: millrace_sessions_core::protocol::AttachReplayMode::None,
+        requested_terminal_size: None,
+        client_protocol_version: Some(M2_ATTACH_PROTOCOL_VERSION),
+        accepted_frame_types: vec![
+            AttachFrameType::RawOutput,
+            AttachFrameType::StreamLagged,
+            AttachFrameType::SnapshotUnavailable,
+            AttachFrameType::ScreenSnapshot,
+        ],
+        stream_encoding: Some(AttachStreamEncoding::RawBytes),
+        initial_replay: Some(AttachInitialReplay::None),
+    };
+
+    assert!(request.requests_raw_stream());
+    assert_eq!(
+        request.negotiated_stream_encoding(),
+        Some(AttachStreamEncoding::RawBytes)
+    );
+    assert_eq!(
+        request.negotiated_initial_replay(),
+        Some(AttachInitialReplay::None)
+    );
+    assert_eq!(
+        request.negotiated_frame_types(),
+        vec![AttachFrameType::RawOutput, AttachFrameType::StreamLagged]
+    );
+    assert_eq!(
+        serde_json::to_value(&request).unwrap(),
+        json!({
+            "selector": {
+                "type": "id",
+                "session_id": "818b61b1-a620-4a57-8e72-4d439d03840f"
+            },
+            "read_only": true,
+            "replay": "none",
+            "client_protocol_version": 2,
+            "accepted_frame_types": [
+                "raw_output",
+                "stream_lagged",
+                "snapshot_unavailable",
+                "screen_snapshot"
+            ],
+            "stream_encoding": "raw_bytes",
+            "initial_replay": "none"
+        })
+    );
+}
+
+#[test]
+fn protocol_contract_raw_attach_response_confirms_fail_closed_fields() {
+    let session_id: SessionId = "818b61b1-a620-4a57-8e72-4d439d03840f".parse().unwrap();
+    let raw_response = SessionAttachResponse {
+        schema_version: M1_PROTOCOL_VERSION,
+        protocol_version: M1_PROTOCOL_VERSION,
+        session_id,
+        stream: StreamSetup {
+            stream_id: "attach-raw".to_string(),
+            kind: StreamKind::Attach,
+            read_only: true,
+            input_owner: false,
+        },
+        negotiated_attach_protocol_version: Some(M2_ATTACH_PROTOCOL_VERSION),
+        negotiated_stream_encoding: Some(AttachStreamEncoding::RawBytes),
+        negotiated_initial_replay: Some(AttachInitialReplay::None),
+        accepted_frame_types: vec![AttachFrameType::RawOutput, AttachFrameType::StreamLagged],
+    };
+    assert!(raw_response.confirms_raw_stream());
+
+    let mut downgraded = raw_response.clone();
+    downgraded.negotiated_attach_protocol_version = None;
+    assert!(!downgraded.confirms_raw_stream());
+
+    downgraded.negotiated_attach_protocol_version = Some(M2_ATTACH_PROTOCOL_VERSION);
+    downgraded.negotiated_stream_encoding = Some(AttachStreamEncoding::Text);
+    assert!(!downgraded.confirms_raw_stream());
 }
 
 #[test]

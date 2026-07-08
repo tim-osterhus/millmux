@@ -1,15 +1,16 @@
 use std::{env, path::PathBuf, str::FromStr};
 
-use clap::{Args, Parser, Subcommand};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 use millrace_sessions_core::{
     ids::{SessionId, UiId},
     paths::UI_ID_ENV,
     protocol::{
-        AttachReplayMode, DoctorRepairMode, DoctorRequest, SessionAttachRequest,
-        SessionDeleteRequest, SessionEventsRequest, SessionInspectRequest, SessionKillRequest,
-        SessionListRequest, SessionLogsRequest, SessionResizeRequest, SessionSelector,
-        SessionSendRequest, SessionStartRequest, SessionStopRequest, UiContextGetRequest,
-        UiContextListRequest,
+        AttachFrameType, AttachInitialReplay, AttachReplayMode, AttachStreamEncoding,
+        DoctorRepairMode, DoctorRequest, SessionAttachRequest, SessionDeleteRequest,
+        SessionEventsRequest, SessionInspectRequest, SessionKillRequest, SessionListRequest,
+        SessionLogsRequest, SessionResizeRequest, SessionSelector, SessionSendRequest,
+        SessionStartRequest, SessionStopRequest, UiContextGetRequest, UiContextListRequest,
+        M2_ATTACH_PROTOCOL_VERSION,
     },
     state::{MonitorProfile, SessionRole, SpawnMode},
 };
@@ -115,26 +116,104 @@ pub struct AttachArgs {
     #[arg(long)]
     pub read_only: bool,
     #[arg(long)]
+    pub raw: bool,
+    #[arg(long)]
     pub no_scrollback: bool,
+    #[arg(long, value_enum, conflicts_with = "no_scrollback")]
+    pub replay: Option<AttachReplayArg>,
 }
 
 impl AttachArgs {
     pub fn request(&self) -> Result<SessionAttachRequest, CommandError> {
+        let replay_choice = if self.no_scrollback {
+            Some(AttachReplayArg::None)
+        } else {
+            self.replay
+        };
+        let uses_v2_attach = self.raw || self.replay.is_some();
+        let initial_replay = if uses_v2_attach {
+            Some(
+                replay_choice
+                    .unwrap_or(AttachReplayArg::None)
+                    .initial_replay(),
+            )
+        } else {
+            None
+        };
+        let replay = replay_choice.map_or_else(
+            || {
+                if self.raw {
+                    AttachReplayMode::None
+                } else {
+                    AttachReplayMode::LineScrollback
+                }
+            },
+            AttachReplayArg::legacy_replay,
+        );
+        let accepted_frame_types =
+            accepted_attach_frame_types(self.raw, self.read_only, initial_replay);
+
         Ok(SessionAttachRequest {
             selector: self.selector.required()?,
             read_only: self.read_only,
-            replay: if self.no_scrollback {
-                AttachReplayMode::None
-            } else {
-                AttachReplayMode::LineScrollback
-            },
+            replay,
             requested_terminal_size: None,
-            client_protocol_version: None,
-            accepted_frame_types: Vec::new(),
-            stream_encoding: None,
-            initial_replay: None,
+            client_protocol_version: uses_v2_attach.then_some(M2_ATTACH_PROTOCOL_VERSION),
+            accepted_frame_types,
+            stream_encoding: uses_v2_attach.then_some(if self.raw {
+                AttachStreamEncoding::RawBytes
+            } else {
+                AttachStreamEncoding::Text
+            }),
+            initial_replay,
         })
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum AttachReplayArg {
+    None,
+    Raw,
+    Screen,
+}
+
+impl AttachReplayArg {
+    fn initial_replay(self) -> AttachInitialReplay {
+        match self {
+            Self::None => AttachInitialReplay::None,
+            Self::Raw => AttachInitialReplay::RawReplay,
+            Self::Screen => AttachInitialReplay::ScreenSnapshot,
+        }
+    }
+
+    fn legacy_replay(self) -> AttachReplayMode {
+        match self {
+            Self::None | Self::Screen => AttachReplayMode::None,
+            Self::Raw => AttachReplayMode::RawReplay,
+        }
+    }
+}
+
+fn accepted_attach_frame_types(
+    raw: bool,
+    read_only: bool,
+    initial_replay: Option<AttachInitialReplay>,
+) -> Vec<AttachFrameType> {
+    let mut frame_types = Vec::new();
+    if raw || initial_replay == Some(AttachInitialReplay::RawReplay) {
+        frame_types.push(AttachFrameType::RawOutput);
+    }
+    if raw && !read_only {
+        frame_types.push(AttachFrameType::RawInput);
+    }
+    if raw {
+        frame_types.push(AttachFrameType::StreamLagged);
+    }
+    if raw || initial_replay == Some(AttachInitialReplay::ScreenSnapshot) {
+        frame_types.push(AttachFrameType::SnapshotUnavailable);
+        frame_types.push(AttachFrameType::ScreenSnapshot);
+    }
+    frame_types
 }
 
 #[derive(Debug, Args)]
@@ -840,6 +919,120 @@ mod tests {
                 let request = args.request().unwrap();
                 assert!(request.read_only);
                 assert_eq!(request.replay, AttachReplayMode::LineScrollback);
+                assert_eq!(request.client_protocol_version, None);
+                assert_eq!(request.stream_encoding, None);
+                assert_eq!(request.initial_replay, None);
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn commands_build_raw_attach_request_with_independent_replay_axis() {
+        let attach = Cli::try_parse_from([
+            "millmux",
+            "attach",
+            "shell",
+            "--read-only",
+            "--raw",
+            "--replay",
+            "none",
+        ])
+        .unwrap();
+        match attach.command {
+            CliCommand::Attach(args) => {
+                let request = args.request().unwrap();
+                assert!(request.read_only);
+                assert_eq!(request.replay, AttachReplayMode::None);
+                assert_eq!(
+                    request.client_protocol_version,
+                    Some(M2_ATTACH_PROTOCOL_VERSION)
+                );
+                assert_eq!(
+                    request.stream_encoding,
+                    Some(AttachStreamEncoding::RawBytes)
+                );
+                assert_eq!(request.initial_replay, Some(AttachInitialReplay::None));
+                assert_eq!(
+                    request.accepted_frame_types,
+                    vec![
+                        AttachFrameType::RawOutput,
+                        AttachFrameType::StreamLagged,
+                        AttachFrameType::SnapshotUnavailable,
+                        AttachFrameType::ScreenSnapshot,
+                    ]
+                );
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn commands_build_attach_replay_modes_as_v2_initial_replay() {
+        for (wire, initial_replay, legacy_replay, accepted_frame_types) in [
+            (
+                "none",
+                AttachInitialReplay::None,
+                AttachReplayMode::None,
+                Vec::new(),
+            ),
+            (
+                "raw",
+                AttachInitialReplay::RawReplay,
+                AttachReplayMode::RawReplay,
+                vec![AttachFrameType::RawOutput],
+            ),
+            (
+                "screen",
+                AttachInitialReplay::ScreenSnapshot,
+                AttachReplayMode::None,
+                vec![
+                    AttachFrameType::SnapshotUnavailable,
+                    AttachFrameType::ScreenSnapshot,
+                ],
+            ),
+        ] {
+            let attach =
+                Cli::try_parse_from(["millmux", "attach", "shell", "--replay", wire]).unwrap();
+            match attach.command {
+                CliCommand::Attach(args) => {
+                    let request = args.request().unwrap();
+                    assert_eq!(request.replay, legacy_replay);
+                    assert_eq!(
+                        request.client_protocol_version,
+                        Some(M2_ATTACH_PROTOCOL_VERSION)
+                    );
+                    assert_eq!(request.stream_encoding, Some(AttachStreamEncoding::Text));
+                    assert_eq!(request.initial_replay, Some(initial_replay));
+                    assert_eq!(request.accepted_frame_types, accepted_frame_types);
+                }
+                other => panic!("unexpected command: {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn commands_build_raw_attach_defaults_to_no_initial_replay() {
+        let attach = Cli::try_parse_from(["millmux", "attach", "shell", "--raw"]).unwrap();
+        match attach.command {
+            CliCommand::Attach(args) => {
+                let request = args.request().unwrap();
+                assert_eq!(request.replay, AttachReplayMode::None);
+                assert_eq!(
+                    request.stream_encoding,
+                    Some(AttachStreamEncoding::RawBytes)
+                );
+                assert_eq!(request.initial_replay, Some(AttachInitialReplay::None));
+                assert_eq!(
+                    request.accepted_frame_types,
+                    vec![
+                        AttachFrameType::RawOutput,
+                        AttachFrameType::RawInput,
+                        AttachFrameType::StreamLagged,
+                        AttachFrameType::SnapshotUnavailable,
+                        AttachFrameType::ScreenSnapshot,
+                    ]
+                );
             }
             other => panic!("unexpected command: {other:?}"),
         }

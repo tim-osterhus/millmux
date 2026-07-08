@@ -1,4 +1,10 @@
-use std::{fs, path::Path, process::Command, thread, time::Duration};
+use std::{
+    fs,
+    path::Path,
+    process::{Command, Stdio},
+    thread,
+    time::Duration,
+};
 
 use assert_cmd::prelude::*;
 use nix::{
@@ -119,6 +125,56 @@ fn cli_smoke_send_logs_events_resize_and_stream_through_host() {
     );
     wait_for_logs(&host, &attach_id, "attach-ready");
     wait_for_attach_output(&host, &attach_id, "attach-ready");
+}
+
+#[test]
+fn cli_smoke_raw_attach_replay_none_preserves_live_bytes() {
+    let host = TempHost::new();
+    let workspace = tempfile::tempdir().expect("workspace");
+
+    let session_id = start_session(
+        &host,
+        workspace.path(),
+        "raw-attach",
+        "printf 'ready-before-raw\\n'; while [ ! -f go-raw ]; do sleep 0.05; done; printf '\\377raw-live\\n'",
+    );
+    wait_for_logs(&host, &session_id, "ready-before-raw");
+
+    let mut attach = millmux_command(&host);
+    let attach = attach
+        .args([
+            "attach",
+            &session_id,
+            "--read-only",
+            "--raw",
+            "--replay",
+            "none",
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn raw attach");
+
+    wait_for_attached_clients(&host, &session_id, 1);
+    fs::write(workspace.path().join("go-raw"), b"go").expect("release raw fixture");
+
+    let output = attach.wait_with_output().expect("wait for raw attach");
+    assert!(
+        output.status.success(),
+        "raw attach failed: status={:?} stderr={}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        contains_bytes(&output.stdout, b"\xffraw-live"),
+        "raw attach did not preserve invalid live bytes: {:?}",
+        output.stdout
+    );
+    assert!(
+        !contains_bytes(&output.stdout, b"ready-before-raw"),
+        "raw attach --replay none unexpectedly replayed legacy scrollback: {:?}",
+        output.stdout
+    );
 }
 
 #[test]
@@ -279,6 +335,29 @@ fn wait_for_attach_output(host: &TempHost, session_id: &str, needle: &str) {
         thread::sleep(Duration::from_millis(25));
     }
     panic!("attach output for {session_id} did not contain {needle:?}: {last_output}");
+}
+
+fn wait_for_attached_clients(host: &TempHost, session_id: &str, expected: u64) {
+    for _ in 0..120 {
+        let output = millmux_command(host)
+            .args(["status", session_id, "--json"])
+            .output()
+            .expect("run status");
+        if output.status.success() {
+            let value: Value = serde_json::from_slice(&output.stdout).expect("status json");
+            if value["session"]["attached_clients"] == expected {
+                return;
+            }
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
+    panic!("status for {session_id} did not report attached_clients={expected}");
+}
+
+fn contains_bytes(haystack: &[u8], needle: &[u8]) -> bool {
+    haystack
+        .windows(needle.len())
+        .any(|window| window == needle)
 }
 
 fn millmux_command(host: &TempHost) -> Command {

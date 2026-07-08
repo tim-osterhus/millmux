@@ -185,7 +185,7 @@ enum AttachObserverMessage {
 }
 
 enum AttachInputCommand {
-    Input(String),
+    Input(Vec<u8>),
     Resize { rows: u16, cols: u16 },
     Close,
 }
@@ -544,19 +544,23 @@ fn send_text(
 }
 
 fn write_pty_text(runtime: &ControlRuntime, text: &str) -> Result<usize, ControlErrorBody> {
-    let mut writer = runtime.writer.lock().expect("pty writer poisoned");
-    writer.write_all(text.as_bytes()).map_err(io_error)?;
-    writer.flush().map_err(io_error)?;
-    Ok(text.len())
+    write_pty_bytes(runtime, text.as_bytes())
 }
 
-fn write_pty_text_cancellable(
+fn write_pty_bytes(runtime: &ControlRuntime, bytes: &[u8]) -> Result<usize, ControlErrorBody> {
+    let mut writer = runtime.writer.lock().expect("pty writer poisoned");
+    writer.write_all(bytes).map_err(io_error)?;
+    writer.flush().map_err(io_error)?;
+    Ok(bytes.len())
+}
+
+fn write_pty_bytes_cancellable(
     runtime: &ControlRuntime,
-    text: &str,
+    bytes: &[u8],
     closed: &AtomicBool,
 ) -> Result<usize, ControlErrorBody> {
     let mut bytes_sent = 0;
-    for chunk in text.as_bytes().chunks(ATTACH_INPUT_WRITE_CHUNK) {
+    for chunk in bytes.chunks(ATTACH_INPUT_WRITE_CHUNK) {
         if closed.load(Ordering::SeqCst) {
             break;
         }
@@ -1091,8 +1095,10 @@ fn write_attach_input_loop(
 ) {
     for command in input_receiver {
         let result = match command {
-            AttachInputCommand::Input(text) => write_pty_text_cancellable(&runtime, &text, &closed)
-                .map(|bytes_sent| WorkerSendResponse { bytes_sent }),
+            AttachInputCommand::Input(bytes) => {
+                write_pty_bytes_cancellable(&runtime, &bytes, &closed)
+                    .map(|bytes_sent| WorkerSendResponse { bytes_sent })
+            }
             AttachInputCommand::Resize { rows, cols } => {
                 resize_pty(&runtime, WorkerResizeRequest { rows, cols })
                     .map(|_| WorkerSendResponse { bytes_sent: 0 })
@@ -1133,33 +1139,7 @@ fn handle_attach_input_line(
 
     match frame {
         AttachStreamFrame::Input { text } => {
-            let input_len = text.len();
-            if input_len > ATTACH_INPUT_MAX_BYTES {
-                let _ = write_attach_error_locked(
-                    writer,
-                    ControlErrorBody::new(
-                        ControlErrorCode::InvalidRequest,
-                        format!(
-                            "attach input frame is {} bytes; maximum is {}",
-                            input_len, ATTACH_INPUT_MAX_BYTES
-                        ),
-                    ),
-                );
-                return false;
-            }
-            if accepted_input_bytes.saturating_add(input_len) > ATTACH_INPUT_MAX_TOTAL_BYTES {
-                let _ = write_attach_error_locked(
-                    writer,
-                    ControlErrorBody::new(
-                        ControlErrorCode::InvalidRequest,
-                        format!(
-                            "attach input stream would exceed {} accepted bytes",
-                            ATTACH_INPUT_MAX_TOTAL_BYTES
-                        ),
-                    ),
-                );
-                return false;
-            }
+            let bytes = text.into_bytes();
             let allowed = {
                 let state = runtime.state.lock().expect("control state poisoned");
                 state.send_is_allowed(Some(&params.stream_id))
@@ -1168,29 +1148,23 @@ fn handle_attach_input_line(
                 let _ = write_attach_error_locked(writer, error);
                 return false;
             }
-            match input_sender.try_send(AttachInputCommand::Input(text)) {
-                Ok(()) => {
-                    *accepted_input_bytes += input_len;
-                }
-                Err(TrySendError::Full(_)) => {
-                    let _ = write_attach_error_locked(
-                        writer,
-                        ControlErrorBody::new(
-                            ControlErrorCode::WorkerUnavailable,
-                            "attach input queue is full",
-                        ),
-                    );
-                }
-                Err(TrySendError::Disconnected(_)) => {
-                    let _ = write_attach_error_locked(
-                        writer,
-                        ControlErrorBody::new(
-                            ControlErrorCode::WorkerUnavailable,
-                            "attach input writer is unavailable",
-                        ),
-                    );
-                    return true;
-                }
+            if queue_attach_input_bytes(writer, input_sender, accepted_input_bytes, bytes) {
+                return true;
+            }
+            false
+        }
+        AttachStreamFrame::RawInput { data } => {
+            let allowed = {
+                let state = runtime.state.lock().expect("control state poisoned");
+                validate_raw_input_allowed(&state, params)
+            };
+            if let Err(error) = allowed {
+                let _ = write_attach_error_locked(writer, error);
+                return false;
+            }
+            if queue_attach_input_bytes(writer, input_sender, accepted_input_bytes, data.into_vec())
+            {
+                return true;
             }
             false
         }
@@ -1229,6 +1203,101 @@ fn handle_attach_input_line(
             true
         }
         _ => false,
+    }
+}
+
+fn validate_raw_input_allowed(
+    state: &ControlState,
+    params: &WorkerAttachRequest,
+) -> Result<(), ControlErrorBody> {
+    if params.negotiated_attach_protocol_version().is_none()
+        || params.negotiated_stream_encoding() != Some(AttachStreamEncoding::RawBytes)
+        || !params
+            .negotiated_frame_types()
+            .contains(&AttachFrameType::RawOutput)
+    {
+        return Err(ControlErrorBody::new(
+            ControlErrorCode::InvalidRequest,
+            "raw_input requires a negotiated raw byte attach stream",
+        ));
+    }
+    if params.read_only {
+        return Err(ControlErrorBody::new(
+            ControlErrorCode::InvalidRequest,
+            "raw_input is not allowed on read-only attach streams",
+        ));
+    }
+    if !params
+        .negotiated_frame_types()
+        .contains(&AttachFrameType::RawInput)
+    {
+        return Err(ControlErrorBody::new(
+            ControlErrorCode::InvalidRequest,
+            "raw_input requires negotiated raw_input support",
+        ));
+    }
+    state.send_is_allowed(Some(&params.stream_id))
+}
+
+fn queue_attach_input_bytes(
+    writer: &Arc<Mutex<UnixStream>>,
+    input_sender: &SyncSender<AttachInputCommand>,
+    accepted_input_bytes: &mut usize,
+    bytes: Vec<u8>,
+) -> bool {
+    let input_len = bytes.len();
+    if input_len > ATTACH_INPUT_MAX_BYTES {
+        let _ = write_attach_error_locked(
+            writer,
+            ControlErrorBody::new(
+                ControlErrorCode::InvalidRequest,
+                format!(
+                    "attach input frame is {} bytes; maximum is {}",
+                    input_len, ATTACH_INPUT_MAX_BYTES
+                ),
+            ),
+        );
+        return false;
+    }
+    if accepted_input_bytes.saturating_add(input_len) > ATTACH_INPUT_MAX_TOTAL_BYTES {
+        let _ = write_attach_error_locked(
+            writer,
+            ControlErrorBody::new(
+                ControlErrorCode::InvalidRequest,
+                format!(
+                    "attach input stream would exceed {} accepted bytes",
+                    ATTACH_INPUT_MAX_TOTAL_BYTES
+                ),
+            ),
+        );
+        return false;
+    }
+
+    match input_sender.try_send(AttachInputCommand::Input(bytes)) {
+        Ok(()) => {
+            *accepted_input_bytes += input_len;
+            false
+        }
+        Err(TrySendError::Full(_)) => {
+            let _ = write_attach_error_locked(
+                writer,
+                ControlErrorBody::new(
+                    ControlErrorCode::WorkerUnavailable,
+                    "attach input queue is full",
+                ),
+            );
+            false
+        }
+        Err(TrySendError::Disconnected(_)) => {
+            let _ = write_attach_error_locked(
+                writer,
+                ControlErrorBody::new(
+                    ControlErrorCode::WorkerUnavailable,
+                    "attach input writer is unavailable",
+                ),
+            );
+            true
+        }
     }
 }
 
@@ -1583,5 +1652,73 @@ mod tests {
             attach_live_output_frame(&request, b"\xfflive".to_vec()),
             AttachStreamFrame::RawOutput { data } if data.as_slice() == b"\xfflive"
         ));
+    }
+
+    #[test]
+    fn worker_raw_input_requires_negotiated_writable_owner_stream() {
+        let mut state = ControlState::default();
+        let mut request = raw_worker_attach_request("raw-owner", false);
+
+        request.client_protocol_version = None;
+        assert_eq!(
+            validate_raw_input_allowed(&state, &request)
+                .unwrap_err()
+                .code,
+            ControlErrorCode::InvalidRequest
+        );
+
+        request = raw_worker_attach_request("raw-owner", false);
+        request.stream_encoding = Some(AttachStreamEncoding::Text);
+        assert_eq!(
+            validate_raw_input_allowed(&state, &request)
+                .unwrap_err()
+                .code,
+            ControlErrorCode::InvalidRequest
+        );
+
+        request = raw_worker_attach_request("raw-owner", true);
+        assert_eq!(
+            validate_raw_input_allowed(&state, &request)
+                .unwrap_err()
+                .code,
+            ControlErrorCode::InvalidRequest
+        );
+
+        request = raw_worker_attach_request("raw-owner", false);
+        request.accepted_frame_types = vec![AttachFrameType::RawOutput];
+        assert_eq!(
+            validate_raw_input_allowed(&state, &request)
+                .unwrap_err()
+                .code,
+            ControlErrorCode::InvalidRequest
+        );
+
+        state.acquire_attach("other-owner", false).unwrap();
+        request = raw_worker_attach_request("raw-owner", false);
+        assert_eq!(
+            validate_raw_input_allowed(&state, &request)
+                .unwrap_err()
+                .code,
+            ControlErrorCode::InputOwnerConflict
+        );
+
+        state.release_attach("other-owner");
+        state.acquire_attach("raw-owner", false).unwrap();
+        validate_raw_input_allowed(&state, &request).unwrap();
+    }
+
+    fn raw_worker_attach_request(stream_id: &str, read_only: bool) -> WorkerAttachRequest {
+        WorkerAttachRequest {
+            stream_id: stream_id.to_string(),
+            read_only,
+            replay: AttachReplayMode::None,
+            requested_terminal_size: None,
+            client_protocol_version: Some(
+                millrace_sessions_core::protocol::M2_ATTACH_PROTOCOL_VERSION,
+            ),
+            accepted_frame_types: vec![AttachFrameType::RawOutput, AttachFrameType::RawInput],
+            stream_encoding: Some(AttachStreamEncoding::RawBytes),
+            initial_replay: Some(AttachInitialReplay::None),
+        }
     }
 }

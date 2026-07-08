@@ -80,6 +80,8 @@ Start any durable PTY session:
 ```bash
 millmux start --name shell --role shell --cwd "$PWD" -- bash
 millmux attach shell
+# For byte-exact terminal output, especially shells and TUIs:
+millmux attach shell --raw
 ```
 
 Start and inspect a long-running command:
@@ -170,6 +172,7 @@ do not keep stale owner values.
 | `millmux start -- ...` | Start an explicit argv in a durable PTY session. |
 | `millmux start --spawn-mode pipe -- ...` | Start an explicit argv without a PTY; capture stdout/stderr separately. |
 | `millmux attach <session>` | Attach to a session without tying process lifetime to the attaching terminal. |
+| `millmux attach <session> --raw` | Negotiate v2 raw-byte output for byte-exact shell/TUI fidelity. |
 | `millmux send <session> --text ...` | Send input to the PTY. |
 | `millmux resize <session> --rows N --cols N` | Resize the hosted PTY. |
 | `millmux logs <session>` | Read or follow PTY output or stream-tagged pipe output. |
@@ -463,11 +466,22 @@ attach frames such as `stream_lagged`, `screen_snapshot`, or
 `snapshot_unavailable`.
 
 Legacy raw replay/checkpoint responses may still use `RawOutput` for initial
-replay bytes. Public host `session.attach` live-output streams require v2
-negotiation with `stream_encoding = "raw_bytes"` and a negotiated
-`raw_output` frame type. The lower-level worker observe path remains a legacy
-internal control surface until the worker-backed streaming batch folds it into
-the same capability gate.
+replay bytes. Public host `session.attach` raw streams require v2 negotiation
+with `stream_encoding = "raw_bytes"` and negotiated `raw_output`; writable raw
+streams also require negotiated `raw_input`.
+
+Human terminal fidelity should use `millmux attach <session> --raw`. Raw attach
+requests `stream_encoding = "raw_bytes"` independently from the initial replay
+choice: `--raw --replay none` still renders byte-exact live output, while
+`--replay raw` requests bounded raw replay bytes and `--replay screen` requests
+the structured screen surface when available. Raw clients fail closed if the
+host response does not confirm v2 raw-byte negotiation. Raw stdin bytes are sent
+as `raw_input` frames with base64 data, so invalid UTF-8, NUL bytes, ESC
+sequences, and Ctrl-C (`0x03`) pass through to the hosted PTY when the local
+terminal is in raw/no-canonical/no-echo mode. External SIGINT or stream close
+detaches the client. Raw attach requests the current terminal size when
+available and forwards window-size changes as resize frames. Legacy
+`millmux attach <session>` keeps line scrollback behavior for compatibility.
 
 ## Evidence
 

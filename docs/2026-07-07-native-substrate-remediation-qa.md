@@ -2,9 +2,10 @@
 
 Date: 2026-07-07
 
-Status: Batch 0 baseline, Batch 2 pipe-mode substrate, and Batch 3 lifecycle
-recovery verified in a clean Windows handoff linked worktree. Batch 2 and
-Batch 3 evidence were appended on 2026-07-08 UTC from WSL/Linux.
+Status: Batch 0 baseline, Batch 2 pipe-mode substrate, Batch 3 lifecycle
+recovery, and Batch 4 Packet 02 raw attach byte/resize fidelity verified in a
+clean Windows handoff linked worktree. Batch 2, Batch 3, and Batch 4 evidence
+were appended on 2026-07-08 UTC from WSL/Linux.
 
 ## Scope And Baseline
 
@@ -14,10 +15,11 @@ compatibility gate for future attach remediation. Batch 2 adds the opt-in
 summary shapes, persisted stop request metadata, and real Millrace daemon
 dogfood. Batch 3 adds lifecycle recovery invariants for client loss and
 `sessiond` restart, separates worker/child liveness, records orphaned-child
-diagnostics, and captures MVP handoff evidence.
+diagnostics, and captures MVP handoff evidence. Batch 4 Packet 02 adds
+negotiated raw byte input and resize fidelity for raw human attach.
 
-It does not claim raw attach UX, structured screen snapshots, or cockpit
-boundary follow-up work.
+It does not claim structured screen snapshots or cockpit boundary follow-up
+work.
 
 ## Checkout Identity
 
@@ -132,7 +134,46 @@ Deferred to Batch 1.
 
 ## Raw Attach Evidence
 
-Deferred to Batch 4.
+Batch 4 Packet 02 implemented negotiated byte-exact raw attach input and resize
+fidelity on top of the v2 attach stream:
+
+- `raw_input` frames carry base64 bytes and are accepted only on negotiated
+  v2 raw-byte, writable, input-owner attach streams;
+- legacy text input remains available for non-raw attach streams;
+- raw attach live output stays in `raw_output` frames and preserves invalid
+  UTF-8 and terminal control bytes;
+- `millmux attach --raw` requests the current terminal size when available,
+  puts writable local TTY input in raw/no-canonical/no-echo mode, sends stdin
+  bytes as `raw_input`, forwards window-change resizes, and restores terminal
+  mode on drop;
+- Ctrl-C in raw terminal mode is pass-through byte `0x03`; external SIGINT or
+  stream close detaches the client.
+
+Packet-named verification filters observed passing under WSL:
+
+```text
+cargo test -p millrace-sessions-worker --test pty raw
+  pass; 0 passed, 2 filtered out
+
+cargo test -p millrace-sessions-host --test session_lifecycle raw
+  pass; 6 passed
+
+cargo test -p millrace-sessions --test attach_smoke raw
+  pass; 1 passed
+
+cargo test --workspace raw
+  pass
+
+cargo fmt --all --check
+  pass
+```
+
+Deterministic raw attach fixtures cover invalid child output bytes, invalid
+stdin bytes, NUL, ESC cursor/control sequences, raw Ctrl-C byte forwarding,
+initial requested rows/cols, post-attach resize, read-only rejection, non-raw
+rejection, non-negotiated rejection, and input-owner conflict. Evidence is WSL
+PTY-only in this handoff checkout; macOS Terminal.app and SSH terminal matrix
+checks were not executable from this runner and are not claimed.
 
 ## Screen API Evidence
 
@@ -561,8 +602,8 @@ archived as
 
 ## Release / Publish Statement
 
-Batch 0, Batch 2, and Batch 3 do not tag, publish crates, switch daemon
-defaults, or push a canonical release branch from this Windows handoff
+Batch 0, Batch 2, Batch 3, and Batch 4 do not tag, publish crates, switch
+daemon defaults, or push a canonical release branch from this Windows handoff
 checkout.
 
 Batch 3 implementation branch:
