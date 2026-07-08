@@ -258,6 +258,75 @@ fn doctor_archive_preserves_unsafe_agent_terminal_evidence() {
 }
 
 #[test]
+fn doctor_reports_attach_stream_lagged_events() {
+    let temp = tempfile::tempdir().unwrap();
+    let paths = prepared_state(temp.path());
+    let session = sample_meta(ProcessState::Exited, temp.path());
+    write_session(&paths, &session, None, true);
+    let session_paths = paths.session_paths(session.id);
+
+    let mut lagged = SessionEvent::new(session.id, SessionEventKind::AttachStreamLagged);
+    lagged
+        .fields
+        .insert("stream_id".to_string(), "stream-slow".to_string());
+    lagged
+        .fields
+        .insert("dropped_bytes".to_string(), "4096".to_string());
+    lagged
+        .fields
+        .insert("dropped_from_offset".to_string(), "128".to_string());
+    lagged
+        .fields
+        .insert("dropped_to_offset".to_string(), "4224".to_string());
+    lagged
+        .fields
+        .insert("current_pty_log_offset".to_string(), "8192".to_string());
+    lagged
+        .fields
+        .insert("reason".to_string(), "observer_backpressure".to_string());
+    millrace_sessions_core::events::append_event(&session_paths.events_jsonl, &lagged).unwrap();
+
+    let report = run_doctor(&paths, None, &DoctorRequest::default()).unwrap();
+    let issue = issue_by_code(&report, "attach_stream_lagged");
+    assert_eq!(issue.severity, DoctorSeverity::Warning);
+    assert_eq!(issue.session_id, Some(session.id));
+    assert_eq!(issue.path.as_ref(), Some(&session_paths.events_jsonl));
+    assert!(issue
+        .suggested_action
+        .as_deref()
+        .unwrap_or_default()
+        .contains("raw replay"));
+    assert_eq!(
+        issue
+            .details
+            .as_ref()
+            .and_then(|details| details.get("lag_event_count")),
+        Some(&json!(1))
+    );
+    assert_eq!(
+        issue
+            .details
+            .as_ref()
+            .and_then(|details| details.get("last_dropped_from_offset")),
+        Some(&json!("128"))
+    );
+    assert_eq!(
+        issue
+            .details
+            .as_ref()
+            .and_then(|details| details.get("last_dropped_to_offset")),
+        Some(&json!("4224"))
+    );
+    assert_eq!(
+        issue
+            .details
+            .as_ref()
+            .and_then(|details| details.get("reason")),
+        Some(&json!("observer_backpressure"))
+    );
+}
+
+#[test]
 fn doctor_close_stale_ui_contexts_preserves_live_contexts_and_session_artifacts() {
     let temp = tempfile::tempdir().unwrap();
     let paths = prepared_state(temp.path());

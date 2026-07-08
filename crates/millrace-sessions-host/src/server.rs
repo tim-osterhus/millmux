@@ -19,7 +19,6 @@ use millrace_sessions_core::{
     ids::{SessionId, UiId},
     paths::{state_paths, StatePaths},
     protocol::{
-        AttachFrameType, AttachInitialReplay, AttachReplayMode, AttachStreamEncoding,
         AttachStreamFrame, ControlErrorBody, ControlErrorCode, ControlResponse, DoctorRequest,
         EventStreamFrame, HostStatusRequest, HostStatusResponse, LogLine, LogStreamFrame,
         SessionAttachRequest, SessionAttachResponse, SessionDeleteRequest, SessionDeleteResponse,
@@ -27,15 +26,13 @@ use millrace_sessions_core::{
         SessionKillRequest, SessionKillResponse, SessionListRequest, SessionListResponse,
         SessionLogsRequest, SessionLogsResponse, SessionResizeRequest, SessionResizeResponse,
         SessionSendRequest, SessionSendResponse, SessionStartRequest, SessionStartResponse,
-        SessionStopRequest, SessionStopResponse, SessionSummary, SnapshotUnavailableReason,
-        StreamKind, StreamSetup, TerminalDimensions, UiContextCloseRequest, UiContextCloseResponse,
-        UiContextGetRequest, UiContextGetResponse, UiContextListEntry, UiContextListRequest,
-        UiContextListResponse, UiContextSetRequest, UiContextSetResponse, WorkerAckResponse,
-        WorkerAttachRequest, WorkerAttachResponse, WorkerControlMethod, WorkerControlRequest,
-        WorkerControlResponse, WorkerReleaseAttachRequest, WorkerResizeRequest,
+        SessionStopRequest, SessionStopResponse, SessionSummary, StreamKind, StreamSetup,
+        UiContextCloseRequest, UiContextCloseResponse, UiContextGetRequest, UiContextGetResponse,
+        UiContextListEntry, UiContextListRequest, UiContextListResponse, UiContextSetRequest,
+        UiContextSetResponse, WorkerAckResponse, WorkerAttachRequest, WorkerAttachResponse,
+        WorkerControlMethod, WorkerControlRequest, WorkerControlResponse, WorkerResizeRequest,
         WorkerResizeResponse, WorkerSendRequest, WorkerSendResponse, M1_PROTOCOL_VERSION,
     },
-    scrollback::{restore_terminal_replay, ScrollbackBuffer},
     state::{
         AttentionState, HostMeta, MonitorProfile, ProcessState, SessionMeta, SessionPaths,
         SessionRole, UiContext, UiContextPaths, UiEvent, UiEventKind, WorkerMeta,
@@ -1868,7 +1865,7 @@ async fn handle_events_follow_stream(
 
 async fn handle_attach_stream(
     request: millrace_sessions_core::protocol::ControlRequest,
-    mut lines: Lines<TokioBufReader<OwnedReadHalf>>,
+    lines: Lines<TokioBufReader<OwnedReadHalf>>,
     mut writer: OwnedWriteHalf,
     paths: &StatePaths,
 ) -> Result<(), HostServerError> {
@@ -1888,8 +1885,8 @@ async fn handle_attach_stream(
         }
     };
 
-    let opened = match open_attach(paths, &params) {
-        Ok(opened) => opened,
+    let worker_stream = match open_worker_attach(paths, &params).await {
+        Ok(worker_stream) => worker_stream,
         Err(error) => {
             writer
                 .write_all(
@@ -1903,61 +1900,39 @@ async fn handle_attach_stream(
         }
     };
 
+    let WorkerAttachStream {
+        opened,
+        lines: mut worker_lines,
+        writer: mut worker_writer,
+    } = worker_stream;
     let cleanup = AttachCleanupGuard::new(opened);
 
     let response = ControlResponse::success(request.id, &cleanup.opened().response)?;
-    writer
-        .write_all(response.to_json_line()?.as_bytes())
-        .await?;
-    writer.flush().await?;
-
-    let mut offset = attach_initial_offset(cleanup.opened(), &params, &mut writer).await?;
-
-    loop {
-        tokio::select! {
-            input = lines.next_line() => {
-                match input? {
-                    Some(line) => {
-                        if handle_attach_input_frame(&line, cleanup.opened(), &mut writer).await? {
-                            break;
-                        }
-                    }
-                    None => break,
-                }
-            }
-            _ = sleep(FOLLOW_POLL) => {
-                let next = match read_from_offset(&cleanup.opened().paths.pty_log, offset) {
-                    Ok((bytes, new_offset)) => {
-                        offset = new_offset;
-                        bytes
-                    }
-                    Err(_) => Vec::new(),
-                };
-                if !next.is_empty() {
-                    let frame = attach_live_output_frame(&params, next);
-                    if writer.write_all(frame.to_json_line()?.as_bytes()).await.is_err() {
-                        break;
-                    }
-                    writer.flush().await?;
-                } else if session_is_terminal(&cleanup.opened().paths.meta_json) {
-                    break;
-                }
-            }
+    let response_line = response.to_json_line()?;
+    if writer.write_all(response_line.as_bytes()).await.is_err() || writer.flush().await.is_err() {
+        let _ = worker_writer.shutdown().await;
+        if drain_worker_attach_close(&mut worker_lines).await? {
+            cleanup.close();
         }
+        return Ok(());
     }
 
-    cleanup.close();
-    let frame = AttachStreamFrame::Closed;
-    let _ = writer.write_all(frame.to_json_line()?.as_bytes()).await;
-    let _ = writer.flush().await;
+    if proxy_attach_stream(lines, writer, worker_lines, worker_writer).await? {
+        cleanup.close();
+    }
     Ok(())
 }
 
 struct OpenAttach {
     paths: SessionPaths,
     stream_id: String,
-    input_owner: bool,
     response: SessionAttachResponse,
+}
+
+struct WorkerAttachStream {
+    opened: OpenAttach,
+    lines: Lines<TokioBufReader<OwnedReadHalf>>,
+    writer: OwnedWriteHalf,
 }
 
 struct AttachCleanupGuard {
@@ -1979,210 +1954,82 @@ impl AttachCleanupGuard {
 
     fn close(mut self) {
         if let Some(opened) = self.opened.take() {
-            close_attach(&opened);
+            record_attach_closed(&opened);
         }
     }
 }
 
 impl Drop for AttachCleanupGuard {
-    fn drop(&mut self) {
-        if let Some(opened) = self.opened.take() {
-            close_attach(&opened);
-        }
-    }
+    fn drop(&mut self) {}
 }
 
-async fn attach_initial_offset(
-    opened: &OpenAttach,
-    request: &SessionAttachRequest,
-    writer: &mut OwnedWriteHalf,
-) -> Result<u64, HostServerError> {
-    if opened.response.negotiated_attach_protocol_version.is_some() {
-        return attach_negotiated_initial_offset(opened, request, writer).await;
-    }
-
-    attach_legacy_initial_offset(
-        opened,
-        request.replay,
-        request.requested_terminal_size,
-        writer,
-    )
-    .await
-}
-
-async fn attach_negotiated_initial_offset(
-    opened: &OpenAttach,
-    request: &SessionAttachRequest,
-    writer: &mut OwnedWriteHalf,
-) -> Result<u64, HostServerError> {
-    match opened.response.negotiated_initial_replay {
-        None | Some(AttachInitialReplay::None) => Ok(file_len(&opened.paths.pty_log)),
-        Some(AttachInitialReplay::LineScrollback) => {
-            attach_line_scrollback(opened, writer).await?;
-            Ok(file_len(&opened.paths.pty_log))
-        }
-        Some(AttachInitialReplay::RawReplay) => {
-            attach_raw_initial_replay(opened, request.requested_terminal_size, writer).await
-        }
-        Some(AttachInitialReplay::ScreenSnapshot) => {
-            if opened
-                .response
-                .accepted_frame_types
-                .contains(&AttachFrameType::SnapshotUnavailable)
-            {
-                let frame = AttachStreamFrame::SnapshotUnavailable {
-                    reason: SnapshotUnavailableReason::TerminalModelUnavailable,
-                    details: Some(json!({
-                        "message": "screen_snapshot attach replay is not implemented by this host"
-                    })),
-                };
-                writer.write_all(frame.to_json_line()?.as_bytes()).await?;
-                writer.flush().await?;
-            }
-            Ok(file_len(&opened.paths.pty_log))
-        }
-    }
-}
-
-async fn attach_legacy_initial_offset(
-    opened: &OpenAttach,
-    replay: AttachReplayMode,
-    requested_terminal_size: Option<TerminalDimensions>,
-    writer: &mut OwnedWriteHalf,
-) -> Result<u64, HostServerError> {
-    match replay {
-        AttachReplayMode::None => Ok(file_len(&opened.paths.pty_log)),
-        AttachReplayMode::LineScrollback => {
-            attach_line_scrollback(opened, writer).await?;
-            Ok(file_len(&opened.paths.pty_log))
-        }
-        AttachReplayMode::RawReplay | AttachReplayMode::TerminalSnapshot => {
-            attach_legacy_raw_initial_replay(opened, replay, requested_terminal_size, writer).await
-        }
-    }
-}
-
-async fn attach_line_scrollback(
-    opened: &OpenAttach,
-    writer: &mut OwnedWriteHalf,
-) -> Result<(), HostServerError> {
-    if let Ok(scrollback) = ScrollbackBuffer::restore_snapshot(&opened.paths.scrollback_snapshot) {
-        let frame = AttachStreamFrame::Scrollback {
-            lines: scrollback.lines(),
-        };
-        writer.write_all(frame.to_json_line()?.as_bytes()).await?;
-        writer.flush().await?;
-    }
-    Ok(())
-}
-
-async fn attach_raw_initial_replay(
-    opened: &OpenAttach,
-    requested_terminal_size: Option<TerminalDimensions>,
-    writer: &mut OwnedWriteHalf,
-) -> Result<u64, HostServerError> {
-    let offset = file_len(&opened.paths.pty_log);
-    if let Some(restored) = restore_terminal_replay(
-        &opened.paths.terminal_snapshot,
-        &opened.paths.raw_replay_ring,
-        offset,
-    )
-    .unwrap_or(None)
-    {
-        if replay_matches_requested_size(
-            AttachReplayMode::RawReplay,
-            requested_terminal_size,
-            &restored.snapshot,
-        ) && !restored.bytes.is_empty()
-        {
-            let frame = AttachStreamFrame::raw_output(restored.bytes);
-            writer.write_all(frame.to_json_line()?.as_bytes()).await?;
-            writer.flush().await?;
-        }
-    }
-    Ok(offset)
-}
-
-async fn attach_legacy_raw_initial_replay(
-    opened: &OpenAttach,
-    replay: AttachReplayMode,
-    requested_terminal_size: Option<TerminalDimensions>,
-    writer: &mut OwnedWriteHalf,
-) -> Result<u64, HostServerError> {
-    let offset = file_len(&opened.paths.pty_log);
-    if let Some(restored) = restore_terminal_replay(
-        &opened.paths.terminal_snapshot,
-        &opened.paths.raw_replay_ring,
-        offset,
-    )
-    .unwrap_or(None)
-    {
-        if replay_matches_requested_size(replay, requested_terminal_size, &restored.snapshot)
-            && !restored.bytes.is_empty()
-        {
-            let frame = attach_initial_output_frame(replay, restored.bytes);
-            writer.write_all(frame.to_json_line()?.as_bytes()).await?;
-            writer.flush().await?;
-        }
-    }
-    Ok(offset)
-}
-
-fn replay_matches_requested_size(
-    replay: AttachReplayMode,
-    requested_terminal_size: Option<TerminalDimensions>,
-    snapshot: &millrace_sessions_core::scrollback::TerminalSnapshot,
-) -> bool {
-    match (replay, requested_terminal_size) {
-        (AttachReplayMode::RawReplay, None) => true,
-        (AttachReplayMode::RawReplay | AttachReplayMode::TerminalSnapshot, Some(size)) => {
-            snapshot.same_size(size.rows, size.cols)
-        }
-        (AttachReplayMode::TerminalSnapshot, None) => false,
-        _ => true,
-    }
-}
-
-fn attach_initial_output_frame(replay: AttachReplayMode, bytes: Vec<u8>) -> AttachStreamFrame {
-    if replay.uses_raw_payloads() {
-        AttachStreamFrame::raw_output(bytes)
-    } else {
-        AttachStreamFrame::Output {
-            text: String::from_utf8_lossy(&bytes).to_string(),
-        }
-    }
-}
-
-fn attach_live_output_frame(request: &SessionAttachRequest, bytes: Vec<u8>) -> AttachStreamFrame {
-    if request.negotiated_stream_encoding() == Some(AttachStreamEncoding::RawBytes)
-        && request
-            .negotiated_frame_types()
-            .contains(&AttachFrameType::RawOutput)
-    {
-        AttachStreamFrame::raw_output(bytes)
-    } else {
-        AttachStreamFrame::Output {
-            text: String::from_utf8_lossy(&bytes).to_string(),
-        }
-    }
-}
-
-fn open_attach(
+async fn open_worker_attach(
     paths: &StatePaths,
     request: &SessionAttachRequest,
-) -> Result<OpenAttach, ControlErrorBody> {
+) -> Result<WorkerAttachStream, ControlErrorBody> {
     let inspected = resolve_running_session(paths, &request.selector)?;
     let stream_id = next_stream_id();
-    let worker: WorkerAttachResponse = worker_request(
-        &inspected.paths,
-        WorkerControlMethod::AcquireAttach,
-        &WorkerAttachRequest {
-            stream_id: stream_id.clone(),
-            read_only: request.read_only,
-            replay: request.replay,
-            requested_terminal_size: request.requested_terminal_size,
-        },
-    )?;
+    let worker_params = WorkerAttachRequest {
+        stream_id: stream_id.clone(),
+        read_only: request.read_only,
+        replay: request.replay,
+        requested_terminal_size: request.requested_terminal_size,
+        client_protocol_version: request.client_protocol_version,
+        accepted_frame_types: request.accepted_frame_types.clone(),
+        stream_encoding: request.stream_encoding,
+        initial_replay: request.initial_replay,
+    };
+    let worker_request_id = next_stream_id();
+    let worker_request = WorkerControlRequest::with_params(
+        worker_request_id.clone(),
+        WorkerControlMethod::ObserveAttach,
+        &worker_params,
+    )
+    .map_err(control_json_error)?;
+    let mut worker_stream = connect_worker_stream(&inspected.paths.worker_sock).await?;
+    worker_stream
+        .write_all(
+            worker_request
+                .to_json_line()
+                .map_err(control_json_error)?
+                .as_bytes(),
+        )
+        .await
+        .map_err(control_io_error)?;
+    worker_stream.flush().await.map_err(control_io_error)?;
+
+    let (worker_reader, worker_writer) = worker_stream.into_split();
+    let mut worker_lines = TokioBufReader::new(worker_reader).lines();
+    let response_line = worker_lines
+        .next_line()
+        .await
+        .map_err(control_io_error)?
+        .ok_or_else(|| {
+            ControlErrorBody::new(
+                ControlErrorCode::WorkerUnavailable,
+                "worker closed attach stream before responding",
+            )
+        })?;
+    let worker_response =
+        WorkerControlResponse::from_json_line(&response_line).map_err(control_json_error)?;
+    if worker_response.id != worker_request_id {
+        return Err(ControlErrorBody::new(
+            ControlErrorCode::WorkerUnavailable,
+            format!(
+                "worker response id {} did not match request id {worker_request_id}",
+                worker_response.id
+            ),
+        ));
+    }
+    if !worker_response.ok {
+        return Err(worker_response.error.unwrap_or_else(|| {
+            ControlErrorBody::new(
+                ControlErrorCode::WorkerUnavailable,
+                "worker returned an error without an error body",
+            )
+        }));
+    }
+    let worker: WorkerAttachResponse = worker_response.result_as().map_err(control_json_error)?;
 
     let mut event = SessionEvent::new(inspected.session.session_id, SessionEventKind::AttachOpened);
     event
@@ -2217,91 +2064,122 @@ fn open_attach(
             read_only: worker.read_only,
             input_owner: worker.input_owner,
         },
-        negotiated_attach_protocol_version: request.negotiated_attach_protocol_version(),
-        negotiated_stream_encoding: request.negotiated_stream_encoding(),
-        negotiated_initial_replay: request.negotiated_initial_replay(),
-        accepted_frame_types: request.negotiated_frame_types(),
+        negotiated_attach_protocol_version: worker.negotiated_attach_protocol_version,
+        negotiated_stream_encoding: worker.negotiated_stream_encoding,
+        negotiated_initial_replay: worker.negotiated_initial_replay,
+        accepted_frame_types: worker.accepted_frame_types,
     };
 
-    Ok(OpenAttach {
-        paths: inspected.paths,
-        stream_id,
-        input_owner: worker.input_owner,
-        response,
+    Ok(WorkerAttachStream {
+        opened: OpenAttach {
+            paths: inspected.paths,
+            stream_id,
+            response,
+        },
+        lines: worker_lines,
+        writer: worker_writer,
     })
 }
 
-async fn handle_attach_input_frame(
-    line: &str,
-    opened: &OpenAttach,
-    writer: &mut OwnedWriteHalf,
+async fn proxy_attach_stream(
+    mut client_lines: Lines<TokioBufReader<OwnedReadHalf>>,
+    mut client_writer: OwnedWriteHalf,
+    mut worker_lines: Lines<TokioBufReader<OwnedReadHalf>>,
+    mut worker_writer: OwnedWriteHalf,
 ) -> Result<bool, HostServerError> {
-    let frame = match AttachStreamFrame::from_json_line(line) {
-        Ok(frame) => frame,
-        Err(error) => {
-            let frame = AttachStreamFrame::Error {
-                error: ControlErrorBody::new(
-                    ControlErrorCode::InvalidRequest,
-                    format!("invalid attach stream frame: {error}"),
-                ),
-            };
-            writer.write_all(frame.to_json_line()?.as_bytes()).await?;
-            writer.flush().await?;
-            return Ok(false);
-        }
-    };
-
-    match frame {
-        AttachStreamFrame::Input { text } => {
-            if !opened.input_owner {
-                let frame = AttachStreamFrame::Error {
-                    error: ControlErrorBody::new(
-                        ControlErrorCode::InputOwnerConflict,
-                        "attach stream does not own PTY input",
-                    ),
-                };
-                writer.write_all(frame.to_json_line()?.as_bytes()).await?;
-                writer.flush().await?;
-                return Ok(false);
+    loop {
+        tokio::select! {
+            input = client_lines.next_line() => {
+                match input? {
+                    Some(line) => {
+                        if worker_writer.write_all(line.as_bytes()).await.is_err()
+                            || worker_writer.write_all(b"\n").await.is_err()
+                            || worker_writer.flush().await.is_err()
+                        {
+                            return drain_worker_attach_close(&mut worker_lines).await;
+                        }
+                    }
+                    None => {
+                        let _ = worker_writer.shutdown().await;
+                        return drain_worker_attach_close(&mut worker_lines).await;
+                    }
+                }
             }
-            match worker_request::<_, WorkerSendResponse>(
-                &opened.paths,
-                WorkerControlMethod::Send,
-                &WorkerSendRequest {
-                    text,
-                    owner: Some(opened.stream_id.clone()),
-                },
-            ) {
-                Ok(_) => Ok(false),
-                Err(error) => {
-                    let frame = AttachStreamFrame::Error { error };
-                    writer.write_all(frame.to_json_line()?.as_bytes()).await?;
-                    writer.flush().await?;
-                    Ok(false)
+            output = worker_lines.next_line() => {
+                match output? {
+                    Some(line) => {
+                        let is_closed = attach_stream_line_is_closed(&line);
+                        if client_writer.write_all(line.as_bytes()).await.is_err()
+                            || client_writer.write_all(b"\n").await.is_err()
+                            || client_writer.flush().await.is_err()
+                        {
+                            if is_closed {
+                                return Ok(true);
+                            }
+                            let _ = worker_writer.shutdown().await;
+                            return drain_worker_attach_close(&mut worker_lines).await;
+                        }
+                        if is_closed {
+                            return Ok(true);
+                        }
+                    }
+                    None => return Ok(true),
                 }
             }
         }
-        AttachStreamFrame::Resize { rows, cols } => {
-            let _ = worker_request::<_, WorkerResizeResponse>(
-                &opened.paths,
-                WorkerControlMethod::Resize,
-                &WorkerResizeRequest { rows, cols },
-            );
-            Ok(false)
-        }
-        AttachStreamFrame::Close => Ok(true),
-        _ => Ok(false),
     }
 }
 
-fn close_attach(opened: &OpenAttach) {
-    let _ = worker_request::<_, WorkerAckResponse>(
-        &opened.paths,
-        WorkerControlMethod::ReleaseAttach,
-        &WorkerReleaseAttachRequest {
-            stream_id: opened.stream_id.clone(),
-        },
-    );
+async fn drain_worker_attach_close(
+    worker_lines: &mut Lines<TokioBufReader<OwnedReadHalf>>,
+) -> Result<bool, HostServerError> {
+    loop {
+        tokio::select! {
+            output = worker_lines.next_line() => {
+                match output? {
+                    Some(line) if attach_stream_line_is_closed(&line) => return Ok(true),
+                    Some(_) => continue,
+                    None => return Ok(true),
+                }
+            }
+            _ = sleep(DEFAULT_STOP_GRACE) => return Ok(false),
+        }
+    }
+}
+
+fn attach_stream_line_is_closed(line: &str) -> bool {
+    matches!(
+        AttachStreamFrame::from_json_line(line),
+        Ok(AttachStreamFrame::Closed)
+    )
+}
+
+async fn connect_worker_stream(path: &Path) -> Result<UnixStream, ControlErrorBody> {
+    let started = Instant::now();
+    let mut last_error = None;
+    while started.elapsed() < WORKER_CONNECT_TIMEOUT {
+        match UnixStream::connect(path).await {
+            Ok(stream) => return Ok(stream),
+            Err(error) => {
+                last_error = Some(error);
+                sleep(WORKER_CONNECT_POLL).await;
+            }
+        }
+    }
+
+    Err(ControlErrorBody::new(
+        ControlErrorCode::WorkerUnavailable,
+        format!(
+            "worker socket unavailable at {}: {}",
+            path.display(),
+            last_error
+                .map(|error| error.to_string())
+                .unwrap_or_else(|| "timed out".to_string())
+        ),
+    ))
+}
+
+fn record_attach_closed(opened: &OpenAttach) {
     let mut event = SessionEvent::new(opened.response.session_id, SessionEventKind::AttachClosed);
     event
         .fields
@@ -2442,7 +2320,7 @@ fn monitor_profile_from_argv(argv: &[String]) -> Option<MonitorProfile> {
 
 #[cfg(test)]
 mod tests {
-    use millrace_sessions_core::{scrollback::TerminalSnapshot, state::HostMeta};
+    use millrace_sessions_core::state::HostMeta;
 
     use super::*;
 
@@ -2465,79 +2343,5 @@ mod tests {
             response.error.expect("error").code,
             ControlErrorCode::InvalidRequest
         );
-    }
-
-    #[test]
-    fn terminal_snapshot_replay_requires_requested_matching_size() {
-        let snapshot = TerminalSnapshot {
-            schema_version: 1,
-            rows: 24,
-            cols: 80,
-            cursor_row: 0,
-            cursor_col: 0,
-            alternate_screen: true,
-            pty_log_offset: 10,
-            raw_replay_start_offset: 0,
-            raw_replay_end_offset: 10,
-            captured_at: "2026-05-26T00:00:00Z".to_string(),
-            screen: vec!["ready".to_string()],
-        };
-
-        assert!(replay_matches_requested_size(
-            AttachReplayMode::TerminalSnapshot,
-            Some(TerminalDimensions { rows: 24, cols: 80 }),
-            &snapshot
-        ));
-        assert!(!replay_matches_requested_size(
-            AttachReplayMode::TerminalSnapshot,
-            Some(TerminalDimensions {
-                rows: 30,
-                cols: 100
-            }),
-            &snapshot
-        ));
-        assert!(!replay_matches_requested_size(
-            AttachReplayMode::TerminalSnapshot,
-            None,
-            &snapshot
-        ));
-        assert!(replay_matches_requested_size(
-            AttachReplayMode::RawReplay,
-            None,
-            &snapshot
-        ));
-    }
-
-    #[test]
-    fn attach_live_output_requires_v2_raw_bytes_and_raw_output_acceptance() {
-        let session_id: SessionId = "818b61b1-a620-4a57-8e72-4d439d03840f".parse().unwrap();
-        let mut request = SessionAttachRequest {
-            selector: millrace_sessions_core::protocol::SessionSelector::Id { session_id },
-            read_only: false,
-            replay: AttachReplayMode::RawReplay,
-            requested_terminal_size: None,
-            client_protocol_version: None,
-            accepted_frame_types: Vec::new(),
-            stream_encoding: None,
-            initial_replay: None,
-        };
-
-        assert!(matches!(
-            attach_live_output_frame(&request, b"\xfflive".to_vec()),
-            AttachStreamFrame::Output { .. }
-        ));
-
-        request.client_protocol_version = Some(2);
-        request.stream_encoding = Some(AttachStreamEncoding::RawBytes);
-        assert!(matches!(
-            attach_live_output_frame(&request, b"\xfflive".to_vec()),
-            AttachStreamFrame::Output { .. }
-        ));
-
-        request.accepted_frame_types = vec![AttachFrameType::RawOutput];
-        assert!(matches!(
-            attach_live_output_frame(&request, b"\xfflive".to_vec()),
-            AttachStreamFrame::RawOutput { data } if data.as_slice() == b"\xfflive"
-        ));
     }
 }

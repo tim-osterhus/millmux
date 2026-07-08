@@ -33,6 +33,12 @@ pub struct OutputLogger {
     pending_line: Vec<u8>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LoggedOutput {
+    pub start_offset: u64,
+    pub end_offset: u64,
+}
+
 impl OutputLogger {
     pub fn new(config: OutputLoggerConfig) -> MillmuxResult<Self> {
         let scrollback = if config.scrollback_snapshot.exists() {
@@ -48,12 +54,19 @@ impl OutputLogger {
         })
     }
 
-    pub fn record_output(&mut self, bytes: &[u8]) -> MillmuxResult<()> {
+    pub fn record_output(&mut self, bytes: &[u8]) -> MillmuxResult<LoggedOutput> {
+        let start_offset = fs::metadata(&self.config.pty_log)
+            .map(|metadata| metadata.len())
+            .unwrap_or(0);
         if bytes.is_empty() {
-            return Ok(());
+            return Ok(LoggedOutput {
+                start_offset,
+                end_offset: start_offset,
+            });
         }
-        append_raw_pty_log(&self.config.pty_log, bytes)?;
+        let end_offset = start_offset + bytes.len() as u64;
         self.record_terminal_output(bytes)?;
+        append_raw_pty_log(&self.config.pty_log, bytes)?;
         self.pending_line.extend_from_slice(bytes);
 
         while let Some(index) = self.pending_line.iter().position(|byte| *byte == b'\n') {
@@ -67,7 +80,10 @@ impl OutputLogger {
             self.record_structured_line(&line)?;
         }
 
-        Ok(())
+        Ok(LoggedOutput {
+            start_offset,
+            end_offset,
+        })
     }
 
     pub fn flush(&mut self) -> MillmuxResult<()> {

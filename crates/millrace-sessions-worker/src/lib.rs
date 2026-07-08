@@ -105,8 +105,8 @@ pub fn run_worker(session_id: SessionId, state_dir: impl Into<PathBuf>) -> Millm
         match reader.read(&mut buffer) {
             Ok(0) => break,
             Ok(count) => {
-                logger.record_output(&buffer[..count])?;
-                control.broadcast_output(&buffer[..count]);
+                let logged = logger.record_output(&buffer[..count])?;
+                control.broadcast_output(&buffer[..count], logged.start_offset, logged.end_offset);
             }
             Err(error) if error.kind() == ErrorKind::Interrupted => continue,
             Err(error) if error.kind() == ErrorKind::UnexpectedEof => break,

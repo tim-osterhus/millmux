@@ -23,6 +23,7 @@ pub enum SessionEventKind {
     Resize,
     AttachOpened,
     AttachClosed,
+    AttachStreamLagged,
     StateChanged,
     StopRequested,
     MillraceStatusProbe,

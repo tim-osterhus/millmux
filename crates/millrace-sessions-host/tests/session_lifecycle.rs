@@ -23,6 +23,7 @@ use millrace_sessions_core::{
     state::{ProcessState, SessionMeta, WorkerMeta},
     storage::{append_raw_pty_log, read_json},
 };
+use nix::sys::socket::{setsockopt, sockopt::RcvBuf};
 use serde_json::{json, Value};
 
 #[test]
@@ -813,6 +814,265 @@ fn attach_streams_scrollback_releases_input_and_leaves_session_running() {
 }
 
 #[test]
+fn attach_stream_forwards_input_and_resize_on_worker_stream() {
+    let temp = tempfile::tempdir().unwrap();
+    let paths = StatePaths::new(temp.path().join("state"));
+    let workspace = temp.path().join("workspace");
+    fs::create_dir_all(&workspace).unwrap();
+    let mut daemon = DaemonChild::spawn(&paths);
+    wait_for_socket(&paths.control_sock);
+
+    let start = start_session(
+        &paths,
+        &workspace,
+        "attach-io-shell",
+        "printf 'ready\\n'; while IFS= read -r line; do printf 'got:%s\\n' \"$line\"; done",
+    );
+    let session_paths = paths.session_paths(start.session.session_id);
+    wait_for_worker_socket(&session_paths.worker_sock);
+    wait_for_running_meta(&session_paths.meta_json);
+    wait_for_file_contains(&session_paths.pty_log, "ready");
+
+    let mut stream = UnixStream::connect(&paths.control_sock).expect("connect attach stream");
+    stream
+        .write_all(
+            format!(
+                "{}\n",
+                serde_json::to_string(&json!({
+                    "id": "attach-io",
+                    "method": "session.attach",
+                    "params": {
+                        "selector": {"type": "id", "session_id": start.session.session_id},
+                        "replay": "none"
+                    }
+                }))
+                .unwrap()
+            )
+            .as_bytes(),
+        )
+        .unwrap();
+    let mut reader = BufReader::new(stream.try_clone().unwrap());
+    let mut response_line = String::new();
+    reader.read_line(&mut response_line).unwrap();
+    let response: ControlResponse = serde_json::from_str(response_line.trim_end()).unwrap();
+    assert!(response.ok, "{response:#?}");
+    let attach: SessionAttachResponse = response.result_as().unwrap();
+    assert!(attach.stream.input_owner);
+
+    stream
+        .write_all(
+            AttachStreamFrame::Input {
+                text: "via-attach\n".to_string(),
+            }
+            .to_json_line()
+            .unwrap()
+            .as_bytes(),
+        )
+        .unwrap();
+    wait_for_file_contains(&session_paths.pty_log, "got:via-attach");
+
+    stream
+        .write_all(
+            AttachStreamFrame::Resize { rows: 33, cols: 77 }
+                .to_json_line()
+                .unwrap()
+                .as_bytes(),
+        )
+        .unwrap();
+    wait_for_terminal_snapshot_size(&session_paths.terminal_snapshot, 33, 77);
+
+    stream
+        .write_all(AttachStreamFrame::Close.to_json_line().unwrap().as_bytes())
+        .unwrap();
+    wait_for_event_kind(&session_paths.events_jsonl, SessionEventKind::AttachClosed);
+
+    daemon.kill();
+}
+
+#[test]
+fn attach_stream_delivers_queued_input_before_close_release() {
+    let temp = tempfile::tempdir().unwrap();
+    let paths = StatePaths::new(temp.path().join("state"));
+    let workspace = temp.path().join("workspace");
+    fs::create_dir_all(&workspace).unwrap();
+    let mut daemon = DaemonChild::spawn(&paths);
+    wait_for_socket(&paths.control_sock);
+
+    let start = start_session(
+        &paths,
+        &workspace,
+        "attach-close-order-shell",
+        "printf 'ready\\n'; while IFS= read -r line; do printf 'got:%s\\n' \"$line\"; done",
+    );
+    let session_paths = paths.session_paths(start.session.session_id);
+    wait_for_worker_socket(&session_paths.worker_sock);
+    wait_for_file_contains(&session_paths.pty_log, "ready");
+
+    let mut stream = open_attach_stream(&paths, start.session.session_id, false);
+    let attach = read_attach_response(&stream);
+    assert!(attach.stream.input_owner);
+    stream
+        .write_all(
+            AttachStreamFrame::Input {
+                text: "close-order\n".to_string(),
+            }
+            .to_json_line()
+            .unwrap()
+            .as_bytes(),
+        )
+        .unwrap();
+    stream
+        .write_all(AttachStreamFrame::Close.to_json_line().unwrap().as_bytes())
+        .unwrap();
+
+    wait_for_file_contains(&session_paths.pty_log, "got:close-order");
+    wait_for_event_kind(&session_paths.events_jsonl, SessionEventKind::AttachClosed);
+
+    let after_close = request_json(
+        &paths,
+        json!({
+            "id": "send-after-close-order",
+            "method": "session.send",
+            "params": {
+                "selector": {"type": "id", "session_id": start.session.session_id},
+                "text": "after-close-order\n"
+            }
+        }),
+    );
+    assert_eq!(after_close["ok"], true, "{after_close:#}");
+    wait_for_file_contains(&session_paths.pty_log, "got:after-close-order");
+
+    daemon.kill();
+}
+
+#[test]
+fn attach_stream_reports_lagged_frame_to_slow_v2_observer() {
+    let temp = tempfile::tempdir().unwrap();
+    let paths = StatePaths::new(temp.path().join("state"));
+    let workspace = temp.path().join("workspace");
+    fs::create_dir_all(&workspace).unwrap();
+    let mut daemon = DaemonChild::spawn(&paths);
+    wait_for_socket(&paths.control_sock);
+
+    let start = start_session(
+        &paths,
+        &workspace,
+        "attach-lag-shell",
+        concat!(
+            "printf 'ready\\n'; ",
+            "while IFS= read -r line; do ",
+            "case \"$line\" in ",
+            "burst) dd if=/dev/zero bs=65536 count=256 2>/dev/null | tr '\\000' x; printf '\\nDONE\\n' ;; ",
+            "tick) printf 'tick\\n' ;; ",
+            "esac; ",
+            "done"
+        ),
+    );
+    let session_paths = paths.session_paths(start.session.session_id);
+    wait_for_worker_socket(&session_paths.worker_sock);
+    wait_for_file_contains(&session_paths.pty_log, "ready");
+
+    let mut slow = UnixStream::connect(&paths.control_sock).expect("connect slow attach stream");
+    setsockopt(&slow, RcvBuf, &4096_usize).unwrap();
+    slow.write_all(
+        format!(
+            "{}\n",
+            serde_json::to_string(&json!({
+                "id": "attach-slow-lag",
+                "method": "session.attach",
+                "params": {
+                    "selector": {"type": "id", "session_id": start.session.session_id},
+                    "read_only": true,
+                    "replay": "none",
+                    "client_protocol_version": 2,
+                    "accepted_frame_types": ["stream_lagged"],
+                    "initial_replay": "none"
+                }
+            }))
+            .unwrap()
+        )
+        .as_bytes(),
+    )
+    .unwrap();
+    slow.set_read_timeout(Some(Duration::from_millis(250)))
+        .unwrap();
+    let mut slow_reader = BufReader::new(slow.try_clone().unwrap());
+    let mut response_line = String::new();
+    slow_reader.read_line(&mut response_line).unwrap();
+    let response: ControlResponse = serde_json::from_str(response_line.trim_end()).unwrap();
+    assert!(response.ok, "{response:#?}");
+    let attach: SessionAttachResponse = response.result_as().unwrap();
+    assert_eq!(
+        attach.accepted_frame_types,
+        vec![AttachFrameType::StreamLagged]
+    );
+
+    let fast_one = open_attach_stream(&paths, start.session.session_id, true);
+    let fast_one_attach = read_attach_response(&fast_one);
+    assert!(!fast_one_attach.stream.input_owner);
+    let mut fast_one_writer = fast_one.try_clone().unwrap();
+    let fast_one_reader = spawn_attach_drain(fast_one);
+
+    let fast_two = open_attach_stream(&paths, start.session.session_id, true);
+    let fast_two_attach = read_attach_response(&fast_two);
+    assert!(!fast_two_attach.stream.input_owner);
+    let mut fast_two_writer = fast_two.try_clone().unwrap();
+    let fast_two_reader = spawn_attach_drain(fast_two);
+
+    let burst_started = Instant::now();
+    let burst = request_json(
+        &paths,
+        json!({
+            "id": "lag-burst",
+            "method": "session.send",
+            "params": {
+                "selector": {"type": "id", "session_id": start.session.session_id},
+                "text": "burst\n"
+            }
+        }),
+    );
+    assert_eq!(burst["ok"], true, "{burst:#}");
+    wait_for_event_kind_timeout(
+        &session_paths.events_jsonl,
+        SessionEventKind::AttachStreamLagged,
+        Duration::from_secs(10),
+    );
+    assert!(
+        burst_started.elapsed() <= Duration::from_secs(10),
+        "16 MiB burst did not produce lag evidence within 10s"
+    );
+
+    for _ in 0..128 {
+        if read_next_attach_frame(&mut slow_reader).is_none() {
+            break;
+        }
+    }
+
+    let lagged = wait_for_attach_frame(
+        &mut slow_reader,
+        |frame| matches!(frame, AttachStreamFrame::StreamLagged { dropped_bytes, .. } if *dropped_bytes > 0),
+    );
+    assert!(
+        matches!(lagged, AttachStreamFrame::StreamLagged { dropped_from_offset, dropped_to_offset, current_pty_log_offset, .. }
+            if dropped_from_offset < dropped_to_offset && current_pty_log_offset >= dropped_to_offset)
+    );
+
+    slow.write_all(AttachStreamFrame::Close.to_json_line().unwrap().as_bytes())
+        .unwrap();
+    fast_one_writer
+        .write_all(AttachStreamFrame::Close.to_json_line().unwrap().as_bytes())
+        .unwrap();
+    fast_two_writer
+        .write_all(AttachStreamFrame::Close.to_json_line().unwrap().as_bytes())
+        .unwrap();
+    assert!(fast_one_reader.join().unwrap() > 0);
+    assert!(fast_two_reader.join().unwrap() > 0);
+    wait_for_event_kind(&session_paths.events_jsonl, SessionEventKind::AttachClosed);
+
+    daemon.kill();
+}
+
+#[test]
 fn attach_terminal_snapshot_replays_raw_bytes_without_text_conversion() {
     let temp = tempfile::tempdir().unwrap();
     let paths = StatePaths::new(temp.path().join("state"));
@@ -861,7 +1121,8 @@ fn attach_terminal_snapshot_replays_raw_bytes_without_text_conversion() {
     );
     let frame = AttachStreamFrame::from_json_line(&frame_line).unwrap();
     assert!(
-        matches!(frame, AttachStreamFrame::RawOutput { data } if data.as_slice() == raw.as_slice())
+        matches!(frame, AttachStreamFrame::RawOutput { ref data } if data.as_slice() == raw.as_slice()),
+        "expected raw replay {raw:?}, got {frame:?}"
     );
 
     stream
@@ -1103,7 +1364,10 @@ fn attach_v2_screen_snapshot_reports_unavailable_without_overclaiming_frames() {
     );
     assert_eq!(
         attach.accepted_frame_types,
-        vec![AttachFrameType::SnapshotUnavailable]
+        vec![
+            AttachFrameType::StreamLagged,
+            AttachFrameType::SnapshotUnavailable
+        ]
     );
 
     let mut frame_line = String::new();
@@ -1389,6 +1653,58 @@ fn read_attach_response(stream: &UnixStream) -> SessionAttachResponse {
     response.result_as().unwrap()
 }
 
+fn read_next_attach_frame(reader: &mut BufReader<UnixStream>) -> Option<AttachStreamFrame> {
+    let mut line = String::new();
+    match reader.read_line(&mut line) {
+        Ok(0) => None,
+        Ok(_) => Some(AttachStreamFrame::from_json_line(line.trim_end()).unwrap()),
+        Err(error)
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+            ) =>
+        {
+            None
+        }
+        Err(error) => panic!("failed to read attach frame: {error}"),
+    }
+}
+
+fn wait_for_attach_frame(
+    reader: &mut BufReader<UnixStream>,
+    predicate: impl Fn(&AttachStreamFrame) -> bool,
+) -> AttachStreamFrame {
+    let started = Instant::now();
+    while started.elapsed() < Duration::from_secs(10) {
+        if let Some(frame) = read_next_attach_frame(reader) {
+            if predicate(&frame) {
+                return frame;
+            }
+        }
+    }
+    panic!("timed out waiting for matching attach frame");
+}
+
+fn spawn_attach_drain(stream: UnixStream) -> thread::JoinHandle<usize> {
+    thread::spawn(move || {
+        stream
+            .set_read_timeout(Some(Duration::from_millis(250)))
+            .unwrap();
+        let mut reader = BufReader::new(stream);
+        let started = Instant::now();
+        let mut non_closed_frames = 0;
+        while started.elapsed() < Duration::from_secs(20) {
+            if let Some(frame) = read_next_attach_frame(&mut reader) {
+                if matches!(frame, AttachStreamFrame::Closed) {
+                    break;
+                }
+                non_closed_frames += 1;
+            }
+        }
+        non_closed_frames
+    })
+}
+
 fn start_session(
     paths: &StatePaths,
     workspace: &Path,
@@ -1438,8 +1754,12 @@ fn wait_for_worker_socket(path: &Path) {
 }
 
 fn wait_for_file_contains(path: &Path, needle: &str) {
+    wait_for_file_contains_timeout(path, needle, Duration::from_secs(5));
+}
+
+fn wait_for_file_contains_timeout(path: &Path, needle: &str, timeout: Duration) {
     let started = Instant::now();
-    while started.elapsed() < Duration::from_secs(5) {
+    while started.elapsed() < timeout {
         if fs::read_to_string(path)
             .map(|raw| raw.contains(needle))
             .unwrap_or(false)
@@ -1510,8 +1830,12 @@ fn wait_for_meta_state(path: &Path, state: ProcessState) -> SessionMeta {
 }
 
 fn wait_for_event_kind(path: &Path, kind: SessionEventKind) {
+    wait_for_event_kind_timeout(path, kind, Duration::from_secs(5));
+}
+
+fn wait_for_event_kind_timeout(path: &Path, kind: SessionEventKind, timeout: Duration) {
     let started = Instant::now();
-    while started.elapsed() < Duration::from_secs(5) {
+    while started.elapsed() < timeout {
         if read_events(path)
             .map(|events| events.iter().any(|event| event.kind == kind))
             .unwrap_or(false)

@@ -26,7 +26,8 @@ pub async fn run_attach(
         TerminalModeGuard::inactive()
     };
 
-    let mut input_rx = spawn_stdin_reader(result.stream.input_owner);
+    let input_enabled = result.stream.input_owner;
+    let mut input_rx = spawn_stdin_reader(input_enabled);
 
     loop {
         tokio::select! {
@@ -40,7 +41,7 @@ pub async fn run_attach(
                     Some(_) => {}
                 }
             }
-            input = input_rx.recv() => {
+            input = input_rx.recv(), if input_enabled => {
                 match input {
                     Some(text) => writer.write_frame(&AttachStreamFrame::Input { text }).await?,
                     None => {
@@ -67,7 +68,7 @@ fn spawn_stdin_reader(enabled: bool) -> mpsc::Receiver<String> {
 
     thread::spawn(move || {
         let mut stdin = io::stdin();
-        let mut buffer = [0_u8; 1024];
+        let mut buffer = [0_u8; 512];
         loop {
             match stdin.read(&mut buffer) {
                 Ok(0) => break,

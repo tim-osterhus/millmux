@@ -372,6 +372,12 @@ pub enum SnapshotUnavailableReason {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AttachStreamLagReason {
+    ObserverBackpressure,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TerminalDimensions {
     pub rows: u16,
     pub cols: u16,
@@ -456,6 +462,10 @@ impl SessionAttachRequest {
             && self.client_accepts_frame_type(AttachFrameType::RawOutput)
         {
             frame_types.push(AttachFrameType::RawOutput);
+        }
+
+        if self.client_accepts_frame_type(AttachFrameType::StreamLagged) {
+            frame_types.push(AttachFrameType::StreamLagged);
         }
 
         match self.negotiated_initial_replay() {
@@ -921,6 +931,14 @@ pub enum AttachStreamFrame {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         details: Option<Value>,
     },
+    StreamLagged {
+        dropped_bytes: u64,
+        dropped_from_offset: u64,
+        dropped_to_offset: u64,
+        current_pty_log_offset: u64,
+        reason: AttachStreamLagReason,
+        recover: String,
+    },
     Input {
         text: String,
     },
@@ -1119,6 +1137,95 @@ pub struct WorkerAttachRequest {
     pub replay: AttachReplayMode,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub requested_terminal_size: Option<TerminalDimensions>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_protocol_version: Option<u32>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub accepted_frame_types: Vec<AttachFrameType>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stream_encoding: Option<AttachStreamEncoding>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub initial_replay: Option<AttachInitialReplay>,
+}
+
+impl WorkerAttachRequest {
+    pub fn negotiated_attach_protocol_version(&self) -> Option<u32> {
+        self.client_protocol_version
+            .filter(|version| *version >= M2_ATTACH_PROTOCOL_VERSION)
+            .map(|version| version.min(M2_ATTACH_PROTOCOL_VERSION))
+    }
+
+    pub fn negotiated_stream_encoding(&self) -> Option<AttachStreamEncoding> {
+        self.negotiated_attach_protocol_version().map(|_| {
+            match self.stream_encoding.unwrap_or_default() {
+                AttachStreamEncoding::RawBytes
+                    if self.client_accepts_frame_type(AttachFrameType::RawOutput) =>
+                {
+                    AttachStreamEncoding::RawBytes
+                }
+                _ => AttachStreamEncoding::Text,
+            }
+        })
+    }
+
+    pub fn negotiated_initial_replay(&self) -> Option<AttachInitialReplay> {
+        self.negotiated_attach_protocol_version().and_then(|_| {
+            match self
+                .initial_replay
+                .unwrap_or_else(|| AttachInitialReplay::from_legacy_replay(self.replay))
+            {
+                AttachInitialReplay::RawReplay
+                    if !self.client_accepts_frame_type(AttachFrameType::RawOutput) =>
+                {
+                    None
+                }
+                AttachInitialReplay::ScreenSnapshot
+                    if !self.client_accepts_frame_type(AttachFrameType::SnapshotUnavailable) =>
+                {
+                    None
+                }
+                replay => Some(replay),
+            }
+        })
+    }
+
+    pub fn negotiated_frame_types(&self) -> Vec<AttachFrameType> {
+        let mut frame_types = Vec::new();
+        if self.negotiated_attach_protocol_version().is_none() {
+            return frame_types;
+        }
+
+        if self.negotiated_stream_encoding() == Some(AttachStreamEncoding::RawBytes)
+            && self.client_accepts_frame_type(AttachFrameType::RawOutput)
+        {
+            frame_types.push(AttachFrameType::RawOutput);
+        }
+
+        if self.client_accepts_frame_type(AttachFrameType::StreamLagged) {
+            frame_types.push(AttachFrameType::StreamLagged);
+        }
+
+        match self.negotiated_initial_replay() {
+            Some(AttachInitialReplay::RawReplay)
+                if self.client_accepts_frame_type(AttachFrameType::RawOutput)
+                    && !frame_types.contains(&AttachFrameType::RawOutput) =>
+            {
+                frame_types.push(AttachFrameType::RawOutput);
+            }
+            Some(AttachInitialReplay::ScreenSnapshot)
+                if self.client_accepts_frame_type(AttachFrameType::SnapshotUnavailable) =>
+            {
+                frame_types.push(AttachFrameType::SnapshotUnavailable);
+            }
+            _ => {}
+        }
+
+        frame_types
+    }
+
+    pub fn client_accepts_frame_type(&self, frame_type: AttachFrameType) -> bool {
+        self.negotiated_attach_protocol_version().is_some()
+            && self.accepted_frame_types.contains(&frame_type)
+    }
 }
 
 impl<'de> Deserialize<'de> for WorkerAttachRequest {
@@ -1137,6 +1244,14 @@ impl<'de> Deserialize<'de> for WorkerAttachRequest {
             requested_terminal_size: Option<TerminalDimensions>,
             #[serde(default)]
             include_scrollback: Option<bool>,
+            #[serde(default)]
+            client_protocol_version: Option<u32>,
+            #[serde(default)]
+            accepted_frame_types: Vec<AttachFrameType>,
+            #[serde(default)]
+            stream_encoding: Option<AttachStreamEncoding>,
+            #[serde(default)]
+            initial_replay: Option<AttachInitialReplay>,
         }
 
         let wire = Wire::deserialize(deserializer)?;
@@ -1149,6 +1264,10 @@ impl<'de> Deserialize<'de> for WorkerAttachRequest {
                     .unwrap_or_default()
             }),
             requested_terminal_size: wire.requested_terminal_size,
+            client_protocol_version: wire.client_protocol_version,
+            accepted_frame_types: wire.accepted_frame_types,
+            stream_encoding: wire.stream_encoding,
+            initial_replay: wire.initial_replay,
         })
     }
 }
@@ -1158,6 +1277,14 @@ pub struct WorkerAttachResponse {
     pub stream_id: String,
     pub read_only: bool,
     pub input_owner: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub negotiated_attach_protocol_version: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub negotiated_stream_encoding: Option<AttachStreamEncoding>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub negotiated_initial_replay: Option<AttachInitialReplay>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub accepted_frame_types: Vec<AttachFrameType>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]

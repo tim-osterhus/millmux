@@ -4,12 +4,13 @@ use millrace_sessions_core::{
     ids::{PaneId, SessionId, UiId},
     protocol::{
         AttachFrameType, AttachInitialReplay, AttachReplayMode, AttachStreamEncoding,
-        AttachStreamFrame, ControlErrorBody, ControlErrorCode, ControlMethod, ControlRequest,
-        ControlResponse, SessionAttachRequest, SessionAttachResponse, SessionListRequest,
-        SessionListResponse, SessionSelector, SessionStartRequest, SessionSummary,
-        SnapshotUnavailableReason, StreamKind, StreamSetup, TerminalDimensions,
-        UiContextGetRequest, UiContextSetRequest, WorkerAttachRequest, WorkerAttachStateResponse,
-        WorkerControlMethod, WorkerControlRequest, M1_PROTOCOL_VERSION, M2_ATTACH_PROTOCOL_VERSION,
+        AttachStreamFrame, AttachStreamLagReason, ControlErrorBody, ControlErrorCode,
+        ControlMethod, ControlRequest, ControlResponse, SessionAttachRequest,
+        SessionAttachResponse, SessionListRequest, SessionListResponse, SessionSelector,
+        SessionStartRequest, SessionSummary, SnapshotUnavailableReason, StreamKind, StreamSetup,
+        TerminalDimensions, UiContextGetRequest, UiContextSetRequest, WorkerAttachRequest,
+        WorkerAttachResponse, WorkerAttachStateResponse, WorkerControlMethod, WorkerControlRequest,
+        M1_PROTOCOL_VERSION, M2_ATTACH_PROTOCOL_VERSION,
     },
     state::{
         AttentionState, MonitorProfile, ProcessState, SessionRole, UiContext, UiDaemonHealth,
@@ -335,7 +336,7 @@ fn session_attach_v2_missing_accepted_frame_type_suppresses_that_frame() {
 }
 
 #[test]
-fn session_attach_v2_negotiates_only_batch0_implemented_frame_types() {
+fn session_attach_v2_negotiates_batch1_stream_lagged_frame_type() {
     let session_id: SessionId = "018f5d8d-3e79-4a62-9bc5-51c3c7f4d5c8".parse().unwrap();
     let request: SessionAttachRequest = serde_json::from_value(json!({
         "selector": {"type": "id", "session_id": session_id},
@@ -357,6 +358,7 @@ fn session_attach_v2_negotiates_only_batch0_implemented_frame_types() {
         request.negotiated_frame_types(),
         vec![
             AttachFrameType::RawOutput,
+            AttachFrameType::StreamLagged,
             AttachFrameType::SnapshotUnavailable
         ]
     );
@@ -474,6 +476,31 @@ fn snapshot_unavailable_frame_has_minimal_v2_envelope() {
 }
 
 #[test]
+fn stream_lagged_frame_has_batch1_recovery_envelope() {
+    let frame = AttachStreamFrame::StreamLagged {
+        dropped_bytes: 4096,
+        dropped_from_offset: 128,
+        dropped_to_offset: 4224,
+        current_pty_log_offset: 8192,
+        reason: AttachStreamLagReason::ObserverBackpressure,
+        recover: "request_screen_or_reattach_raw_replay".to_string(),
+    };
+
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&frame.to_json_line().unwrap()).unwrap(),
+        json!({
+            "type": "stream_lagged",
+            "dropped_bytes": 4096,
+            "dropped_from_offset": 128,
+            "dropped_to_offset": 4224,
+            "current_pty_log_offset": 8192,
+            "reason": "observer_backpressure",
+            "recover": "request_screen_or_reattach_raw_replay"
+        })
+    );
+}
+
+#[test]
 fn worker_attach_replay_modes_decode_legacy_scrollback_boolean() {
     let request = WorkerControlRequest::with_params(
         "worker-attach-1",
@@ -483,6 +510,10 @@ fn worker_attach_replay_modes_decode_legacy_scrollback_boolean() {
             read_only: false,
             replay: AttachReplayMode::TerminalSnapshot,
             requested_terminal_size: Some(TerminalDimensions { rows: 31, cols: 99 }),
+            client_protocol_version: Some(M2_ATTACH_PROTOCOL_VERSION),
+            accepted_frame_types: vec![AttachFrameType::RawOutput, AttachFrameType::StreamLagged],
+            stream_encoding: Some(AttachStreamEncoding::RawBytes),
+            initial_replay: Some(AttachInitialReplay::RawReplay),
         },
     )
     .expect("worker request serializes");
@@ -496,7 +527,11 @@ fn worker_attach_replay_modes_decode_legacy_scrollback_boolean() {
             "params": {
                 "stream_id": "stream-1",
                 "replay": "terminal_snapshot",
-                "requested_terminal_size": {"rows": 31, "cols": 99}
+                "requested_terminal_size": {"rows": 31, "cols": 99},
+                "client_protocol_version": 2,
+                "accepted_frame_types": ["raw_output", "stream_lagged"],
+                "stream_encoding": "raw_bytes",
+                "initial_replay": "raw_replay"
             }
         })
     );
@@ -504,6 +539,10 @@ fn worker_attach_replay_modes_decode_legacy_scrollback_boolean() {
     assert_eq!(
         decoded.requested_terminal_size,
         Some(TerminalDimensions { rows: 31, cols: 99 })
+    );
+    assert_eq!(
+        decoded.negotiated_frame_types(),
+        vec![AttachFrameType::RawOutput, AttachFrameType::StreamLagged]
     );
 
     let legacy: WorkerAttachRequest = serde_json::from_value(json!({
@@ -513,6 +552,43 @@ fn worker_attach_replay_modes_decode_legacy_scrollback_boolean() {
     .expect("legacy worker attach params deserialize");
     assert_eq!(legacy.replay, AttachReplayMode::LineScrollback);
     assert_eq!(legacy.requested_terminal_size, None);
+}
+
+#[test]
+fn worker_attach_response_echoes_optional_negotiated_axes() {
+    let response = WorkerAttachResponse {
+        stream_id: "stream-1".to_string(),
+        read_only: false,
+        input_owner: true,
+        negotiated_attach_protocol_version: Some(M2_ATTACH_PROTOCOL_VERSION),
+        negotiated_stream_encoding: Some(AttachStreamEncoding::RawBytes),
+        negotiated_initial_replay: Some(AttachInitialReplay::RawReplay),
+        accepted_frame_types: vec![AttachFrameType::RawOutput, AttachFrameType::StreamLagged],
+    };
+
+    assert_eq!(
+        serde_json::to_value(&response).unwrap(),
+        json!({
+            "stream_id": "stream-1",
+            "read_only": false,
+            "input_owner": true,
+            "negotiated_attach_protocol_version": 2,
+            "negotiated_stream_encoding": "raw_bytes",
+            "negotiated_initial_replay": "raw_replay",
+            "accepted_frame_types": ["raw_output", "stream_lagged"]
+        })
+    );
+
+    let legacy: WorkerAttachResponse = serde_json::from_value(json!({
+        "stream_id": "stream-old",
+        "read_only": true,
+        "input_owner": false
+    }))
+    .expect("legacy worker attach response deserializes");
+    assert_eq!(legacy.negotiated_attach_protocol_version, None);
+    assert_eq!(legacy.negotiated_stream_encoding, None);
+    assert_eq!(legacy.negotiated_initial_replay, None);
+    assert!(legacy.accepted_frame_types.is_empty());
 }
 
 #[test]

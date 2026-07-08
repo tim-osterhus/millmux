@@ -6,7 +6,7 @@ use std::{
 };
 
 use millrace_sessions_core::{
-    events::{append_event, SessionEvent, SessionEventKind},
+    events::{append_event, read_events, SessionEvent, SessionEventKind},
     ids::{SessionId, UiId},
     paths::StatePaths,
     protocol::{
@@ -236,6 +236,7 @@ fn check_session_record(record: &SessionRecord, issues: &mut Vec<DoctorIssue>) {
         ));
     }
     check_legacy_line_scrollback(record, issues);
+    check_attach_stream_lag(record, issues);
 
     if record.archived || !is_active_process_state(&record.meta.process_state) {
         return;
@@ -284,6 +285,49 @@ fn check_session_record(record: &SessionRecord, issues: &mut Vec<DoctorIssue>) {
             Some(json!({ "pids": pids })),
         ));
     }
+}
+
+fn check_attach_stream_lag(record: &SessionRecord, issues: &mut Vec<DoctorIssue>) {
+    if record.archived || !record.paths.events_jsonl.exists() {
+        return;
+    }
+
+    let Ok(events) = read_events(&record.paths.events_jsonl) else {
+        return;
+    };
+    let lag_events = events
+        .iter()
+        .filter(|event| event.kind == SessionEventKind::AttachStreamLagged)
+        .collect::<Vec<_>>();
+    let Some(last_event) = lag_events.last() else {
+        return;
+    };
+
+    issues.push(issue(
+        "attach_stream_lagged",
+        DoctorSeverity::Warning,
+        format!(
+            "session {} dropped output for one or more attach observers",
+            record.meta.id
+        ),
+        Some(record.meta.id),
+        Some(record.paths.events_jsonl.clone()),
+        false,
+        Some(
+            "reattach with raw replay or inspect pty.log; slow attach clients should drain frames promptly"
+                .to_string(),
+        ),
+        Some(json!({
+            "lag_event_count": lag_events.len(),
+            "last_stream_id": last_event.fields.get("stream_id"),
+            "last_dropped_bytes": last_event.fields.get("dropped_bytes"),
+            "last_dropped_from_offset": last_event.fields.get("dropped_from_offset"),
+            "last_dropped_to_offset": last_event.fields.get("dropped_to_offset"),
+            "current_pty_log_offset": last_event.fields.get("current_pty_log_offset"),
+            "reason": last_event.fields.get("reason"),
+            "pty_log": record.paths.pty_log.display().to_string(),
+        })),
+    ));
 }
 
 fn check_legacy_line_scrollback(record: &SessionRecord, issues: &mut Vec<DoctorIssue>) {
