@@ -3,7 +3,7 @@ use std::collections::BTreeMap;
 use millrace_sessions_core::{
     error::MillmuxResult,
     events::{append_event, current_timestamp, SessionEvent, SessionEventKind},
-    state::{ProcessState, SessionMeta, SessionPaths, WorkerMeta},
+    state::{ProcessState, SessionMeta, SessionPaths, SpawnMode, WorkerMeta},
     storage::{read_json, write_json_atomic},
 };
 
@@ -12,6 +12,7 @@ pub struct WorkerFacts {
     pub worker_pid: u32,
     pub child_pid: Option<u32>,
     pub child_pgid: Option<u32>,
+    pub spawn_mode: SpawnMode,
 }
 
 pub fn load_session_meta(paths: &SessionPaths) -> MillmuxResult<SessionMeta> {
@@ -30,9 +31,12 @@ pub fn write_worker_meta(paths: &SessionPaths, facts: WorkerFacts) -> MillmuxRes
         pid: facts.worker_pid,
         child_pid: facts.child_pid,
         child_pgid: facts.child_pgid,
+        spawn_mode: facts.spawn_mode,
         process_state: ProcessState::Starting,
         started_at: now.clone(),
         ended_at: None,
+        stop_requested_at: None,
+        stop_reason: None,
         exit_code: None,
         exit_signal: None,
         attached_clients: 0,

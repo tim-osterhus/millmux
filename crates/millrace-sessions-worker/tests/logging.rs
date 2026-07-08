@@ -5,14 +5,17 @@ use std::{
 };
 
 use millrace_sessions_core::{
-    events::read_events,
+    events::{read_events, SessionEventKind},
+    protocol::LogStream,
     scrollback::{
         restore_terminal_replay, ScrollbackBuffer, TerminalSnapshot, TerminalStateBuffer,
         DEFAULT_TERMINAL_COLS, DEFAULT_TERMINAL_ROWS,
     },
     storage::read_json,
 };
-use millrace_sessions_worker::logging::{OutputLogger, OutputLoggerConfig};
+use millrace_sessions_worker::logging::{
+    OutputLogger, OutputLoggerConfig, PipeOutputLogger, PipeOutputLoggerConfig,
+};
 
 #[test]
 fn logging_appends_raw_bytes_events_and_scrollback() {
@@ -76,6 +79,80 @@ fn logging_keeps_partial_utf8_out_of_structured_lines_until_complete() {
     let events = read_events(temp.path().join("events.jsonl")).unwrap();
     assert_eq!(events.len(), 1);
     assert_eq!(events[0].message.as_deref(), Some("€"));
+}
+
+#[test]
+fn pipe_logging_records_read_chunks_with_stream_offsets_and_sequence() {
+    let temp = tempfile::tempdir().unwrap();
+    let events_jsonl = temp.path().join("events.jsonl");
+    let session_id = millrace_sessions_core::ids::SessionId::new();
+    let mut stdout = PipeOutputLogger::new(PipeOutputLoggerConfig {
+        session_id,
+        log: temp.path().join("stdout.log"),
+        events_jsonl: events_jsonl.clone(),
+        stream: LogStream::Stdout,
+    })
+    .expect("stdout logger");
+    let mut stderr = PipeOutputLogger::new(PipeOutputLoggerConfig {
+        session_id,
+        log: temp.path().join("stderr.log"),
+        events_jsonl: events_jsonl.clone(),
+        stream: LogStream::Stderr,
+    })
+    .expect("stderr logger");
+
+    stdout.record_chunk(b"out-part", 1).expect("stdout chunk");
+    stderr.record_chunk(b"err\n", 2).expect("stderr chunk");
+    stdout.record_chunk(b"-done\n", 3).expect("stdout chunk 2");
+
+    assert_eq!(
+        fs::read(temp.path().join("stdout.log")).unwrap(),
+        b"out-part-done\n"
+    );
+    assert_eq!(fs::read(temp.path().join("stderr.log")).unwrap(), b"err\n");
+    let events = read_events(events_jsonl).unwrap();
+    assert_eq!(events.len(), 3);
+    assert!(events
+        .iter()
+        .all(|event| event.kind == SessionEventKind::Output));
+    assert_eq!(events[0].message.as_deref(), Some("out-part"));
+    assert_eq!(
+        events[0].fields.get("stream").map(String::as_str),
+        Some("stdout")
+    );
+    assert_eq!(
+        events[0].fields.get("record_kind").map(String::as_str),
+        Some("chunk")
+    );
+    assert_eq!(
+        events[0].fields.get("pipe_sequence").map(String::as_str),
+        Some("1")
+    );
+    assert_eq!(
+        events[0]
+            .fields
+            .get("stream_start_offset")
+            .map(String::as_str),
+        Some("0")
+    );
+    assert_eq!(
+        events[0]
+            .fields
+            .get("stream_end_offset")
+            .map(String::as_str),
+        Some("8")
+    );
+    assert_eq!(
+        events[2].fields.get("pipe_sequence").map(String::as_str),
+        Some("3")
+    );
+    assert_eq!(
+        events[2]
+            .fields
+            .get("stream_start_offset")
+            .map(String::as_str),
+        Some("8")
+    );
 }
 
 #[test]

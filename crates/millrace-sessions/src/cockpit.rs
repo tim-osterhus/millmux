@@ -25,7 +25,7 @@ use millrace_sessions_core::{
         SessionListRequest, SessionLogsRequest, SessionSelector, SessionStartRequest,
         TerminalDimensions, UiContextSetRequest,
     },
-    state::{MonitorProfile, ProcessState, SessionRole, UiEvent, UiEventKind},
+    state::{MonitorProfile, ProcessState, SessionRole, SpawnMode, UiEvent, UiEventKind},
 };
 use millrace_sessions_tui::{
     renderer::{render_app, render_to_string},
@@ -38,6 +38,7 @@ use crate::{
     client::{AttachConnection, ClientError, SessionControlClient},
     commands::{CockpitArgs, CommandError},
     launch_env::{current_launch_env, merge_current_launch_env, resolve_argv_executable},
+    output::render_log_line_text,
 };
 
 const LOG_TAIL: usize = 4000;
@@ -259,6 +260,7 @@ async fn start_workspace_daemon(
             name,
             role: Some(SessionRole::MillraceDaemon),
             session_id: None,
+            spawn_mode: SpawnMode::Pty,
             monitor_profile: monitor.clone(),
             env: current_launch_env(),
         })
@@ -337,6 +339,7 @@ async fn ensure_agent_session(
             name,
             role: Some(SessionRole::Agent),
             session_id: Some(agent_session_id),
+            spawn_mode: SpawnMode::Pty,
             monitor_profile: MonitorProfile::Auto,
             env,
         })
@@ -459,7 +462,7 @@ async fn fetch_log_lines(
             follow: false,
         })
         .await?;
-    Ok(response.lines.into_iter().map(|line| line.line).collect())
+    Ok(response.lines.iter().map(render_log_line_text).collect())
 }
 
 async fn refresh_daemon_sessions(
@@ -1224,6 +1227,7 @@ mod tests {
             session_id: SessionId::new(),
             name: Some(name.to_string()),
             role,
+            spawn_mode: SpawnMode::Pty,
             process_state: ProcessState::Running,
             attention_state: millrace_sessions_core::state::AttentionState::Idle,
             failure_message: None,
@@ -1237,8 +1241,14 @@ mod tests {
             monitor_profile: MonitorProfile::Auto,
             created_at: "2026-05-26T00:00:00Z".to_string(),
             updated_at: "2026-05-26T00:00:01Z".to_string(),
+            stop_requested_at: None,
+            stop_reason: None,
             attached_clients: 0,
             input_owner: None,
+            capabilities: millrace_sessions_core::protocol::SessionCapabilities::for_spawn_mode(
+                SpawnMode::Pty,
+            ),
+            artifacts: millrace_sessions_core::protocol::SessionArtifacts::default(),
         }
     }
 }

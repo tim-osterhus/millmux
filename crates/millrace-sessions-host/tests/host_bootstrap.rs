@@ -3,7 +3,7 @@ use std::{collections::BTreeMap, fs, os::unix::net::UnixListener, path::Path};
 use millrace_sessions_core::{
     ids::SessionId,
     paths::StatePaths,
-    state::{AttentionState, HostMeta, ProcessState, SessionMeta, SessionRole},
+    state::{AttentionState, HostMeta, ProcessState, SessionMeta, SessionRole, SpawnMode},
     storage::{read_json, write_json_atomic},
     workspace::WorkspaceIdentity,
 };
@@ -150,6 +150,7 @@ fn sample_session(workspace: impl AsRef<Path>, role: SessionRole) -> SessionMeta
             "run".to_string(),
             "daemon".to_string(),
         ],
+        spawn_mode: SpawnMode::Pty,
         monitor_profile: millrace_sessions_core::state::MonitorProfile::Auto,
         env: BTreeMap::new(),
         worker_pid: None,
@@ -157,6 +158,8 @@ fn sample_session(workspace: impl AsRef<Path>, role: SessionRole) -> SessionMeta
         child_pgid: None,
         started_at: None,
         ended_at: None,
+        stop_requested_at: None,
+        stop_reason: None,
         exit_code: None,
         exit_signal: None,
         failure_message: None,

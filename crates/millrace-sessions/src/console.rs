@@ -23,7 +23,7 @@ use millrace_sessions_core::{
         SessionKillRequest, SessionListRequest, SessionLogsRequest, SessionSelector,
         SessionStartRequest, SessionStopRequest, UiContextSetRequest,
     },
-    state::{MonitorProfile, ProcessState, SessionRole, UiEvent, UiEventKind},
+    state::{MonitorProfile, ProcessState, SessionRole, SpawnMode, UiEvent, UiEventKind},
 };
 use millrace_sessions_tui::{
     renderer::{render_app, render_to_string},
@@ -37,6 +37,7 @@ use crate::{
     client::{ClientError, SessionControlClient},
     commands::{CommandError, ConsoleArgs, ConsoleCommand},
     launch_env::{current_launch_env, resolve_argv_executable},
+    output::render_log_line_text,
 };
 
 const LOG_TAIL: usize = 4000;
@@ -243,6 +244,7 @@ async fn start_workspace_daemon(
             name,
             role: Some(SessionRole::MillraceDaemon),
             session_id: None,
+            spawn_mode: SpawnMode::Pty,
             monitor_profile: monitor.clone(),
             env: current_launch_env(),
         })
@@ -261,7 +263,7 @@ async fn fetch_log_lines(
             follow: false,
         })
         .await?;
-    Ok(response.lines.into_iter().map(|line| line.line).collect())
+    Ok(response.lines.iter().map(render_log_line_text).collect())
 }
 
 async fn run_interactive_console(
@@ -559,6 +561,7 @@ async fn execute_console_command(
                 .stop(&SessionStopRequest {
                     selector,
                     grace_seconds: None,
+                    reason: None,
                 })
                 .await,
         ),

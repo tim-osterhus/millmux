@@ -1301,7 +1301,7 @@ mod tests {
         ids::SessionId,
         paths::StatePaths,
         scrollback::{TerminalSnapshot, TerminalStateBuffer},
-        state::ProcessState,
+        state::{ProcessState, SpawnMode},
         storage::append_raw_pty_log,
     };
 
@@ -1422,9 +1422,12 @@ mod tests {
                 pid: std::process::id(),
                 child_pid: None,
                 child_pgid: None,
+                spawn_mode: SpawnMode::Pty,
                 process_state: ProcessState::Running,
                 started_at: "2026-05-20T18:00:00Z".to_string(),
                 ended_at: None,
+                stop_requested_at: None,
+                stop_reason: None,
                 exit_code: None,
                 exit_signal: None,
                 attached_clients: 1,

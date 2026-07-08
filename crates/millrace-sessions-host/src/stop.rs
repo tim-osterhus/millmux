@@ -34,6 +34,12 @@ pub fn request_millrace_control_stop(
         "workspace".to_string(),
         workspace.canonical_path.display().to_string(),
     );
+    event
+        .fields
+        .insert("reason".to_string(), "millrace_control_stop".to_string());
+    event
+        .fields
+        .insert("stop_requested_at".to_string(), event.timestamp.clone());
     append_event(events_jsonl, &event).map_err(control_core_error)?;
 
     match Command::new("millrace")
@@ -59,6 +65,10 @@ pub fn request_millrace_control_stop(
                 workspace.canonical_path.display().to_string(),
             );
             event.fields.insert(
+                "reason".to_string(),
+                "millrace_control_stop_failed".to_string(),
+            );
+            event.fields.insert(
                 "stderr".to_string(),
                 String::from_utf8_lossy(&output.stderr).trim().to_string(),
             );
@@ -70,6 +80,10 @@ pub fn request_millrace_control_stop(
             event.fields.insert(
                 "workspace".to_string(),
                 workspace.canonical_path.display().to_string(),
+            );
+            event.fields.insert(
+                "reason".to_string(),
+                "millrace_control_stop_failed".to_string(),
             );
             append_event(events_jsonl, &event).map_err(control_core_error)
         }

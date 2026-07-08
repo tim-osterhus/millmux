@@ -360,8 +360,10 @@ mod tests {
 
     use millrace_sessions_core::{
         ids::SessionId,
-        protocol::{SessionListResponse, M1_PROTOCOL_VERSION},
-        state::{AttentionState, MonitorProfile, SessionRole},
+        protocol::{
+            SessionArtifacts, SessionCapabilities, SessionListResponse, M1_PROTOCOL_VERSION,
+        },
+        state::{AttentionState, MonitorProfile, SessionRole, SpawnMode},
     };
 
     use super::*;
@@ -406,6 +408,7 @@ mod tests {
             session_id,
             name: Some("daemon:millrace".to_string()),
             role: SessionRole::MillraceDaemon,
+            spawn_mode: SpawnMode::Pty,
             process_state,
             attention_state: AttentionState::Active,
             failure_message: None,
@@ -419,8 +422,12 @@ mod tests {
             monitor_profile: MonitorProfile::Basic,
             created_at: "2026-05-20T18:00:00Z".to_string(),
             updated_at: updated_at.to_string(),
+            stop_requested_at: None,
+            stop_reason: None,
             attached_clients: 0,
             input_owner: None,
+            capabilities: SessionCapabilities::for_spawn_mode(SpawnMode::Pty),
+            artifacts: SessionArtifacts::default(),
         }
     }
 }

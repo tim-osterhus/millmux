@@ -20,18 +20,19 @@ use millrace_sessions_core::{
     paths::{state_paths, StatePaths},
     protocol::{
         AttachStreamFrame, ControlErrorBody, ControlErrorCode, ControlResponse, DoctorRequest,
-        EventStreamFrame, HostStatusRequest, HostStatusResponse, LogLine, LogStreamFrame,
-        SessionAttachRequest, SessionAttachResponse, SessionDeleteRequest, SessionDeleteResponse,
-        SessionEventsRequest, SessionEventsResponse, SessionInspectRequest, SessionInspectResponse,
-        SessionKillRequest, SessionKillResponse, SessionListRequest, SessionListResponse,
-        SessionLogsRequest, SessionLogsResponse, SessionResizeRequest, SessionResizeResponse,
-        SessionSendRequest, SessionSendResponse, SessionStartRequest, SessionStartResponse,
-        SessionStopRequest, SessionStopResponse, SessionSummary, StreamKind, StreamSetup,
-        UiContextCloseRequest, UiContextCloseResponse, UiContextGetRequest, UiContextGetResponse,
-        UiContextListEntry, UiContextListRequest, UiContextListResponse, UiContextSetRequest,
-        UiContextSetResponse, WorkerAckResponse, WorkerAttachRequest, WorkerAttachResponse,
-        WorkerControlMethod, WorkerControlRequest, WorkerControlResponse, WorkerResizeRequest,
-        WorkerResizeResponse, WorkerSendRequest, WorkerSendResponse, M1_PROTOCOL_VERSION,
+        EventStreamFrame, HostStatusRequest, HostStatusResponse, LogLine, LogStream,
+        LogStreamFrame, SessionArtifacts, SessionAttachRequest, SessionAttachResponse,
+        SessionCapabilities, SessionDeleteRequest, SessionDeleteResponse, SessionEventsRequest,
+        SessionEventsResponse, SessionInspectRequest, SessionInspectResponse, SessionKillRequest,
+        SessionKillResponse, SessionListRequest, SessionListResponse, SessionLogsRequest,
+        SessionLogsResponse, SessionResizeRequest, SessionResizeResponse, SessionSendRequest,
+        SessionSendResponse, SessionStartRequest, SessionStartResponse, SessionStopRequest,
+        SessionStopResponse, SessionSummary, StreamKind, StreamSetup, UiContextCloseRequest,
+        UiContextCloseResponse, UiContextGetRequest, UiContextGetResponse, UiContextListEntry,
+        UiContextListRequest, UiContextListResponse, UiContextSetRequest, UiContextSetResponse,
+        WorkerAckResponse, WorkerAttachRequest, WorkerAttachResponse, WorkerControlMethod,
+        WorkerControlRequest, WorkerControlResponse, WorkerResizeRequest, WorkerResizeResponse,
+        WorkerSendRequest, WorkerSendResponse, M1_PROTOCOL_VERSION,
     },
     state::{
         AttentionState, HostMeta, MonitorProfile, ProcessState, SessionMeta, SessionPaths,
@@ -63,6 +64,9 @@ const WORKER_CONNECT_POLL: Duration = Duration::from_millis(25);
 const FOLLOW_POLL: Duration = Duration::from_millis(50);
 const DEFAULT_STOP_GRACE: Duration = Duration::from_secs(2);
 const KILL_SETTLE_TIMEOUT: Duration = Duration::from_millis(250);
+const DEFAULT_STOP_REASON: &str = "session_stop";
+const SIGTERM_STOP_REASON: &str = "sigterm_stop";
+const SIGTERM_FALLBACK_STOP_REASON: &str = "sigterm_fallback";
 
 #[derive(Debug, Error)]
 pub enum HostServerError {
@@ -343,6 +347,7 @@ fn start_session(
     }
     let argv = request.argv;
     let requested_session_id = request.session_id;
+    let spawn_mode = request.spawn_mode;
     let monitor_profile = request.monitor_profile;
     let env = request.env;
 
@@ -381,11 +386,11 @@ fn start_session(
 
         let registry = HostRegistry::load(paths.clone())?;
         if let Some(record) = registry.find_active_millrace_daemon(workspace) {
-            if record.meta.argv == argv {
+            if record.meta.argv == argv && record.meta.spawn_mode == spawn_mode {
                 return Ok(SessionStartResponse {
                     schema_version: M1_PROTOCOL_VERSION,
                     protocol_version: M1_PROTOCOL_VERSION,
-                    session: summary_from_meta(&record.meta, record.worker.as_ref()),
+                    session: summary_from_meta(&record.meta, record.worker.as_ref(), &record.paths),
                     attached_existing: true,
                 });
             }
@@ -435,6 +440,7 @@ fn start_session(
         workspace,
         cwd,
         argv,
+        spawn_mode,
         monitor_profile,
         env,
         worker_pid: None,
@@ -442,6 +448,8 @@ fn start_session(
         child_pgid: None,
         started_at: None,
         ended_at: None,
+        stop_requested_at: None,
+        stop_reason: None,
         exit_code: None,
         exit_signal: None,
         failure_message: None,
@@ -491,7 +499,7 @@ fn start_session(
     Ok(SessionStartResponse {
         schema_version: M1_PROTOCOL_VERSION,
         protocol_version: M1_PROTOCOL_VERSION,
-        session: summary_from_meta(&meta, None),
+        session: summary_from_meta(&meta, None, &session_paths),
         attached_existing: false,
     })
 }
@@ -937,7 +945,7 @@ fn build_logs_response(
     include_follow: bool,
 ) -> Result<SessionLogsResponse, ControlErrorBody> {
     let inspected = resolve_session(paths, &request.selector)?;
-    let lines = read_log_lines(&inspected.paths.pty_log, request.tail).map_err(control_io_error)?;
+    let lines = read_session_log_lines(&inspected, request.tail)?;
     Ok(SessionLogsResponse {
         schema_version: M1_PROTOCOL_VERSION,
         protocol_version: M1_PROTOCOL_VERSION,
@@ -963,12 +971,41 @@ fn build_events_response(
     })
 }
 
+fn ensure_capability(
+    inspected: &SessionInspectResponse,
+    supported: bool,
+    method: &'static str,
+    capability: &'static str,
+) -> Result<(), ControlErrorBody> {
+    if supported {
+        return Ok(());
+    }
+    Err(ControlErrorBody::new(
+        ControlErrorCode::UnsupportedSpawnMode,
+        format!(
+            "{method} is unsupported for spawn_mode={}",
+            inspected.session.spawn_mode
+        ),
+    )
+    .with_details(json!({
+        "session_id": inspected.session.session_id,
+        "spawn_mode": inspected.session.spawn_mode,
+        "capability": capability,
+    })))
+}
+
 fn send_to_session(
     paths: &StatePaths,
     request: SessionSendRequest,
     owner: Option<String>,
 ) -> Result<SessionSendResponse, ControlErrorBody> {
     let inspected = resolve_running_session(paths, &request.selector)?;
+    ensure_capability(
+        &inspected,
+        inspected.session.capabilities.send,
+        "session.send",
+        "send",
+    )?;
     let worker: WorkerSendResponse = worker_request(
         &inspected.paths,
         WorkerControlMethod::Send,
@@ -1004,6 +1041,12 @@ fn resize_session(
     }
 
     let inspected = resolve_running_session(paths, &request.selector)?;
+    ensure_capability(
+        &inspected,
+        inspected.session.capabilities.resize,
+        "session.resize",
+        "resize",
+    )?;
     let worker: WorkerResizeResponse = worker_request(
         &inspected.paths,
         WorkerControlMethod::Resize,
@@ -1040,15 +1083,25 @@ fn stop_session(
         .grace_seconds
         .map(Duration::from_secs)
         .unwrap_or(DEFAULT_STOP_GRACE);
+    let stop_reason = normalize_stop_reason(request.reason.as_deref());
+    let stop_requested_at = current_timestamp();
+    persist_stop_request_metadata(&inspected.paths, &stop_requested_at, &stop_reason)?;
 
     let mut event = SessionEvent::new(
         inspected.session.session_id,
         SessionEventKind::StopRequested,
     );
+    event.timestamp = stop_requested_at.clone();
     event.process_state = Some(inspected.session.process_state.clone());
     event
         .fields
         .insert("grace_seconds".to_string(), grace.as_secs().to_string());
+    event
+        .fields
+        .insert("reason".to_string(), stop_reason.clone());
+    event
+        .fields
+        .insert("stop_requested_at".to_string(), stop_requested_at.clone());
     append_event(&inspected.paths.events_jsonl, &event).map_err(control_core_error)?;
 
     if inspected.session.role == SessionRole::MillraceDaemon {
@@ -1063,8 +1116,32 @@ fn stop_session(
                 session_id: inspected.session.session_id,
                 process_state: state,
                 stop_requested: true,
+                stop_requested_at: Some(stop_requested_at),
+                stop_reason: Some(stop_reason),
             });
         }
+    }
+
+    if !inspected.session.spawn_mode.is_pty() {
+        let meta =
+            read_json::<SessionMeta>(&inspected.paths.meta_json).map_err(control_core_error)?;
+        append_signal_stop_event(
+            &inspected.paths,
+            inspected.session.session_id,
+            &meta.process_state,
+            SIGTERM_STOP_REASON,
+        )?;
+        stop::request_sigterm(&meta)?;
+        let state = wait_for_terminal_state(&inspected.paths.meta_json, grace)?;
+        return Ok(SessionStopResponse {
+            schema_version: M1_PROTOCOL_VERSION,
+            protocol_version: M1_PROTOCOL_VERSION,
+            session_id: inspected.session.session_id,
+            process_state: state,
+            stop_requested: true,
+            stop_requested_at: Some(stop_requested_at),
+            stop_reason: Some(stop_reason),
+        });
     }
 
     let interrupt_result = worker_request::<_, WorkerAckResponse>(
@@ -1076,6 +1153,12 @@ fn stop_session(
     if is_active_process_state(&state) {
         let meta =
             read_json::<SessionMeta>(&inspected.paths.meta_json).map_err(control_core_error)?;
+        append_signal_stop_event(
+            &inspected.paths,
+            inspected.session.session_id,
+            &meta.process_state,
+            SIGTERM_FALLBACK_STOP_REASON,
+        )?;
         stop::request_sigterm(&meta).or_else(|error| {
             if interrupt_result.is_err() {
                 Err(error)
@@ -1092,7 +1175,54 @@ fn stop_session(
         session_id: inspected.session.session_id,
         process_state: state,
         stop_requested: true,
+        stop_requested_at: Some(stop_requested_at),
+        stop_reason: Some(stop_reason),
     })
+}
+
+fn normalize_stop_reason(reason: Option<&str>) -> String {
+    reason
+        .map(str::trim)
+        .filter(|reason| !reason.is_empty())
+        .unwrap_or(DEFAULT_STOP_REASON)
+        .to_string()
+}
+
+fn persist_stop_request_metadata(
+    paths: &SessionPaths,
+    requested_at: &str,
+    reason: &str,
+) -> Result<(), ControlErrorBody> {
+    update_session_meta(paths, |meta, now| {
+        meta.stop_requested_at = Some(requested_at.to_string());
+        meta.stop_reason = Some(reason.to_string());
+        meta.updated_at = now.to_string();
+    })?;
+    update_worker_meta(paths, |worker, now| {
+        worker.stop_requested_at = Some(requested_at.to_string());
+        worker.stop_reason = Some(reason.to_string());
+        worker.updated_at = now.to_string();
+    })
+}
+
+fn append_signal_stop_event(
+    paths: &SessionPaths,
+    session_id: SessionId,
+    process_state: &ProcessState,
+    reason: &str,
+) -> Result<(), ControlErrorBody> {
+    let mut event = SessionEvent::new(session_id, SessionEventKind::StopRequested);
+    event.process_state = Some(process_state.clone());
+    event
+        .fields
+        .insert("reason".to_string(), reason.to_string());
+    event
+        .fields
+        .insert("signal".to_string(), "SIGTERM".to_string());
+    event
+        .fields
+        .insert("stop_requested_at".to_string(), event.timestamp.clone());
+    append_event(&paths.events_jsonl, &event).map_err(control_core_error)
 }
 
 fn kill_session(
@@ -1551,7 +1681,29 @@ fn is_active_session_root(paths: &StatePaths, root: &Path) -> bool {
     root.starts_with(&paths.sessions_dir)
 }
 
-fn read_log_lines(path: &std::path::Path, tail: Option<usize>) -> std::io::Result<Vec<LogLine>> {
+fn read_session_log_lines(
+    inspected: &SessionInspectResponse,
+    tail: Option<usize>,
+) -> Result<Vec<LogLine>, ControlErrorBody> {
+    match inspected.session.spawn_mode {
+        millrace_sessions_core::state::SpawnMode::Pty => {
+            read_log_lines(&inspected.paths.pty_log, tail, LogStream::Pty).map_err(control_io_error)
+        }
+        millrace_sessions_core::state::SpawnMode::Pipe => {
+            let events =
+                read_event_lines(&inspected.paths.events_jsonl).map_err(control_core_error)?;
+            let mut lines = log_lines_from_output_events(events);
+            apply_tail(&mut lines, tail);
+            Ok(lines)
+        }
+    }
+}
+
+fn read_log_lines(
+    path: &std::path::Path,
+    tail: Option<usize>,
+    stream: LogStream,
+) -> std::io::Result<Vec<LogLine>> {
     let raw = match fs::read(path) {
         Ok(raw) => raw,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
@@ -1561,16 +1713,110 @@ fn read_log_lines(path: &std::path::Path, tail: Option<usize>) -> std::io::Resul
     let mut lines = text
         .lines()
         .map(|line| LogLine {
+            stream,
             timestamp: None,
             line: line.trim_end_matches('\r').to_string(),
         })
         .collect::<Vec<_>>();
+    apply_tail(&mut lines, tail);
+    Ok(lines)
+}
+
+fn apply_tail(lines: &mut Vec<LogLine>, tail: Option<usize>) {
     if let Some(tail) = tail {
         if lines.len() > tail {
-            lines = lines.split_off(lines.len() - tail);
+            *lines = lines.split_off(lines.len() - tail);
         }
     }
-    Ok(lines)
+}
+
+fn log_lines_from_output_events(events: Vec<SessionEvent>) -> Vec<LogLine> {
+    let mut assembler = LogLineAssembler::default();
+    let mut lines = Vec::new();
+    for event in events {
+        lines.extend(assembler.push_event(event));
+    }
+    lines.extend(assembler.flush());
+    lines
+}
+
+#[derive(Default)]
+struct LogLineAssembler {
+    pty: Vec<u8>,
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+}
+
+impl LogLineAssembler {
+    fn push_event(&mut self, event: SessionEvent) -> Vec<LogLine> {
+        if event.kind != SessionEventKind::Output {
+            return Vec::new();
+        }
+        let Some(stream) = log_stream_from_event(&event) else {
+            return Vec::new();
+        };
+        let message = event.message.unwrap_or_default();
+        if event.fields.get("record_kind").map(String::as_str) != Some("chunk") {
+            return vec![LogLine {
+                stream,
+                timestamp: Some(event.timestamp),
+                line: message,
+            }];
+        }
+
+        let mut lines = Vec::new();
+        let buffer = self.buffer_mut(stream);
+        buffer.extend_from_slice(message.as_bytes());
+        while let Some(index) = buffer.iter().position(|byte| *byte == b'\n') {
+            let mut line = buffer.drain(..=index).collect::<Vec<_>>();
+            if line.last() == Some(&b'\n') {
+                line.pop();
+            }
+            if line.last() == Some(&b'\r') {
+                line.pop();
+            }
+            lines.push(LogLine {
+                stream,
+                timestamp: Some(event.timestamp.clone()),
+                line: String::from_utf8_lossy(&line).to_string(),
+            });
+        }
+        lines
+    }
+
+    fn flush(&mut self) -> Vec<LogLine> {
+        let mut lines = Vec::new();
+        for stream in [LogStream::Pty, LogStream::Stdout, LogStream::Stderr] {
+            let buffer = self.buffer_mut(stream);
+            if buffer.is_empty() {
+                continue;
+            }
+            let line = std::mem::take(buffer);
+            lines.push(LogLine {
+                stream,
+                timestamp: None,
+                line: String::from_utf8_lossy(&line).to_string(),
+            });
+        }
+        lines
+    }
+
+    fn buffer_mut(&mut self, stream: LogStream) -> &mut Vec<u8> {
+        match stream {
+            LogStream::Pty => &mut self.pty,
+            LogStream::Stdout => &mut self.stdout,
+            LogStream::Stderr => &mut self.stderr,
+        }
+    }
+}
+
+fn log_stream_from_event(event: &SessionEvent) -> Option<LogStream> {
+    match event.fields.get("stream").map(String::as_str) {
+        Some("stdout") => Some(LogStream::Stdout),
+        Some("stderr") => Some(LogStream::Stderr),
+        Some("pty") | None => Some(LogStream::Pty),
+        Some(_) => None,
+    }
 }
 
 fn read_event_lines(path: &std::path::Path) -> MillmuxResult<Vec<SessionEvent>> {
@@ -1736,41 +1982,91 @@ async fn handle_logs_follow_stream(
         .await?;
     writer.flush().await?;
 
-    let mut offset = file_len(&inspected.paths.pty_log);
-    loop {
-        sleep(FOLLOW_POLL).await;
-        let next = match read_from_offset(&inspected.paths.pty_log, offset) {
-            Ok((bytes, new_offset)) => {
-                offset = new_offset;
-                bytes
-            }
-            Err(_) => Vec::new(),
-        };
-        if next.is_empty() {
-            if session_is_terminal(&inspected.paths.meta_json) {
-                let frame = LogStreamFrame::Closed;
-                let _ = writer.write_all(frame.to_json_line()?.as_bytes()).await;
-                let _ = writer.flush().await;
-                break;
-            }
-            continue;
-        }
+    match inspected.session.spawn_mode {
+        millrace_sessions_core::state::SpawnMode::Pty => {
+            let mut offset = file_len(&inspected.paths.pty_log);
+            loop {
+                sleep(FOLLOW_POLL).await;
+                let next = match read_from_offset(&inspected.paths.pty_log, offset) {
+                    Ok((bytes, new_offset)) => {
+                        offset = new_offset;
+                        bytes
+                    }
+                    Err(_) => Vec::new(),
+                };
+                if next.is_empty() {
+                    if session_is_terminal(&inspected.paths.meta_json) {
+                        let frame = LogStreamFrame::Closed;
+                        let _ = writer.write_all(frame.to_json_line()?.as_bytes()).await;
+                        let _ = writer.flush().await;
+                        break;
+                    }
+                    continue;
+                }
 
-        for line in String::from_utf8_lossy(&next).lines() {
-            let frame = LogStreamFrame::Line {
-                line: LogLine {
-                    timestamp: None,
-                    line: line.trim_end_matches('\r').to_string(),
-                },
-            };
-            if writer
-                .write_all(frame.to_json_line()?.as_bytes())
-                .await
-                .is_err()
-            {
-                break;
+                for line in String::from_utf8_lossy(&next).lines() {
+                    let frame = LogStreamFrame::Line {
+                        line: LogLine {
+                            stream: LogStream::Pty,
+                            timestamp: None,
+                            line: line.trim_end_matches('\r').to_string(),
+                        },
+                    };
+                    if writer
+                        .write_all(frame.to_json_line()?.as_bytes())
+                        .await
+                        .is_err()
+                    {
+                        break;
+                    }
+                    writer.flush().await?;
+                }
             }
-            writer.flush().await?;
+        }
+        millrace_sessions_core::state::SpawnMode::Pipe => {
+            let mut offset = file_len(&inspected.paths.events_jsonl);
+            let mut assembler = LogLineAssembler::default();
+            loop {
+                sleep(FOLLOW_POLL).await;
+                let next = match read_from_offset(&inspected.paths.events_jsonl, offset) {
+                    Ok((bytes, new_offset)) => {
+                        offset = new_offset;
+                        bytes
+                    }
+                    Err(_) => Vec::new(),
+                };
+                if next.is_empty() {
+                    if session_is_terminal(&inspected.paths.meta_json) {
+                        for line in assembler.flush() {
+                            let frame = LogStreamFrame::Line { line };
+                            let _ = writer.write_all(frame.to_json_line()?.as_bytes()).await;
+                            let _ = writer.flush().await;
+                        }
+                        let frame = LogStreamFrame::Closed;
+                        let _ = writer.write_all(frame.to_json_line()?.as_bytes()).await;
+                        let _ = writer.flush().await;
+                        break;
+                    }
+                    continue;
+                }
+
+                for line in String::from_utf8_lossy(&next).lines() {
+                    let Ok(event) = serde_json::from_str::<SessionEvent>(line) else {
+                        continue;
+                    };
+                    for line in assembler.push_event(event) {
+                        let frame = LogStreamFrame::Line { line };
+                        if writer
+                            .write_all(frame.to_json_line()?.as_bytes())
+                            .await
+                            .is_err()
+                        {
+                            break;
+                        }
+                        writer.flush().await?;
+                    }
+                }
+            }
         }
     }
 
@@ -1968,6 +2264,12 @@ async fn open_worker_attach(
     request: &SessionAttachRequest,
 ) -> Result<WorkerAttachStream, ControlErrorBody> {
     let inspected = resolve_running_session(paths, &request.selector)?;
+    ensure_capability(
+        &inspected,
+        inspected.session.capabilities.attach,
+        "session.attach",
+        "attach",
+    )?;
     let stream_id = next_stream_id();
     let worker_params = WorkerAttachRequest {
         stream_id: stream_id.clone(),
@@ -2269,19 +2571,33 @@ enum StartSessionError {
     Worker(#[from] WorkerLaunchError),
 }
 
-fn summary_from_meta(meta: &SessionMeta, worker: Option<&WorkerMeta>) -> SessionSummary {
+fn summary_from_meta(
+    meta: &SessionMeta,
+    worker: Option<&WorkerMeta>,
+    paths: &SessionPaths,
+) -> SessionSummary {
     let active = is_active_process_state(&meta.process_state);
-    let attached_clients = worker
-        .filter(|_| active)
-        .map_or(0, |worker| worker.attached_clients);
-    let input_owner = worker
-        .filter(|_| active)
-        .and_then(|worker| worker.input_owner.clone());
+    let terminal_capable = meta.spawn_mode.is_pty();
+    let attached_clients = if terminal_capable {
+        worker
+            .filter(|_| active)
+            .map_or(0, |worker| worker.attached_clients)
+    } else {
+        0
+    };
+    let input_owner = if terminal_capable {
+        worker
+            .filter(|_| active)
+            .and_then(|worker| worker.input_owner.clone())
+    } else {
+        None
+    };
 
     SessionSummary {
         session_id: meta.id,
         name: meta.name.clone(),
         role: meta.role.clone(),
+        spawn_mode: meta.spawn_mode,
         process_state: meta.process_state.clone(),
         attention_state: meta.attention_state.clone(),
         failure_message: meta.failure_message.clone(),
@@ -2291,8 +2607,12 @@ fn summary_from_meta(meta: &SessionMeta, worker: Option<&WorkerMeta>) -> Session
         monitor_profile: monitor_profile_from_meta(meta),
         created_at: meta.created_at.clone(),
         updated_at: meta.updated_at.clone(),
+        stop_requested_at: meta.stop_requested_at.clone(),
+        stop_reason: meta.stop_reason.clone(),
         attached_clients,
         input_owner,
+        capabilities: SessionCapabilities::for_spawn_mode(meta.spawn_mode),
+        artifacts: SessionArtifacts::for_paths(meta.spawn_mode, paths),
     }
 }
 

@@ -106,6 +106,8 @@ pub fn session_paths(sessions_dir: impl Into<PathBuf>, session_id: SessionId) ->
         meta_json: root.join("meta.json"),
         worker_json: root.join("worker.json"),
         pty_log: root.join("pty.log"),
+        stdout_log: root.join("stdout.log"),
+        stderr_log: root.join("stderr.log"),
         events_jsonl: root.join("events.jsonl"),
         scrollback_snapshot: root.join("scrollback.snapshot"),
         terminal_snapshot: root.join("terminal.snapshot.json"),
@@ -151,6 +153,8 @@ mod tests {
         assert_eq!(session.meta_json, session.root.join("meta.json"));
         assert_eq!(session.worker_json, session.root.join("worker.json"));
         assert_eq!(session.pty_log, session.root.join("pty.log"));
+        assert_eq!(session.stdout_log, session.root.join("stdout.log"));
+        assert_eq!(session.stderr_log, session.root.join("stderr.log"));
         assert_eq!(session.events_jsonl, session.root.join("events.jsonl"));
         assert_eq!(
             session.scrollback_snapshot,

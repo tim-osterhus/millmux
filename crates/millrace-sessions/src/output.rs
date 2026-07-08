@@ -1,6 +1,6 @@
 use millrace_sessions_core::{
     protocol::{
-        DoctorResponse, EventStreamFrame, HostStatusResponse, LogStreamFrame,
+        DoctorResponse, EventStreamFrame, HostStatusResponse, LogLine, LogStream, LogStreamFrame,
         SessionDeleteResponse, SessionEventsResponse, SessionInspectResponse, SessionKillResponse,
         SessionListResponse, SessionLogsResponse, SessionResizeResponse, SessionSendResponse,
         SessionStartResponse, SessionStopResponse, SessionSummary, UiContextGetResponse,
@@ -26,10 +26,11 @@ pub fn render_list(result: &SessionListResponse) -> String {
     let mut lines = String::new();
     for session in &result.sessions {
         lines.push_str(&format!(
-            "{} {} role={} name={} monitor={} clients={} owner={} cwd={}\n",
+            "{} {} role={} spawn={} name={} monitor={} clients={} owner={} cwd={}\n",
             session.session_id,
             process_state(&session.process_state),
             role(&session.role),
+            session.spawn_mode,
             session.name.as_deref().unwrap_or("-"),
             session.monitor_profile,
             session.attached_clients,
@@ -81,10 +82,11 @@ pub fn render_doctor(result: &DoctorResponse) -> String {
 pub fn render_start(result: &SessionStartResponse) -> String {
     let session = &result.session;
     format!(
-        "session {} {} role={} name={} monitor={} attached_existing={}\n",
+        "session {} {} role={} spawn={} name={} monitor={} attached_existing={}\n",
         session.session_id,
         process_state(&session.process_state),
         role(&session.role),
+        session.spawn_mode,
         session.name.as_deref().unwrap_or("-"),
         session.monitor_profile,
         result.attached_existing
@@ -94,10 +96,11 @@ pub fn render_start(result: &SessionStartResponse) -> String {
 pub fn render_session_status(result: &SessionInspectResponse) -> String {
     let session = &result.session;
     format!(
-        "session {} {} role={} name={} monitor={} clients={} owner={}\n",
+        "session {} {} role={} spawn={} name={} monitor={} clients={} owner={}\n",
         session.session_id,
         process_state(&session.process_state),
         role(&session.role),
+        session.spawn_mode,
         session.name.as_deref().unwrap_or("-"),
         session.monitor_profile,
         session.attached_clients,
@@ -108,7 +111,7 @@ pub fn render_session_status(result: &SessionInspectResponse) -> String {
 pub fn render_logs(result: &SessionLogsResponse) -> String {
     let mut output = String::new();
     for line in &result.lines {
-        output.push_str(&line.line);
+        output.push_str(&render_log_line_text(line));
         output.push('\n');
     }
     output
@@ -124,8 +127,16 @@ pub fn render_events(result: &SessionEventsResponse) -> String {
 
 pub fn render_log_stream_frame(frame: &LogStreamFrame) -> String {
     match frame {
-        LogStreamFrame::Line { line } => format!("{}\n", line.line),
+        LogStreamFrame::Line { line } => format!("{}\n", render_log_line_text(line)),
         LogStreamFrame::Closed => String::new(),
+    }
+}
+
+pub fn render_log_line_text(line: &LogLine) -> String {
+    match line.stream {
+        LogStream::Pty => line.line.clone(),
+        LogStream::Stdout => format!("[stdout] {}", line.line),
+        LogStream::Stderr => format!("[stderr] {}", line.line),
     }
 }
 
@@ -239,6 +250,7 @@ pub fn render_inspect(result: &SessionInspectResponse) -> String {
     lines.push_str(&format!("session {}\n", session.session_id));
     push_field(&mut lines, "name", session.name.as_deref().unwrap_or("-"));
     push_field(&mut lines, "role", &role(&session.role));
+    push_field(&mut lines, "spawn", &session.spawn_mode.to_string());
     push_field(
         &mut lines,
         "process",
@@ -349,8 +361,10 @@ mod tests {
 
     use millrace_sessions_core::{
         ids::SessionId,
-        protocol::{SessionInspectResponse, M1_PROTOCOL_VERSION},
-        state::{AttentionState, ProcessState, SessionPaths},
+        protocol::{
+            SessionArtifacts, SessionCapabilities, SessionInspectResponse, M1_PROTOCOL_VERSION,
+        },
+        state::{AttentionState, ProcessState, SessionPaths, SpawnMode},
     };
     use serde_json::Value;
 
@@ -361,6 +375,7 @@ mod tests {
             session_id: SessionId::new(),
             name: Some("shell".to_string()),
             role: SessionRole::Shell,
+            spawn_mode: SpawnMode::Pty,
             process_state: ProcessState::Running,
             attention_state: AttentionState::Active,
             failure_message: None,
@@ -370,8 +385,12 @@ mod tests {
             monitor_profile: millrace_sessions_core::state::MonitorProfile::Auto,
             created_at: "2026-05-20T18:00:00Z".to_string(),
             updated_at: "2026-05-20T18:01:00Z".to_string(),
+            stop_requested_at: None,
+            stop_reason: None,
             attached_clients: 0,
             input_owner: None,
+            capabilities: SessionCapabilities::for_spawn_mode(SpawnMode::Pty),
+            artifacts: SessionArtifacts::default(),
         }
     }
 
@@ -413,6 +432,8 @@ mod tests {
                 meta_json: PathBuf::from("/state/sessions/id/meta.json"),
                 worker_json: PathBuf::from("/state/sessions/id/worker.json"),
                 pty_log: PathBuf::from("/state/sessions/id/pty.log"),
+                stdout_log: PathBuf::from("/state/sessions/id/stdout.log"),
+                stderr_log: PathBuf::from("/state/sessions/id/stderr.log"),
                 events_jsonl: PathBuf::from("/state/sessions/id/events.jsonl"),
                 scrollback_snapshot: PathBuf::from("/state/sessions/id/scrollback.snapshot"),
                 terminal_snapshot: PathBuf::from("/state/sessions/id/terminal.snapshot.json"),

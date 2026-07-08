@@ -9,7 +9,7 @@ use assert_cmd::prelude::*;
 use millrace_sessions_core::{
     ids::SessionId,
     paths::StatePaths,
-    state::{AttentionState, ProcessState, SessionMeta, SessionRole},
+    state::{AttentionState, ProcessState, SessionMeta, SessionRole, SpawnMode},
     storage::write_json_atomic,
 };
 use serde_json::Value;
@@ -103,6 +103,7 @@ fn sample_meta(state: ProcessState, root: &Path) -> SessionMeta {
         workspace: None,
         cwd: root.to_path_buf(),
         argv: vec!["sh".to_string()],
+        spawn_mode: SpawnMode::Pty,
         monitor_profile: millrace_sessions_core::state::MonitorProfile::Auto,
         env: BTreeMap::new(),
         worker_pid: None,
@@ -110,6 +111,8 @@ fn sample_meta(state: ProcessState, root: &Path) -> SessionMeta {
         child_pgid: None,
         started_at: None,
         ended_at: None,
+        stop_requested_at: None,
+        stop_reason: None,
         exit_code: None,
         exit_signal: None,
         failure_message: None,

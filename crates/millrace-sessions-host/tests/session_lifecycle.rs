@@ -15,12 +15,12 @@ use millrace_sessions_core::{
     paths::{StatePaths, STATE_DIR_ENV},
     protocol::{
         AttachFrameType, AttachInitialReplay, AttachStreamFrame, ControlErrorCode, ControlResponse,
-        SessionAttachResponse, SessionDeleteResponse, SessionEventsResponse, SessionKillResponse,
-        SessionLogsResponse, SessionResizeResponse, SessionSendResponse, SessionStartResponse,
-        SessionStopResponse, SnapshotUnavailableReason,
+        LogStream, SessionAttachResponse, SessionDeleteResponse, SessionEventsResponse,
+        SessionKillResponse, SessionLogsResponse, SessionResizeResponse, SessionSendResponse,
+        SessionStartResponse, SessionStopResponse, SnapshotUnavailableReason,
     },
     scrollback::{restore_terminal_replay, TerminalSnapshot, TerminalStateBuffer},
-    state::{ProcessState, SessionMeta, WorkerMeta},
+    state::{ProcessState, SessionMeta, SpawnMode, WorkerMeta},
     storage::{append_raw_pty_log, read_json},
 };
 use nix::sys::socket::{setsockopt, sockopt::RcvBuf};
@@ -421,6 +421,173 @@ fn logs_reads_tail_from_host_artifact() {
         .map(|line| line.line.as_str())
         .collect::<Vec<_>>();
     assert_eq!(lines, ["two", "three"]);
+
+    daemon.kill();
+}
+
+#[test]
+fn pipe_session_exposes_stream_logs_capabilities_and_artifacts() {
+    let temp = tempfile::tempdir().unwrap();
+    let paths = StatePaths::new(temp.path().join("state"));
+    let workspace = temp.path().join("workspace");
+    fs::create_dir_all(&workspace).unwrap();
+    let mut daemon = DaemonChild::spawn(&paths);
+    wait_for_socket(&paths.control_sock);
+
+    let start = start_pipe_session(
+        &paths,
+        &workspace,
+        "pipe-artifacts",
+        "printf 'pipe-out\\n'; printf 'pipe-err\\n' >&2; exit 7",
+    );
+    assert_eq!(start.session.spawn_mode, SpawnMode::Pipe);
+    assert!(!start.session.capabilities.attach);
+    assert!(!start.session.capabilities.send);
+    assert!(!start.session.capabilities.resize);
+    assert!(start.session.artifacts.pty.is_none());
+    assert!(start.session.artifacts.pipe.is_some());
+
+    let session_paths = paths.session_paths(start.session.session_id);
+    wait_for_file_contains(&session_paths.stdout_log, "pipe-out");
+    wait_for_file_contains(&session_paths.stderr_log, "pipe-err");
+    let meta = wait_for_terminal_meta(&session_paths.meta_json);
+    assert_eq!(meta.spawn_mode, SpawnMode::Pipe);
+    assert_eq!(meta.exit_code, Some(7));
+    assert!(
+        !session_paths.pty_log.exists(),
+        "pipe sessions must not fake pty.log"
+    );
+
+    let listed = listed_session(&paths, start.session.session_id);
+    assert_eq!(listed["spawn_mode"], "pipe", "{listed:#}");
+    assert_eq!(listed["capabilities"]["attach"], false, "{listed:#}");
+    assert!(listed["artifacts"]["pty"].is_null(), "{listed:#}");
+    assert!(
+        listed["artifacts"]["pipe"]["stdout_log"]
+            .as_str()
+            .is_some_and(|path| path.ends_with("stdout.log")),
+        "{listed:#}"
+    );
+
+    let inspected = inspected_session_summary(&paths, start.session.session_id);
+    assert_eq!(inspected["spawn_mode"], "pipe", "{inspected:#}");
+    assert_eq!(inspected["capabilities"]["send"], false, "{inspected:#}");
+    assert!(
+        inspected["artifacts"]["pipe"]["stderr_log"]
+            .as_str()
+            .is_some_and(|path| path.ends_with("stderr.log")),
+        "{inspected:#}"
+    );
+
+    let response = request_json(
+        &paths,
+        json!({
+            "id": "pipe-logs",
+            "method": "session.logs",
+            "params": {
+                "selector": {"type": "id", "session_id": start.session.session_id},
+                "tail": 10
+            }
+        }),
+    );
+    assert_eq!(response["ok"], true, "{response:#}");
+    let logs: SessionLogsResponse =
+        serde_json::from_value(response["result"].clone()).expect("logs result");
+    assert!(logs
+        .lines
+        .iter()
+        .any(|line| line.stream == LogStream::Stdout && line.line == "pipe-out"));
+    assert!(logs
+        .lines
+        .iter()
+        .any(|line| line.stream == LogStream::Stderr && line.line == "pipe-err"));
+
+    daemon.kill();
+}
+
+#[test]
+fn pipe_session_rejects_pty_only_control_methods() {
+    let temp = tempfile::tempdir().unwrap();
+    let paths = StatePaths::new(temp.path().join("state"));
+    let workspace = temp.path().join("workspace");
+    fs::create_dir_all(&workspace).unwrap();
+    let mut daemon = DaemonChild::spawn(&paths);
+    wait_for_socket(&paths.control_sock);
+
+    let start = start_pipe_session(
+        &paths,
+        &workspace,
+        "pipe-no-pty-controls",
+        "printf 'ready\\n'; sleep 5",
+    );
+    let session_paths = paths.session_paths(start.session.session_id);
+    wait_for_file_contains(&session_paths.stdout_log, "ready");
+    wait_for_running_meta(&session_paths.meta_json);
+
+    let attach = request_json(
+        &paths,
+        json!({
+            "id": "pipe-attach",
+            "method": "session.attach",
+            "params": {
+                "selector": {"type": "id", "session_id": start.session.session_id},
+                "replay": "none"
+            }
+        }),
+    );
+    assert_error(
+        &attach,
+        "pipe-attach",
+        ControlErrorCode::UnsupportedSpawnMode,
+    );
+
+    let send = request_json(
+        &paths,
+        json!({
+            "id": "pipe-send",
+            "method": "session.send",
+            "params": {
+                "selector": {"type": "id", "session_id": start.session.session_id},
+                "text": "hello\n"
+            }
+        }),
+    );
+    assert_error(&send, "pipe-send", ControlErrorCode::UnsupportedSpawnMode);
+
+    let resize = request_json(
+        &paths,
+        json!({
+            "id": "pipe-resize",
+            "method": "session.resize",
+            "params": {
+                "selector": {"type": "id", "session_id": start.session.session_id},
+                "rows": 24,
+                "cols": 80
+            }
+        }),
+    );
+    assert_error(
+        &resize,
+        "pipe-resize",
+        ControlErrorCode::UnsupportedSpawnMode,
+    );
+
+    let stop = request_json(
+        &paths,
+        json!({
+            "id": "pipe-stop",
+            "method": "session.stop",
+            "params": {
+                "selector": {"type": "id", "session_id": start.session.session_id},
+                "grace_seconds": 1
+            }
+        }),
+    );
+    assert_eq!(stop["ok"], true, "{stop:#}");
+    assert!(matches!(
+        wait_for_terminal_meta(&session_paths.meta_json).process_state,
+        ProcessState::Exited | ProcessState::Killed | ProcessState::Crashed
+    ));
 
     daemon.kill();
 }
@@ -1727,6 +1894,31 @@ fn start_session(
     );
     assert_eq!(response["ok"], true, "{response:#}");
     serde_json::from_value(response["result"].clone()).expect("start result")
+}
+
+fn start_pipe_session(
+    paths: &StatePaths,
+    workspace: &Path,
+    name: &str,
+    script: &str,
+) -> SessionStartResponse {
+    let response = request_json(
+        paths,
+        json!({
+            "id": format!("start-pipe-{name}"),
+            "method": "session.start",
+            "params": {
+                "name": name,
+                "role": "shell",
+                "spawn_mode": "pipe",
+                "workspace": workspace,
+                "cwd": workspace,
+                "argv": ["sh", "-c", script]
+            }
+        }),
+    );
+    assert_eq!(response["ok"], true, "{response:#}");
+    serde_json::from_value(response["result"].clone()).expect("pipe start result")
 }
 
 fn assert_error(response: &Value, id: &str, code: ControlErrorCode) {

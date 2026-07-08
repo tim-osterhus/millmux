@@ -4,7 +4,7 @@ use millrace_sessions_core::{
     events::{read_events, SessionEventKind},
     ids::SessionId,
     paths::StatePaths,
-    state::{AttentionState, ProcessState, SessionMeta, SessionRole, WorkerMeta},
+    state::{AttentionState, ProcessState, SessionMeta, SessionRole, SpawnMode, WorkerMeta},
     storage::{read_json, write_json_atomic},
 };
 use millrace_sessions_worker::{
@@ -29,6 +29,7 @@ fn lifecycle_writes_worker_facts_and_state_transitions() {
             worker_pid: 42,
             child_pid: Some(99),
             child_pgid: Some(99),
+            spawn_mode: SpawnMode::Pty,
         },
     )
     .expect("write worker meta");
@@ -67,6 +68,7 @@ fn worker_lifecycle_writes_private_metadata() {
             worker_pid: 42,
             child_pid: Some(99),
             child_pgid: Some(99),
+            spawn_mode: SpawnMode::Pty,
         },
     )
     .expect("write worker meta");
@@ -129,6 +131,59 @@ fn lifecycle_run_worker_persists_worker_meta_when_child_spawn_fails() {
     assert!(event.message.is_some());
 }
 
+#[cfg(unix)]
+#[test]
+fn pipe_worker_captures_separate_streams_without_pty_artifacts() {
+    let temp = tempfile::tempdir().unwrap();
+    let state_paths = StatePaths::new(temp.path().join("state"));
+    let mut session = sample_session(temp.path());
+    session.spawn_mode = SpawnMode::Pipe;
+    session.argv = vec![
+        "sh".to_string(),
+        "-c".to_string(),
+        "printf 'pipe-out\\n'; printf 'pipe-err\\n' >&2; exit 7".to_string(),
+    ];
+    let paths = state_paths.session_paths(session.id);
+    fs::create_dir_all(&paths.root).unwrap();
+    write_json_atomic(&paths.meta_json, &session).unwrap();
+
+    run_worker(session.id, state_paths.root.clone()).expect("pipe worker exits cleanly");
+
+    assert_eq!(fs::read_to_string(&paths.stdout_log).unwrap(), "pipe-out\n");
+    assert_eq!(fs::read_to_string(&paths.stderr_log).unwrap(), "pipe-err\n");
+    assert!(
+        !paths.pty_log.exists(),
+        "pipe sessions must not fake pty.log"
+    );
+    assert!(!paths.scrollback_snapshot.exists());
+    assert!(!paths.terminal_snapshot.exists());
+    assert!(!paths.raw_replay_ring.exists());
+
+    let worker: WorkerMeta = read_json(&paths.worker_json).unwrap();
+    assert_eq!(worker.spawn_mode, SpawnMode::Pipe);
+    assert_eq!(worker.process_state, ProcessState::Exited);
+    assert_eq!(worker.exit_code, Some(7));
+
+    let meta: SessionMeta = read_json(&paths.meta_json).unwrap();
+    assert_eq!(meta.spawn_mode, SpawnMode::Pipe);
+    assert_eq!(meta.process_state, ProcessState::Exited);
+    assert_eq!(meta.exit_code, Some(7));
+
+    let events = read_events(&paths.events_jsonl).unwrap();
+    assert!(events.iter().any(|event| {
+        event.kind == SessionEventKind::Output
+            && event.message.as_deref() == Some("pipe-out\n")
+            && event.fields.get("stream").map(String::as_str) == Some("stdout")
+            && event.fields.get("record_kind").map(String::as_str) == Some("chunk")
+    }));
+    assert!(events.iter().any(|event| {
+        event.kind == SessionEventKind::Output
+            && event.message.as_deref() == Some("pipe-err\n")
+            && event.fields.get("stream").map(String::as_str) == Some("stderr")
+            && event.fields.get("record_kind").map(String::as_str) == Some("chunk")
+    }));
+}
+
 fn sample_session(cwd: &Path) -> SessionMeta {
     let now = "2026-05-20T18:00:00Z".to_string();
     SessionMeta {
@@ -140,6 +195,7 @@ fn sample_session(cwd: &Path) -> SessionMeta {
         workspace: None,
         cwd: cwd.to_path_buf(),
         argv: vec!["sh".to_string(), "-c".to_string(), "echo ready".to_string()],
+        spawn_mode: SpawnMode::Pty,
         monitor_profile: millrace_sessions_core::state::MonitorProfile::Auto,
         env: BTreeMap::new(),
         created_at: now.clone(),
@@ -149,6 +205,8 @@ fn sample_session(cwd: &Path) -> SessionMeta {
         child_pgid: None,
         started_at: None,
         ended_at: None,
+        stop_requested_at: None,
+        stop_reason: None,
         exit_code: None,
         exit_signal: None,
         failure_message: None,

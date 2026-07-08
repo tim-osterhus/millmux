@@ -14,7 +14,10 @@ use millrace_sessions_core::{
         DoctorResponse, DoctorSeverity, DoctorStatus, M1_PROTOCOL_VERSION,
     },
     scrollback::{legacy_line_scrollback_tui_sequence_name, ScrollbackBuffer},
-    state::{HostMeta, ProcessState, SessionRole, UiContext, UiContextPaths, UiEvent, UiEventKind},
+    state::{
+        HostMeta, ProcessState, SessionRole, SpawnMode, UiContext, UiContextPaths, UiEvent,
+        UiEventKind,
+    },
     storage::{append_json_line, create_private_dir_all, read_json},
 };
 use serde_json::json;
@@ -223,17 +226,75 @@ fn check_host_socket(paths: &StatePaths, host: Option<&HostMeta>, issues: &mut V
 }
 
 fn check_session_record(record: &SessionRecord, issues: &mut Vec<DoctorIssue>) {
-    if !record.archived && !record.paths.pty_log.exists() {
-        issues.push(issue(
-            "missing_pty_log",
-            DoctorSeverity::Warning,
-            format!("session {} is missing pty.log", record.meta.id),
-            Some(record.meta.id),
-            Some(record.paths.pty_log.clone()),
-            false,
-            Some("preserve the session directory and inspect worker events".to_string()),
-            None,
-        ));
+    if !record.archived {
+        match record.meta.spawn_mode {
+            SpawnMode::Pty => {
+                if !record.paths.pty_log.exists() {
+                    issues.push(issue(
+                        "missing_pty_log",
+                        DoctorSeverity::Warning,
+                        format!("session {} is missing pty.log", record.meta.id),
+                        Some(record.meta.id),
+                        Some(record.paths.pty_log.clone()),
+                        false,
+                        Some(
+                            "preserve the session directory and inspect worker events".to_string(),
+                        ),
+                        None,
+                    ));
+                }
+                check_unexpected_artifact(
+                    record,
+                    &record.paths.stdout_log,
+                    "unexpected_stdout_log_for_pty",
+                    issues,
+                );
+                check_unexpected_artifact(
+                    record,
+                    &record.paths.stderr_log,
+                    "unexpected_stderr_log_for_pty",
+                    issues,
+                );
+            }
+            SpawnMode::Pipe => {
+                check_pipe_artifact(
+                    record,
+                    &record.paths.stdout_log,
+                    "missing_stdout_log",
+                    issues,
+                );
+                check_pipe_artifact(
+                    record,
+                    &record.paths.stderr_log,
+                    "missing_stderr_log",
+                    issues,
+                );
+                check_unexpected_artifact(
+                    record,
+                    &record.paths.pty_log,
+                    "unexpected_pty_log_for_pipe",
+                    issues,
+                );
+                check_unexpected_artifact(
+                    record,
+                    &record.paths.scrollback_snapshot,
+                    "unexpected_scrollback_for_pipe",
+                    issues,
+                );
+                check_unexpected_artifact(
+                    record,
+                    &record.paths.terminal_snapshot,
+                    "unexpected_terminal_snapshot_for_pipe",
+                    issues,
+                );
+                check_unexpected_artifact(
+                    record,
+                    &record.paths.raw_replay_ring,
+                    "unexpected_raw_replay_for_pipe",
+                    issues,
+                );
+            }
+        }
     }
     check_legacy_line_scrollback(record, issues);
     check_attach_stream_lag(record, issues);
@@ -285,6 +346,61 @@ fn check_session_record(record: &SessionRecord, issues: &mut Vec<DoctorIssue>) {
             Some(json!({ "pids": pids })),
         ));
     }
+}
+
+fn check_pipe_artifact(
+    record: &SessionRecord,
+    path: &Path,
+    code: &'static str,
+    issues: &mut Vec<DoctorIssue>,
+) {
+    if path.exists() {
+        return;
+    }
+    issues.push(issue(
+        code,
+        DoctorSeverity::Warning,
+        format!(
+            "pipe session {} is missing {}",
+            record.meta.id,
+            path.display()
+        ),
+        Some(record.meta.id),
+        Some(path.to_path_buf()),
+        false,
+        Some("preserve the session directory and inspect worker events".to_string()),
+        Some(json!({
+            "spawn_mode": record.meta.spawn_mode,
+        })),
+    ));
+}
+
+fn check_unexpected_artifact(
+    record: &SessionRecord,
+    path: &Path,
+    code: &'static str,
+    issues: &mut Vec<DoctorIssue>,
+) {
+    if !path.exists() {
+        return;
+    }
+    issues.push(issue(
+        code,
+        DoctorSeverity::Warning,
+        format!(
+            "session {} has artifact unexpected for spawn_mode={}: {}",
+            record.meta.id,
+            record.meta.spawn_mode,
+            path.display()
+        ),
+        Some(record.meta.id),
+        Some(path.to_path_buf()),
+        false,
+        Some("preserve the session directory and inspect worker events".to_string()),
+        Some(json!({
+            "spawn_mode": record.meta.spawn_mode,
+        })),
+    ));
 }
 
 fn check_attach_stream_lag(record: &SessionRecord, issues: &mut Vec<DoctorIssue>) {

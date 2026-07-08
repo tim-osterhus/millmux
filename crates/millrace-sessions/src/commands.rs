@@ -11,8 +11,7 @@ use millrace_sessions_core::{
         SessionSendRequest, SessionStartRequest, SessionStopRequest, UiContextGetRequest,
         UiContextListRequest,
     },
-    state::MonitorProfile,
-    state::SessionRole,
+    state::{MonitorProfile, SessionRole, SpawnMode},
 };
 use millrace_sessions_tui::{AgentCockpitLayout, DaemonConsoleLayout};
 use thiserror::Error;
@@ -83,6 +82,8 @@ pub struct StartArgs {
     pub json: bool,
     #[arg(long, value_parser = parse_monitor_profile, default_value = "auto")]
     pub monitor: MonitorProfile,
+    #[arg(long, value_parser = parse_spawn_mode, default_value = "pty")]
+    pub spawn_mode: SpawnMode,
     #[arg(last = true, required = true, num_args = 1..)]
     pub argv: Vec<String>,
 }
@@ -100,6 +101,7 @@ impl StartArgs {
             name: self.name.clone(),
             role: self.role.clone(),
             session_id: None,
+            spawn_mode: self.spawn_mode,
             monitor_profile: self.monitor.clone(),
             env: current_launch_env(),
         })
@@ -280,6 +282,7 @@ impl StopArgs {
         Ok(SessionStopRequest {
             selector: self.selector.required()?,
             grace_seconds: self.grace_seconds,
+            reason: None,
         })
     }
 }
@@ -516,6 +519,8 @@ pub enum CommandError {
     InvalidUiId(String),
     #[error("invalid monitor profile: {0}")]
     InvalidMonitorProfile(String),
+    #[error("invalid spawn mode: {0}")]
+    InvalidSpawnMode(String),
     #[error("invalid daemon console layout: {0}")]
     InvalidConsoleLayout(String),
     #[error("invalid agent cockpit layout: {0}")]
@@ -568,6 +573,12 @@ fn parse_monitor_profile(value: &str) -> Result<MonitorProfile, CommandError> {
     value
         .parse()
         .map_err(|_| CommandError::InvalidMonitorProfile(value.to_string()))
+}
+
+fn parse_spawn_mode(value: &str) -> Result<SpawnMode, CommandError> {
+    value
+        .parse()
+        .map_err(|_| CommandError::InvalidSpawnMode(value.to_string()))
 }
 
 fn parse_console_layout(value: &str) -> Result<DaemonConsoleLayout, CommandError> {
@@ -679,6 +690,30 @@ mod tests {
     }
 
     #[test]
+    fn commands_parse_pipe_spawn_mode_for_start() {
+        let cli = Cli::try_parse_from([
+            "millmux",
+            "start",
+            "--spawn-mode",
+            "pipe",
+            "--",
+            "sh",
+            "-c",
+            "echo ready",
+        ])
+        .unwrap();
+
+        match cli.command {
+            CliCommand::Start(args) => {
+                let request = args.request().unwrap();
+                assert_eq!(request.spawn_mode, SpawnMode::Pipe);
+                assert_eq!(request.argv, ["sh", "-c", "echo ready"]);
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
     fn commands_build_start_request_without_shell_string_execution() {
         let cli = Cli::try_parse_from([
             "millmux",
@@ -703,6 +738,7 @@ mod tests {
             CliCommand::Start(args) => {
                 let request = args.request().unwrap();
                 assert_eq!(request.argv, ["sh", "-c", "echo ready"]);
+                assert_eq!(request.spawn_mode, SpawnMode::Pty);
                 assert_eq!(request.name.as_deref(), Some("build"));
                 assert_eq!(request.role, Some(SessionRole::MillraceDaemon));
                 assert_eq!(request.workspace, Some(PathBuf::from("/tmp/workspace")));

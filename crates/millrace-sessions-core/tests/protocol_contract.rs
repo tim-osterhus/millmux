@@ -5,16 +5,17 @@ use millrace_sessions_core::{
     protocol::{
         AttachFrameType, AttachInitialReplay, AttachReplayMode, AttachStreamEncoding,
         AttachStreamFrame, AttachStreamLagReason, ControlErrorBody, ControlErrorCode,
-        ControlMethod, ControlRequest, ControlResponse, SessionAttachRequest,
-        SessionAttachResponse, SessionListRequest, SessionListResponse, SessionSelector,
-        SessionStartRequest, SessionSummary, SnapshotUnavailableReason, StreamKind, StreamSetup,
-        TerminalDimensions, UiContextGetRequest, UiContextSetRequest, WorkerAttachRequest,
-        WorkerAttachResponse, WorkerAttachStateResponse, WorkerControlMethod, WorkerControlRequest,
-        M1_PROTOCOL_VERSION, M2_ATTACH_PROTOCOL_VERSION,
+        ControlMethod, ControlRequest, ControlResponse, LogLine, LogStream, SessionArtifacts,
+        SessionAttachRequest, SessionAttachResponse, SessionCapabilities, SessionListRequest,
+        SessionListResponse, SessionSelector, SessionStartRequest, SessionSummary,
+        SnapshotUnavailableReason, StreamKind, StreamSetup, TerminalDimensions,
+        UiContextGetRequest, UiContextSetRequest, WorkerAttachRequest, WorkerAttachResponse,
+        WorkerAttachStateResponse, WorkerControlMethod, WorkerControlRequest, M1_PROTOCOL_VERSION,
+        M2_ATTACH_PROTOCOL_VERSION,
     },
     state::{
-        AttentionState, MonitorProfile, ProcessState, SessionRole, UiContext, UiDaemonHealth,
-        UiDaemonRecoveryAction, UiMode,
+        AttentionState, MonitorProfile, ProcessState, SessionRole, SpawnMode, UiContext,
+        UiDaemonHealth, UiDaemonRecoveryAction, UiMode,
     },
 };
 use serde_json::json;
@@ -32,6 +33,7 @@ fn session_start_request_matches_m1_jsonl_contract() {
         workspace: Some(PathBuf::from("/tmp/millmux-workspace")),
         name: Some("daemon".to_string()),
         role: Some(SessionRole::MillraceDaemon),
+        spawn_mode: SpawnMode::Pty,
         session_id: None,
         monitor_profile: MonitorProfile::Auto,
         env: BTreeMap::new(),
@@ -70,6 +72,46 @@ fn session_start_request_matches_m1_jsonl_contract() {
 }
 
 #[test]
+fn session_start_request_serializes_pipe_spawn_mode_when_requested() {
+    let params = SessionStartRequest {
+        argv: vec!["sh".to_string(), "-c".to_string(), "echo ready".to_string()],
+        cwd: Some(PathBuf::from("/tmp/millmux-workspace")),
+        workspace: Some(PathBuf::from("/tmp/millmux-workspace")),
+        name: Some("pipe".to_string()),
+        role: Some(SessionRole::Shell),
+        spawn_mode: SpawnMode::Pipe,
+        session_id: None,
+        monitor_profile: MonitorProfile::Auto,
+        env: BTreeMap::new(),
+    };
+
+    let request = ControlRequest::with_params("req_pipe", ControlMethod::SessionStart, &params)
+        .expect("params serialize");
+
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(
+            request
+                .to_json_line()
+                .expect("request serializes")
+                .trim_end()
+        )
+        .unwrap(),
+        json!({
+            "id": "req_pipe",
+            "method": "session.start",
+            "params": {
+                "argv": ["sh", "-c", "echo ready"],
+                "cwd": "/tmp/millmux-workspace",
+                "workspace": "/tmp/millmux-workspace",
+                "name": "pipe",
+                "role": "shell",
+                "spawn_mode": "pipe"
+            }
+        })
+    );
+}
+
+#[test]
 fn session_list_request_and_response_match_m1_jsonl_contract() {
     let request = ControlRequest::with_params(
         "req_list_1",
@@ -101,6 +143,7 @@ fn session_list_request_and_response_match_m1_jsonl_contract() {
             session_id,
             name: Some("daemon".to_string()),
             role: SessionRole::MillraceDaemon,
+            spawn_mode: SpawnMode::Pty,
             process_state: ProcessState::Running,
             attention_state: AttentionState::MillraceIdle,
             failure_message: None,
@@ -114,8 +157,12 @@ fn session_list_request_and_response_match_m1_jsonl_contract() {
             monitor_profile: MonitorProfile::Basic,
             created_at: "2026-05-20T18:00:00Z".to_string(),
             updated_at: "2026-05-20T18:01:00Z".to_string(),
+            stop_requested_at: None,
+            stop_reason: None,
             attached_clients: 0,
             input_owner: None,
+            capabilities: SessionCapabilities::for_spawn_mode(SpawnMode::Pty),
+            artifacts: SessionArtifacts::default(),
         }],
     };
 
@@ -135,6 +182,7 @@ fn session_list_request_and_response_match_m1_jsonl_contract() {
                     "session_id": "018f5d8d-3e79-4a62-9bc5-51c3c7f4d5c8",
                     "name": "daemon",
                     "role": "millrace_daemon",
+                    "spawn_mode": "pty",
                     "process_state": "running",
                     "attention_state": "millrace_idle",
                     "workspace": null,
@@ -144,7 +192,18 @@ fn session_list_request_and_response_match_m1_jsonl_contract() {
                     "created_at": "2026-05-20T18:00:00Z",
                     "updated_at": "2026-05-20T18:01:00Z",
                     "attached_clients": 0,
-                    "input_owner": null
+                    "input_owner": null,
+                    "capabilities": {
+                        "schema_version": 1,
+                        "attach": true,
+                        "raw_attach": false,
+                        "send": true,
+                        "resize": true,
+                        "screen": false
+                    },
+                    "artifacts": {
+                        "schema_version": 1
+                    }
                 }]
             }
         })
@@ -155,6 +214,67 @@ fn session_list_request_and_response_match_m1_jsonl_contract() {
         .result_as::<SessionListResponse>()
         .expect("typed result");
     assert_eq!(decoded_result.sessions[0].session_id, session_id);
+}
+
+#[test]
+fn legacy_log_line_without_stream_defaults_to_pty() {
+    let line: LogLine =
+        serde_json::from_value(json!({"timestamp": "2026-05-20T18:00:00Z", "line": "ready"}))
+            .unwrap();
+
+    assert_eq!(line.stream, LogStream::Pty);
+    assert_eq!(line.line, "ready");
+}
+
+#[test]
+fn session_artifacts_contract_versions_pty_and_pipe_shapes() {
+    let paths = millrace_sessions_core::state::SessionPaths {
+        root: PathBuf::from("/state/sessions/id"),
+        meta_json: PathBuf::from("/state/sessions/id/meta.json"),
+        worker_json: PathBuf::from("/state/sessions/id/worker.json"),
+        pty_log: PathBuf::from("/state/sessions/id/pty.log"),
+        stdout_log: PathBuf::from("/state/sessions/id/stdout.log"),
+        stderr_log: PathBuf::from("/state/sessions/id/stderr.log"),
+        events_jsonl: PathBuf::from("/state/sessions/id/events.jsonl"),
+        scrollback_snapshot: PathBuf::from("/state/sessions/id/scrollback.snapshot"),
+        terminal_snapshot: PathBuf::from("/state/sessions/id/terminal.snapshot.json"),
+        raw_replay_ring: PathBuf::from("/state/sessions/id/pty.replay"),
+        worker_sock: PathBuf::from("/state/sessions/id/worker.sock"),
+    };
+
+    assert_eq!(
+        serde_json::to_value(SessionArtifacts::for_paths(SpawnMode::Pty, &paths)).unwrap(),
+        json!({
+            "schema_version": 1,
+            "pty": {
+                "pty_log": "/state/sessions/id/pty.log",
+                "scrollback_snapshot": "/state/sessions/id/scrollback.snapshot",
+                "terminal_snapshot": "/state/sessions/id/terminal.snapshot.json",
+                "raw_replay_ring": "/state/sessions/id/pty.replay"
+            }
+        })
+    );
+    assert_eq!(
+        serde_json::to_value(SessionArtifacts::for_paths(SpawnMode::Pipe, &paths)).unwrap(),
+        json!({
+            "schema_version": 1,
+            "pipe": {
+                "stdout_log": "/state/sessions/id/stdout.log",
+                "stderr_log": "/state/sessions/id/stderr.log"
+            }
+        })
+    );
+    assert_eq!(
+        serde_json::to_value(SessionCapabilities::for_spawn_mode(SpawnMode::Pipe)).unwrap(),
+        json!({
+            "schema_version": 1,
+            "attach": false,
+            "raw_attach": false,
+            "send": false,
+            "resize": false,
+            "screen": false
+        })
+    );
 }
 
 #[test]

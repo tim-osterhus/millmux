@@ -9,13 +9,15 @@ use crate::{
     ids::{SessionId, UiId},
     state::{
         AttentionState, HostMeta, MonitorProfile, ProcessState, SessionPaths, SessionRole,
-        UiContext, UiContextPaths, UiEvent, WorkerMeta,
+        SpawnMode, UiContext, UiContextPaths, UiEvent, WorkerMeta,
     },
     workspace::WorkspaceIdentity,
 };
 
 pub const M1_PROTOCOL_VERSION: u32 = 1;
 pub const M2_ATTACH_PROTOCOL_VERSION: u32 = 2;
+pub const SESSION_CAPABILITIES_SCHEMA_VERSION: u32 = 1;
+pub const SESSION_ARTIFACTS_SCHEMA_VERSION: u32 = 1;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ControlMethod {
@@ -180,6 +182,7 @@ pub enum ControlErrorCode {
     MillraceStopFailed,
     UiContextNotFound,
     AmbiguousUiContext,
+    UnsupportedSpawnMode,
     InternalError,
 }
 
@@ -261,6 +264,8 @@ pub struct SessionStartRequest {
     pub name: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub role: Option<SessionRole>,
+    #[serde(default, skip_serializing_if = "SpawnMode::is_pty")]
+    pub spawn_mode: SpawnMode,
     #[serde(default, skip_serializing_if = "MonitorProfile::is_auto")]
     pub monitor_profile: MonitorProfile,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
@@ -574,6 +579,8 @@ pub struct SessionStopRequest {
     pub selector: SessionSelector,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub grace_seconds: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -690,6 +697,8 @@ pub struct SessionSummary {
     pub session_id: SessionId,
     pub name: Option<String>,
     pub role: SessionRole,
+    #[serde(default)]
+    pub spawn_mode: SpawnMode,
     pub process_state: ProcessState,
     pub attention_state: AttentionState,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -700,10 +709,117 @@ pub struct SessionSummary {
     pub monitor_profile: MonitorProfile,
     pub created_at: String,
     pub updated_at: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stop_requested_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stop_reason: Option<String>,
     #[serde(default)]
     pub attached_clients: u32,
     #[serde(default)]
     pub input_owner: Option<String>,
+    #[serde(default)]
+    pub capabilities: SessionCapabilities,
+    #[serde(default)]
+    pub artifacts: SessionArtifacts,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionCapabilities {
+    #[serde(default = "default_session_capabilities_schema_version")]
+    pub schema_version: u32,
+    pub attach: bool,
+    pub raw_attach: bool,
+    pub send: bool,
+    pub resize: bool,
+    pub screen: bool,
+}
+
+impl Default for SessionCapabilities {
+    fn default() -> Self {
+        Self::for_spawn_mode(SpawnMode::Pty)
+    }
+}
+
+impl SessionCapabilities {
+    pub fn for_spawn_mode(spawn_mode: SpawnMode) -> Self {
+        match spawn_mode {
+            SpawnMode::Pty => Self {
+                schema_version: SESSION_CAPABILITIES_SCHEMA_VERSION,
+                attach: true,
+                raw_attach: false,
+                send: true,
+                resize: true,
+                screen: false,
+            },
+            SpawnMode::Pipe => Self {
+                schema_version: SESSION_CAPABILITIES_SCHEMA_VERSION,
+                attach: false,
+                raw_attach: false,
+                send: false,
+                resize: false,
+                screen: false,
+            },
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionArtifacts {
+    #[serde(default = "default_session_artifacts_schema_version")]
+    pub schema_version: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pty: Option<PtyArtifacts>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pipe: Option<PipeArtifacts>,
+}
+
+impl Default for SessionArtifacts {
+    fn default() -> Self {
+        Self {
+            schema_version: SESSION_ARTIFACTS_SCHEMA_VERSION,
+            pty: None,
+            pipe: None,
+        }
+    }
+}
+
+impl SessionArtifacts {
+    pub fn for_paths(spawn_mode: SpawnMode, paths: &SessionPaths) -> Self {
+        match spawn_mode {
+            SpawnMode::Pty => Self {
+                schema_version: SESSION_ARTIFACTS_SCHEMA_VERSION,
+                pty: Some(PtyArtifacts {
+                    pty_log: paths.pty_log.clone(),
+                    scrollback_snapshot: paths.scrollback_snapshot.clone(),
+                    terminal_snapshot: paths.terminal_snapshot.clone(),
+                    raw_replay_ring: paths.raw_replay_ring.clone(),
+                }),
+                pipe: None,
+            },
+            SpawnMode::Pipe => Self {
+                schema_version: SESSION_ARTIFACTS_SCHEMA_VERSION,
+                pty: None,
+                pipe: Some(PipeArtifacts {
+                    stdout_log: paths.stdout_log.clone(),
+                    stderr_log: paths.stderr_log.clone(),
+                }),
+            },
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PtyArtifacts {
+    pub pty_log: PathBuf,
+    pub scrollback_snapshot: PathBuf,
+    pub terminal_snapshot: PathBuf,
+    pub raw_replay_ring: PathBuf,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PipeArtifacts {
+    pub stdout_log: PathBuf,
+    pub stderr_log: PathBuf,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -759,9 +875,30 @@ pub struct SessionLogsResponse {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LogLine {
+    #[serde(default)]
+    pub stream: LogStream,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub timestamp: Option<String>,
     pub line: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LogStream {
+    #[default]
+    Pty,
+    Stdout,
+    Stderr,
+}
+
+impl LogStream {
+    pub fn as_wire_value(&self) -> &'static str {
+        match self {
+            Self::Pty => "pty",
+            Self::Stdout => "stdout",
+            Self::Stderr => "stderr",
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -798,6 +935,10 @@ pub struct SessionStopResponse {
     pub session_id: SessionId,
     pub process_state: ProcessState,
     pub stop_requested: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stop_requested_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stop_reason: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1320,6 +1461,14 @@ fn is_false(value: &bool) -> bool {
     !*value
 }
 
+fn default_session_capabilities_schema_version() -> u32 {
+    SESSION_CAPABILITIES_SCHEMA_VERSION
+}
+
+fn default_session_artifacts_schema_version() -> u32 {
+    SESSION_ARTIFACTS_SCHEMA_VERSION
+}
+
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
@@ -1388,6 +1537,10 @@ mod tests {
             (ControlErrorCode::PermissionError, "permission_error"),
             (ControlErrorCode::IoError, "io_error"),
             (ControlErrorCode::WorkerUnavailable, "worker_unavailable"),
+            (
+                ControlErrorCode::UnsupportedSpawnMode,
+                "unsupported_spawn_mode",
+            ),
             (ControlErrorCode::MillraceStopFailed, "millrace_stop_failed"),
             (ControlErrorCode::InternalError, "internal_error"),
         ];
@@ -1412,6 +1565,7 @@ mod tests {
             workspace: None,
             name: Some("hello".to_string()),
             role: Some(SessionRole::Shell),
+            spawn_mode: SpawnMode::Pty,
             session_id: None,
             monitor_profile: MonitorProfile::Auto,
             env: BTreeMap::new(),

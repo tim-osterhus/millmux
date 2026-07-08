@@ -126,6 +126,139 @@ fn lifecycle_commands_emit_stable_json_results() {
     assert_eq!(purged["purged"], true);
 }
 
+#[test]
+fn pipe_lifecycle_commands_emit_stable_json_results() {
+    let host = TempHost::new();
+    let workspace = tempfile::tempdir().expect("workspace");
+
+    let stop_id = start_pipe_session(
+        &host,
+        workspace.path(),
+        "cli-pipe-stop",
+        "trap 'exit 0' TERM; printf 'pipe-ready\\n'; while true; do sleep 1; done",
+    );
+    let logs_output = millmux_command(&host)
+        .args(["logs", "--json", &stop_id])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let logs: Value = serde_json::from_slice(&logs_output).expect("pipe logs json");
+    assert!(logs["lines"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|line| { line["stream"] == "stdout" && line["line"] == "pipe-ready" }));
+
+    let events_output = millmux_command(&host)
+        .args(["events", "--json", &stop_id])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let events: Value = serde_json::from_slice(&events_output).expect("pipe events json");
+    assert!(events["events"].as_array().unwrap().iter().any(|event| {
+        event["kind"] == "output"
+            && event["fields"]["stream"] == "stdout"
+            && event["fields"]["record_kind"] == "chunk"
+    }));
+
+    let stop_output = millmux_command(&host)
+        .args(["stop", &stop_id, "--grace-seconds", "1", "--json"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let stopped: Value = serde_json::from_slice(&stop_output).expect("pipe stop json");
+    assert_eq!(stopped["session_id"], stop_id);
+    assert_eq!(stopped["stop_requested"], true);
+    assert_eq!(stopped["stop_reason"], "session_stop");
+    let stop_requested_at = stopped["stop_requested_at"]
+        .as_str()
+        .expect("stop requested timestamp");
+
+    let session_root = host.state_dir().join("sessions").join(&stop_id);
+    let meta: Value = serde_json::from_str(
+        &fs::read_to_string(session_root.join("meta.json")).expect("pipe meta json"),
+    )
+    .expect("pipe meta value");
+    assert_eq!(meta["stop_requested_at"].as_str(), Some(stop_requested_at));
+    assert_eq!(meta["stop_reason"], "session_stop");
+    let worker: Value = serde_json::from_str(
+        &fs::read_to_string(session_root.join("worker.json")).expect("pipe worker json"),
+    )
+    .expect("pipe worker value");
+    assert_eq!(
+        worker["stop_requested_at"].as_str(),
+        Some(stop_requested_at)
+    );
+    assert_eq!(worker["stop_reason"], "session_stop");
+
+    let post_stop_events_output = millmux_command(&host)
+        .args(["events", "--json", &stop_id])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let post_stop_events: Value =
+        serde_json::from_slice(&post_stop_events_output).expect("post-stop pipe events json");
+    let post_stop_events = post_stop_events["events"].as_array().unwrap();
+    assert!(post_stop_events.iter().any(|event| {
+        event["kind"] == "stop_requested"
+            && event["fields"]["reason"] == "session_stop"
+            && event["fields"]["stop_requested_at"].as_str() == Some(stop_requested_at)
+    }));
+    assert!(post_stop_events.iter().any(|event| {
+        event["kind"] == "stop_requested"
+            && event["fields"]["reason"] == "sigterm_stop"
+            && event["fields"]["signal"] == "SIGTERM"
+    }));
+
+    let delete_output = millmux_command(&host)
+        .args(["delete", &stop_id, "--json"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let deleted: Value = serde_json::from_slice(&delete_output).expect("pipe delete json");
+    assert_eq!(deleted["session_id"], stop_id);
+    assert_eq!(deleted["archived"], true);
+
+    let kill_id = start_pipe_session(
+        &host,
+        workspace.path(),
+        "cli-pipe-kill",
+        "printf 'pipe-kill-ready\\n'; while true; do sleep 1; done",
+    );
+    let kill_output = millmux_command(&host)
+        .args(["kill", &kill_id, "--json"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let killed: Value = serde_json::from_slice(&kill_output).expect("pipe kill json");
+    assert_eq!(killed["session_id"], kill_id);
+    assert_eq!(killed["kill_requested"], true);
+    assert_eq!(killed["process_state"], "killed");
+
+    let purge_output = millmux_command(&host)
+        .args(["delete", &kill_id, "--purge", "--json"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let purged: Value = serde_json::from_slice(&purge_output).expect("pipe purge json");
+    assert_eq!(purged["session_id"], kill_id);
+    assert_eq!(purged["purged"], true);
+}
+
 fn start_session(host: &TempHost, workspace: &Path, name: &str, script: &str) -> String {
     let output = millmux_command(host)
         .args([
@@ -157,6 +290,45 @@ fn start_session(host: &TempHost, workspace: &Path, name: &str, script: &str) ->
             .join("sessions")
             .join(&session_id)
             .join("pty.log"),
+        "ready",
+    );
+    session_id
+}
+
+fn start_pipe_session(host: &TempHost, workspace: &Path, name: &str, script: &str) -> String {
+    let output = millmux_command(host)
+        .args([
+            "start",
+            "--json",
+            "--spawn-mode",
+            "pipe",
+            "--name",
+            name,
+            "--role",
+            "shell",
+            "--workspace",
+        ])
+        .arg(workspace)
+        .args(["--cwd"])
+        .arg(workspace)
+        .args(["--", "sh", "-c", script])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let value: Value = serde_json::from_slice(&output).expect("pipe start json");
+    assert_eq!(value["session"]["spawn_mode"], "pipe");
+    let session_id = value["session"]["session_id"]
+        .as_str()
+        .expect("session id")
+        .to_string();
+    wait_for_file_contains(
+        &host
+            .state_dir()
+            .join("sessions")
+            .join(&session_id)
+            .join("stdout.log"),
         "ready",
     );
     session_id

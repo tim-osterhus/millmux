@@ -9,8 +9,9 @@ use millrace_sessions_core::{
     error::{MillmuxError, MillmuxResult},
     events::{append_event, SessionEvent, SessionEventKind},
     ids::SessionId,
+    protocol::LogStream,
     scrollback::{ScrollbackBuffer, TerminalStateBuffer},
-    storage::append_raw_pty_log,
+    storage::{append_raw_log, append_raw_pty_log},
 };
 
 pub type SharedTerminalState = Arc<Mutex<TerminalStateBuffer>>;
@@ -37,6 +38,59 @@ pub struct OutputLogger {
 pub struct LoggedOutput {
     pub start_offset: u64,
     pub end_offset: u64,
+}
+
+#[derive(Clone)]
+pub struct PipeOutputLoggerConfig {
+    pub session_id: SessionId,
+    pub log: PathBuf,
+    pub events_jsonl: PathBuf,
+    pub stream: LogStream,
+}
+
+pub struct PipeOutputLogger {
+    config: PipeOutputLoggerConfig,
+}
+
+impl PipeOutputLogger {
+    pub fn new(config: PipeOutputLoggerConfig) -> MillmuxResult<Self> {
+        append_raw_log(&config.log, b"")?;
+        Ok(Self { config })
+    }
+
+    pub fn record_chunk(&mut self, bytes: &[u8], sequence: u64) -> MillmuxResult<LoggedOutput> {
+        let start_offset = fs::metadata(&self.config.log)
+            .map(|metadata| metadata.len())
+            .unwrap_or(0);
+        if bytes.is_empty() {
+            return Ok(LoggedOutput {
+                start_offset,
+                end_offset: start_offset,
+            });
+        }
+        let end_offset = start_offset + bytes.len() as u64;
+        append_raw_log(&self.config.log, bytes)?;
+        let message = String::from_utf8_lossy(bytes).to_string();
+        let mut event = SessionEvent::new(self.config.session_id, SessionEventKind::Output);
+        event.message = Some(message);
+        event.fields = BTreeMap::from([
+            (
+                "stream".to_string(),
+                self.config.stream.as_wire_value().to_string(),
+            ),
+            ("record_kind".to_string(), "chunk".to_string()),
+            ("pipe_sequence".to_string(), sequence.to_string()),
+            ("byte_count".to_string(), bytes.len().to_string()),
+            ("stream_start_offset".to_string(), start_offset.to_string()),
+            ("stream_end_offset".to_string(), end_offset.to_string()),
+            ("content_encoding".to_string(), "utf8_lossy".to_string()),
+        ]);
+        append_event(&self.config.events_jsonl, &event)?;
+        Ok(LoggedOutput {
+            start_offset,
+            end_offset,
+        })
+    }
 }
 
 impl OutputLogger {

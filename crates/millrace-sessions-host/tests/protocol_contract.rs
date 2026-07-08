@@ -17,7 +17,9 @@ use millrace_sessions_core::{
         SessionAttachResponse, SessionInspectResponse, SessionListResponse, StreamKind,
         StreamSetup, M1_PROTOCOL_VERSION, M2_ATTACH_PROTOCOL_VERSION,
     },
-    state::{AttentionState, HostMeta, MonitorProfile, ProcessState, SessionMeta, SessionRole},
+    state::{
+        AttentionState, HostMeta, MonitorProfile, ProcessState, SessionMeta, SessionRole, SpawnMode,
+    },
     storage::{read_json, read_json_lines, write_json_atomic},
     workspace::WorkspaceIdentity,
 };
@@ -500,6 +502,7 @@ fn sample_session(workspace: impl AsRef<Path>) -> SessionMeta {
             "run".to_string(),
             "daemon".to_string(),
         ],
+        spawn_mode: SpawnMode::Pty,
         monitor_profile: MonitorProfile::Auto,
         env: BTreeMap::new(),
         worker_pid: None,
@@ -507,6 +510,8 @@ fn sample_session(workspace: impl AsRef<Path>) -> SessionMeta {
         child_pgid: None,
         started_at: None,
         ended_at: None,
+        stop_requested_at: None,
+        stop_reason: None,
         exit_code: None,
         exit_signal: None,
         failure_message: None,

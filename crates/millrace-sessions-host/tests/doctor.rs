@@ -15,8 +15,8 @@ use millrace_sessions_core::{
     },
     scrollback::{legacy_line_scrollback_contains_tui_sequences, ScrollbackBuffer},
     state::{
-        AttentionState, HostMeta, MonitorProfile, ProcessState, SessionMeta, SessionRole, UiEvent,
-        WorkerMeta,
+        AttentionState, HostMeta, MonitorProfile, ProcessState, SessionMeta, SessionRole,
+        SpawnMode, UiEvent, WorkerMeta,
     },
     storage::{
         append_raw_pty_log, create_private_dir_all, read_json, read_json_lines, write_json_atomic,
@@ -66,6 +66,35 @@ fn doctor_reports_structured_state_socket_and_session_issues() {
     assert_issue(&result, "missing_pid", DoctorSeverity::Critical);
     assert_issue(&result, "stale_worker_record", DoctorSeverity::Warning);
     assert_issue(&result, "missing_pty_log", DoctorSeverity::Warning);
+}
+
+#[test]
+fn doctor_checks_pipe_artifacts_without_requiring_pty_log() {
+    let temp = tempfile::tempdir().unwrap();
+    let paths = prepared_state(temp.path());
+    let mut pipe_session = sample_meta(ProcessState::Exited, temp.path());
+    pipe_session.spawn_mode = SpawnMode::Pipe;
+    write_session(&paths, &pipe_session, None, false);
+    let session_paths = paths.session_paths(pipe_session.id);
+    append_raw_pty_log(&session_paths.pty_log, b"stray pty\n").unwrap();
+
+    let result = run_doctor(&paths, None, &DoctorRequest::default()).unwrap();
+
+    assert_issue(&result, "missing_stdout_log", DoctorSeverity::Warning);
+    assert_issue(&result, "missing_stderr_log", DoctorSeverity::Warning);
+    assert_issue(
+        &result,
+        "unexpected_pty_log_for_pipe",
+        DoctorSeverity::Warning,
+    );
+    assert!(
+        result
+            .issues
+            .iter()
+            .all(|issue| issue.code != "missing_pty_log"),
+        "{:#?}",
+        result.issues
+    );
 }
 
 #[test]
@@ -527,6 +556,7 @@ fn sample_meta(state: ProcessState, root: &Path) -> SessionMeta {
         workspace: None,
         cwd: root.to_path_buf(),
         argv: vec!["sh".to_string()],
+        spawn_mode: SpawnMode::Pty,
         monitor_profile: MonitorProfile::Auto,
         env: BTreeMap::new(),
         worker_pid: None,
@@ -534,6 +564,8 @@ fn sample_meta(state: ProcessState, root: &Path) -> SessionMeta {
         child_pgid: None,
         started_at: None,
         ended_at: None,
+        stop_requested_at: None,
+        stop_reason: None,
         exit_code: None,
         exit_signal: None,
         failure_message: None,
@@ -548,9 +580,12 @@ fn sample_worker(session_id: SessionId, pid: u32, state: ProcessState) -> Worker
         pid,
         child_pid: None,
         child_pgid: None,
+        spawn_mode: SpawnMode::Pty,
         process_state: state,
         started_at: "2026-05-20T18:00:00Z".to_string(),
         ended_at: None,
+        stop_requested_at: None,
+        stop_reason: None,
         exit_code: None,
         exit_signal: None,
         attached_clients: 0,

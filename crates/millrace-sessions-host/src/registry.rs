@@ -9,8 +9,8 @@ use millrace_sessions_core::{
     ids::SessionId,
     paths::{session_paths as session_paths_in, StatePaths},
     protocol::{
-        SessionInspectResponse, SessionListRequest, SessionSelector, SessionSummary,
-        M1_PROTOCOL_VERSION,
+        SessionArtifacts, SessionCapabilities, SessionInspectResponse, SessionListRequest,
+        SessionSelector, SessionSummary, M1_PROTOCOL_VERSION,
     },
     state::{MonitorProfile, ProcessState, SessionMeta, SessionRole, WorkerMeta},
     storage::read_json,
@@ -244,22 +244,36 @@ fn load_optional_worker(path: &Path, registry: &mut HostRegistry) -> Option<Work
 }
 
 fn summary_from_record(record: &SessionRecord) -> SessionSummary {
-    summary_from_meta(&record.meta, record.worker.as_ref())
+    summary_from_meta(&record.meta, record.worker.as_ref(), &record.paths)
 }
 
-fn summary_from_meta(meta: &SessionMeta, worker: Option<&WorkerMeta>) -> SessionSummary {
+fn summary_from_meta(
+    meta: &SessionMeta,
+    worker: Option<&WorkerMeta>,
+    paths: &millrace_sessions_core::state::SessionPaths,
+) -> SessionSummary {
     let active = is_active_process_state(&meta.process_state);
-    let attached_clients = worker
-        .filter(|_| active)
-        .map_or(0, |worker| worker.attached_clients);
-    let input_owner = worker
-        .filter(|_| active)
-        .and_then(|worker| worker.input_owner.clone());
+    let terminal_capable = meta.spawn_mode.is_pty();
+    let attached_clients = if terminal_capable {
+        worker
+            .filter(|_| active)
+            .map_or(0, |worker| worker.attached_clients)
+    } else {
+        0
+    };
+    let input_owner = if terminal_capable {
+        worker
+            .filter(|_| active)
+            .and_then(|worker| worker.input_owner.clone())
+    } else {
+        None
+    };
 
     SessionSummary {
         session_id: meta.id,
         name: meta.name.clone(),
         role: meta.role.clone(),
+        spawn_mode: meta.spawn_mode,
         process_state: meta.process_state.clone(),
         attention_state: meta.attention_state.clone(),
         failure_message: meta.failure_message.clone(),
@@ -269,8 +283,12 @@ fn summary_from_meta(meta: &SessionMeta, worker: Option<&WorkerMeta>) -> Session
         monitor_profile: monitor_profile_from_meta(meta),
         created_at: meta.created_at.clone(),
         updated_at: meta.updated_at.clone(),
+        stop_requested_at: meta.stop_requested_at.clone(),
+        stop_reason: meta.stop_reason.clone(),
         attached_clients,
         input_owner,
+        capabilities: SessionCapabilities::for_spawn_mode(meta.spawn_mode),
+        artifacts: SessionArtifacts::for_paths(meta.spawn_mode, paths),
     }
 }
 
@@ -317,7 +335,7 @@ mod tests {
     use std::{collections::BTreeMap, str::FromStr};
 
     use millrace_sessions_core::{
-        state::{AttentionState, ProcessState},
+        state::{AttentionState, ProcessState, SpawnMode},
         storage::write_json_atomic,
     };
 
@@ -337,6 +355,7 @@ mod tests {
             workspace: None,
             cwd: temp.path().to_path_buf(),
             argv: vec!["sh".to_string()],
+            spawn_mode: SpawnMode::Pty,
             monitor_profile: MonitorProfile::Auto,
             env: BTreeMap::new(),
             worker_pid: None,
@@ -344,6 +363,8 @@ mod tests {
             child_pgid: None,
             started_at: None,
             ended_at: None,
+            stop_requested_at: None,
+            stop_reason: None,
             exit_code: None,
             exit_signal: None,
             failure_message: None,
@@ -429,6 +450,7 @@ mod tests {
                 "run".to_string(),
                 "daemon".to_string(),
             ],
+            spawn_mode: SpawnMode::Pty,
             monitor_profile: MonitorProfile::Basic,
             env: BTreeMap::new(),
             worker_pid: None,
@@ -436,6 +458,8 @@ mod tests {
             child_pgid: None,
             started_at: None,
             ended_at: None,
+            stop_requested_at: None,
+            stop_reason: None,
             exit_code: None,
             exit_signal: None,
             failure_message: None,

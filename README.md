@@ -1,7 +1,9 @@
 # Millmux
 
 Millmux is a native local process/session substrate for long-running terminal
-and daemon-oriented work. The currently implemented substrate is PTY-centered.
+and daemon-oriented work. The default substrate is PTY-backed; an opt-in pipe
+spawn mode is available for daemon-style processes that only need stdout/stderr
+capture and lifecycle control.
 
 It gives operators and agents a narrow alternative to keeping important work
 alive inside tmux panes: start a process, detach, reattach, inspect logs, send
@@ -22,9 +24,10 @@ support is not currently documented or tested.
 
 A Millmux session has three layers:
 
-- a hosted process, which is the command running inside a PTY;
-- a per-session worker, which owns that PTY and keeps running while clients
-  attach and detach;
+- a hosted process, which is the command running inside a PTY or as a pipe
+  child;
+- a per-session worker, which owns the PTY or pipe capture and keeps running
+  while clients inspect or control the session;
 - one or more clients, such as the CLI, console, or cockpit, which observe or
   control the same session.
 
@@ -36,8 +39,8 @@ For Millrace workflows, keep three layers separate:
 - Millrace runtime truth: tasks, queues, incidents, approvals, recovery, and
   completion evidence.
 - Millmux substrate truth: sessions, workers, process state, attach state,
-  logs, events, PTY evidence, terminal replay checkpoints, and UI context
-  records.
+  logs, events, PTY or pipe evidence, terminal replay checkpoints when present,
+  and UI context records.
 - Renderer/client truth: human attach, console, cockpit, and any future tmux or
   UI adapter.
 
@@ -87,6 +90,14 @@ millmux logs tests --tail 80
 millmux status tests --json
 ```
 
+Start a pipe-mode command when stdout/stderr capture is enough and PTY
+interaction is intentionally unavailable:
+
+```bash
+millmux start --spawn-mode pipe --name daemon --role generic -- ./daemon
+millmux logs daemon --json
+```
+
 Open the Millrace-oriented console when you are running a Millrace workspace:
 
 ```bash
@@ -119,9 +130,12 @@ Millmux owns session and terminal truth:
 - per-session worker process and child process lifecycle;
 - PTY input ownership, attach streams, resize, raw output, bounded scrollback,
   terminal snapshots, and bounded raw replay;
+- pipe-mode stdout/stderr capture, stream-tagged log events, and process-group
+  lifecycle control without attach/send/resize support;
 - local session artifacts: `meta.json`, `worker.json`, `pty.log`,
-  `events.jsonl`, `scrollback.snapshot`, `terminal.snapshot.json`, and
-  `pty.replay`;
+  `stdout.log`, `stderr.log`, `events.jsonl`, `scrollback.snapshot`,
+  `terminal.snapshot.json`, and `pty.replay` as applicable for the session's
+  spawn mode;
 - UI context records for console and cockpit clients, including daemon health
   for visible and managed daemons.
 
@@ -154,10 +168,11 @@ do not keep stale owner values.
 | Command | Purpose |
 | --- | --- |
 | `millmux start -- ...` | Start an explicit argv in a durable PTY session. |
+| `millmux start --spawn-mode pipe -- ...` | Start an explicit argv without a PTY; capture stdout/stderr separately. |
 | `millmux attach <session>` | Attach to a session without tying process lifetime to the attaching terminal. |
 | `millmux send <session> --text ...` | Send input to the PTY. |
 | `millmux resize <session> --rows N --cols N` | Resize the hosted PTY. |
-| `millmux logs <session>` | Read or follow raw PTY output. |
+| `millmux logs <session>` | Read or follow PTY output or stream-tagged pipe output. |
 | `millmux events <session>` | Read or follow structured session events. |
 | `millmux inspect <session> --json` | Inspect metadata, paths, argv, workspace binding, and worker state. |
 | `millmux stop <session>` | Request graceful stop. |
@@ -277,10 +292,24 @@ millmux start \
   -- millrace run daemon --workspace "$WORKSPACE" --monitor basic
 ```
 
+Pipe mode can be selected explicitly for daemon dogfood:
+
+```bash
+millmux start \
+  --spawn-mode pipe \
+  --workspace "$WORKSPACE" \
+  --role millrace-daemon \
+  --json \
+  -- millrace run daemon --workspace "$WORKSPACE" --monitor basic
+```
+
 Millmux records the daemon as a `millrace-daemon` session bound to the
 canonical workspace path. Duplicate active daemon sessions for the same
 workspace are refused or resolved to the matching existing session when the
 argv is identical.
+
+Console and cockpit daemon autostart still use PTY mode by default. This
+checkout does not switch daemon defaults to pipe.
 
 Inspect the daemon:
 
@@ -325,6 +354,8 @@ session-control.sock
 sessions/<session-id>/meta.json
 sessions/<session-id>/worker.json
 sessions/<session-id>/pty.log
+sessions/<session-id>/stdout.log
+sessions/<session-id>/stderr.log
 sessions/<session-id>/events.jsonl
 sessions/<session-id>/scrollback.snapshot
 sessions/<session-id>/terminal.snapshot.json
@@ -334,22 +365,30 @@ views/<ui-id>/events.jsonl
 archive/<session-id>/...
 ```
 
-Raw PTY logs, terminal snapshots, replay rings, and UI context files are
-local-sensitive diagnostics. They can contain prompts, command output, paths,
-tokens printed by child processes, and workspace details. Millmux uses private
-Unix permissions for state artifacts, but it does not sanitize PTY output.
+Raw PTY logs, pipe stdout/stderr logs, terminal snapshots, replay rings, and UI
+context files are local-sensitive diagnostics. They can contain prompts,
+command output, paths, tokens printed by child processes, and workspace
+details. Millmux uses private Unix permissions for state artifacts, but it does
+not sanitize PTY or pipe output. Pipe-mode `stdout.log` and `stderr.log` are
+append-only V1 artifacts with no rotation or size bound in this batch.
 Active `worker.json` records may also include attach client counts and the
 current input-owner stream id; lifecycle paths clear those fields for terminal
 records.
 
 ## Lifecycle Safety
 
-- `stop` is graceful and records stop evidence.
+- `stop` is graceful and records stop evidence, including
+  `stop_requested_at` and `stop_reason` in session/worker metadata and stop
+  events.
 - `kill` is explicit and records `kill_requested`.
 - `delete` archives stopped sessions by default.
 - `delete --purge` removes artifacts and should be used deliberately.
 - Crashed, stale, lost, killed, exited, and archived sessions remain
   inspectable instead of being silently discarded.
+
+On Unix, pipe children are launched in their own process group so stop/kill can
+signal the recorded child group. Native Windows process semantics are not
+implemented or tested; use WSL for Windows-hosted development.
 
 Host startup reconciles recorded session metadata against local process ids.
 Live records are preserved, dead active records are marked terminal, and logs
@@ -381,6 +420,11 @@ still have legacy `scrollback.snapshot` lines containing likely full-screen TUI
 control sequences. The guidance is to ignore that line scrollback for agent TUI
 replay, or archive the session only when it is stale or no longer needed, while
 preserving `pty.log`, `events.jsonl`, and other raw evidence.
+
+Doctor validates artifact shape by spawn mode: PTY sessions should have PTY
+artifacts, pipe sessions should have `stdout.log` and `stderr.log`, and
+unexpected artifacts from the other mode are reported as warnings rather than
+silently ignored.
 
 ## What Millmux Is Not
 

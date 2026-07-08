@@ -2,7 +2,12 @@ use std::{
     fs,
     io::{ErrorKind, Read},
     path::PathBuf,
-    sync::{Arc, Mutex},
+    process::ExitStatus,
+    sync::{
+        mpsc::{self, Sender},
+        Arc, Mutex,
+    },
+    thread,
 };
 
 use control::{start_control_server, WorkerControlConfig};
@@ -11,16 +16,20 @@ use millrace_sessions_core::{
     error::{MillmuxError, MillmuxResult},
     ids::SessionId,
     paths::StatePaths,
+    protocol::LogStream,
     scrollback::{
         ScrollbackBuffer, TerminalStateBuffer, DEFAULT_RAW_REPLAY_CAPACITY_BYTES,
         DEFAULT_TERMINAL_COLS, DEFAULT_TERMINAL_ROWS,
     },
+    state::{SessionMeta, SessionPaths, SpawnMode},
 };
+use pipe::{spawn_pipe, PipeCommandSpec};
 use pty::{spawn_pty, PtyCommandSpec};
 
 pub mod control;
 pub mod lifecycle;
 pub mod logging;
+pub mod pipe;
 pub mod pty;
 
 pub fn binary_name() -> &'static str {
@@ -44,9 +53,21 @@ pub fn run_worker(session_id: SessionId, state_dir: impl Into<PathBuf>) -> Millm
             worker_pid: std::process::id(),
             child_pid: None,
             child_pgid: None,
+            spawn_mode: meta.spawn_mode,
         },
     )?;
 
+    match meta.spawn_mode {
+        SpawnMode::Pty => run_pty_worker(session_id, session_paths, meta),
+        SpawnMode::Pipe => run_pipe_worker(session_id, session_paths, meta),
+    }
+}
+
+fn run_pty_worker(
+    session_id: SessionId,
+    session_paths: SessionPaths,
+    meta: SessionMeta,
+) -> MillmuxResult<()> {
     let running = match spawn_pty(PtyCommandSpec {
         argv: meta.argv.clone(),
         cwd: meta.cwd.clone(),
@@ -119,4 +140,144 @@ pub fn run_worker(session_id: SessionId, state_dir: impl Into<PathBuf>) -> Millm
     let status = child.wait()?;
     record_process_exit(&session_paths, status.exit_code() as i32, None)?;
     Ok(())
+}
+
+fn run_pipe_worker(
+    session_id: SessionId,
+    session_paths: SessionPaths,
+    meta: SessionMeta,
+) -> MillmuxResult<()> {
+    let running = match spawn_pipe(PipeCommandSpec {
+        argv: meta.argv.clone(),
+        cwd: meta.cwd.clone(),
+        env: meta.env.clone(),
+    }) {
+        Ok(running) => running,
+        Err(error) => {
+            let _ = record_failed_start(&session_paths, error.to_string());
+            return Err(error);
+        }
+    };
+    let pipe::RunningPipe {
+        stdout,
+        stderr,
+        mut child,
+        child_pid,
+        child_pgid,
+    } = running;
+
+    let mut stdout_logger = logging::PipeOutputLogger::new(logging::PipeOutputLoggerConfig {
+        session_id,
+        log: session_paths.stdout_log.clone(),
+        events_jsonl: session_paths.events_jsonl.clone(),
+        stream: LogStream::Stdout,
+    })?;
+    let mut stderr_logger = logging::PipeOutputLogger::new(logging::PipeOutputLoggerConfig {
+        session_id,
+        log: session_paths.stderr_log.clone(),
+        events_jsonl: session_paths.events_jsonl.clone(),
+        stream: LogStream::Stderr,
+    })?;
+
+    let (sender, receiver) = mpsc::channel();
+    let stdout_reader = spawn_pipe_reader(LogStream::Stdout, stdout, sender.clone());
+    let stderr_reader = spawn_pipe_reader(LogStream::Stderr, stderr, sender.clone());
+    drop(sender);
+
+    record_running(&session_paths, child_pid, child_pgid)?;
+
+    let mut sequence = 0_u64;
+    for message in receiver {
+        match message {
+            PipeReadMessage::Chunk { stream, bytes } => {
+                sequence += 1;
+                match stream {
+                    LogStream::Stdout => {
+                        stdout_logger.record_chunk(&bytes, sequence)?;
+                    }
+                    LogStream::Stderr => {
+                        stderr_logger.record_chunk(&bytes, sequence)?;
+                    }
+                    LogStream::Pty => {}
+                }
+            }
+            PipeReadMessage::Done { result } => result?,
+        }
+    }
+
+    let status = child.wait()?;
+    join_pipe_reader(stdout_reader)?;
+    join_pipe_reader(stderr_reader)?;
+    record_process_exit(
+        &session_paths,
+        exit_code_for_status(&status),
+        exit_signal_for_status(&status),
+    )?;
+    Ok(())
+}
+
+enum PipeReadMessage {
+    Chunk { stream: LogStream, bytes: Vec<u8> },
+    Done { result: MillmuxResult<()> },
+}
+
+fn spawn_pipe_reader<R>(
+    stream: LogStream,
+    mut reader: R,
+    sender: Sender<PipeReadMessage>,
+) -> thread::JoinHandle<()>
+where
+    R: Read + Send + 'static,
+{
+    thread::spawn(move || {
+        let mut buffer = [0_u8; 8192];
+        let result: MillmuxResult<()> = loop {
+            match reader.read(&mut buffer) {
+                Ok(0) => break Ok(()),
+                Ok(count) => {
+                    if sender
+                        .send(PipeReadMessage::Chunk {
+                            stream,
+                            bytes: buffer[..count].to_vec(),
+                        })
+                        .is_err()
+                    {
+                        break Ok(());
+                    }
+                }
+                Err(error) if error.kind() == ErrorKind::Interrupted => continue,
+                Err(error) => break Err(MillmuxError::Io(error)),
+            }
+        };
+        let _ = sender.send(PipeReadMessage::Done { result });
+    })
+}
+
+fn join_pipe_reader(handle: thread::JoinHandle<()>) -> MillmuxResult<()> {
+    handle
+        .join()
+        .map_err(|_| MillmuxError::Internal("pipe reader thread panicked".to_string()))
+}
+
+fn exit_code_for_status(status: &ExitStatus) -> i32 {
+    status.code().unwrap_or_else(|| {
+        exit_signal_number(status)
+            .map(|signal| 128 + signal)
+            .unwrap_or(-1)
+    })
+}
+
+fn exit_signal_for_status(status: &ExitStatus) -> Option<String> {
+    exit_signal_number(status).map(|signal| signal.to_string())
+}
+
+#[cfg(unix)]
+fn exit_signal_number(status: &ExitStatus) -> Option<i32> {
+    use std::os::unix::process::ExitStatusExt;
+    status.signal()
+}
+
+#[cfg(not(unix))]
+fn exit_signal_number(_status: &ExitStatus) -> Option<i32> {
+    None
 }

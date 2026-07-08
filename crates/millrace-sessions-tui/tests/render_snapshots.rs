@@ -3,8 +3,8 @@ use std::{collections::BTreeMap, path::PathBuf};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use millrace_sessions_core::{
     ids::{SessionId, UiId},
-    protocol::SessionSummary,
-    state::{AttentionState, MonitorProfile, ProcessState, SessionRole},
+    protocol::{SessionArtifacts, SessionCapabilities, SessionSummary},
+    state::{AttentionState, MonitorProfile, ProcessState, SessionRole, SpawnMode},
     workspace::WorkspaceIdentity,
 };
 use millrace_sessions_tui::{
@@ -472,6 +472,7 @@ fn summary(name: &str) -> SessionSummary {
         session_id: SessionId::new(),
         name: Some(name.to_string()),
         role: SessionRole::MillraceDaemon,
+        spawn_mode: SpawnMode::Pty,
         process_state: ProcessState::Running,
         attention_state: AttentionState::MillraceIdle,
         failure_message: None,
@@ -489,8 +490,12 @@ fn summary(name: &str) -> SessionSummary {
         monitor_profile: MonitorProfile::Basic,
         created_at: "2026-05-26T00:00:00Z".to_string(),
         updated_at: "2026-05-26T00:00:01Z".to_string(),
+        stop_requested_at: None,
+        stop_reason: None,
         attached_clients: 0,
         input_owner: None,
+        capabilities: SessionCapabilities::for_spawn_mode(SpawnMode::Pty),
+        artifacts: SessionArtifacts::default(),
     }
 }
 

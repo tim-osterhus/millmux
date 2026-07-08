@@ -78,6 +78,10 @@ pub fn read_json_lines<T: DeserializeOwned>(path: impl AsRef<Path>) -> MillmuxRe
 }
 
 pub fn append_raw_pty_log(path: impl AsRef<Path>, bytes: &[u8]) -> MillmuxResult<()> {
+    append_raw_log(path, bytes)
+}
+
+pub fn append_raw_log(path: impl AsRef<Path>, bytes: &[u8]) -> MillmuxResult<()> {
     let path = path.as_ref();
     if let Some(parent) = path.parent() {
         create_private_dir_all(parent)?;

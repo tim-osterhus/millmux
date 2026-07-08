@@ -71,6 +71,45 @@ pub enum ProcessState {
     Stale,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SpawnMode {
+    #[default]
+    Pty,
+    Pipe,
+}
+
+impl SpawnMode {
+    pub fn is_pty(&self) -> bool {
+        matches!(self, Self::Pty)
+    }
+
+    pub fn as_wire_value(&self) -> &'static str {
+        match self {
+            Self::Pty => "pty",
+            Self::Pipe => "pipe",
+        }
+    }
+}
+
+impl fmt::Display for SpawnMode {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_wire_value())
+    }
+}
+
+impl FromStr for SpawnMode {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value.trim().to_ascii_lowercase().replace('-', "_").as_str() {
+            "pty" => Ok(Self::Pty),
+            "pipe" => Ok(Self::Pipe),
+            _ => Err("spawn mode must be pty or pipe".to_string()),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AttentionState {
@@ -243,6 +282,8 @@ pub struct SessionPaths {
     pub meta_json: PathBuf,
     pub worker_json: PathBuf,
     pub pty_log: PathBuf,
+    pub stdout_log: PathBuf,
+    pub stderr_log: PathBuf,
     pub events_jsonl: PathBuf,
     pub scrollback_snapshot: PathBuf,
     pub terminal_snapshot: PathBuf,
@@ -261,6 +302,10 @@ impl<'de> Deserialize<'de> for SessionPaths {
             meta_json: PathBuf,
             worker_json: PathBuf,
             pty_log: PathBuf,
+            #[serde(default)]
+            stdout_log: Option<PathBuf>,
+            #[serde(default)]
+            stderr_log: Option<PathBuf>,
             events_jsonl: PathBuf,
             scrollback_snapshot: PathBuf,
             #[serde(default)]
@@ -271,6 +316,12 @@ impl<'de> Deserialize<'de> for SessionPaths {
         }
 
         let raw = RawSessionPaths::deserialize(deserializer)?;
+        let stdout_log = raw
+            .stdout_log
+            .unwrap_or_else(|| raw.root.join("stdout.log"));
+        let stderr_log = raw
+            .stderr_log
+            .unwrap_or_else(|| raw.root.join("stderr.log"));
         Ok(Self {
             terminal_snapshot: raw
                 .terminal_snapshot
@@ -282,6 +333,8 @@ impl<'de> Deserialize<'de> for SessionPaths {
             meta_json: raw.meta_json,
             worker_json: raw.worker_json,
             pty_log: raw.pty_log,
+            stdout_log,
+            stderr_log,
             events_jsonl: raw.events_jsonl,
             scrollback_snapshot: raw.scrollback_snapshot,
             worker_sock: raw.worker_sock,
@@ -300,6 +353,8 @@ pub struct SessionMeta {
     pub cwd: PathBuf,
     pub argv: Vec<String>,
     #[serde(default)]
+    pub spawn_mode: SpawnMode,
+    #[serde(default)]
     pub monitor_profile: MonitorProfile,
     pub env: BTreeMap<String, String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -312,6 +367,10 @@ pub struct SessionMeta {
     pub started_at: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ended_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stop_requested_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stop_reason: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub exit_code: Option<i32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -330,10 +389,16 @@ pub struct WorkerMeta {
     pub child_pid: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub child_pgid: Option<u32>,
+    #[serde(default)]
+    pub spawn_mode: SpawnMode,
     pub process_state: ProcessState,
     pub started_at: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ended_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stop_requested_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stop_reason: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub exit_code: Option<i32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -380,6 +445,8 @@ mod tests {
             serde_json::to_string(&ProcessState::Running).unwrap(),
             "\"running\""
         );
+        assert_eq!(serde_json::to_string(&SpawnMode::Pty).unwrap(), "\"pty\"");
+        assert_eq!(serde_json::to_string(&SpawnMode::Pipe).unwrap(), "\"pipe\"");
         assert_eq!(
             serde_json::to_string(&AttentionState::MillraceIdle).unwrap(),
             "\"millrace_idle\""
@@ -434,6 +501,7 @@ mod tests {
             workspace: None,
             cwd: PathBuf::from("/tmp"),
             argv: vec!["millrace".to_string(), "daemon".to_string()],
+            spawn_mode: SpawnMode::Pty,
             monitor_profile: MonitorProfile::Auto,
             env: BTreeMap::from([("PATH".to_string(), "/bin".to_string())]),
             worker_pid: Some(100),
@@ -441,6 +509,8 @@ mod tests {
             child_pgid: Some(101),
             started_at: Some("2026-05-20T00:00:01Z".to_string()),
             ended_at: None,
+            stop_requested_at: None,
+            stop_reason: None,
             exit_code: None,
             exit_signal: None,
             failure_message: None,
@@ -450,6 +520,42 @@ mod tests {
         let encoded = serde_json::to_string(&meta).unwrap();
         let decoded: SessionMeta = serde_json::from_str(&encoded).unwrap();
         assert_eq!(decoded, meta);
+    }
+
+    #[test]
+    fn session_meta_defaults_missing_spawn_mode_to_pty() {
+        let value = json!({
+            "id": SessionId::new(),
+            "name": null,
+            "role": "shell",
+            "process_state": "running",
+            "attention_state": "active",
+            "workspace": null,
+            "cwd": "/tmp",
+            "argv": ["sh"],
+            "env": {},
+            "created_at": "2026-05-20T00:00:00Z",
+            "updated_at": "2026-05-20T00:00:00Z"
+        });
+
+        let meta: SessionMeta = serde_json::from_value(value).unwrap();
+
+        assert_eq!(meta.spawn_mode, SpawnMode::Pty);
+    }
+
+    #[test]
+    fn worker_meta_defaults_missing_spawn_mode_to_pty() {
+        let value = json!({
+            "session_id": SessionId::new(),
+            "pid": 100,
+            "process_state": "running",
+            "started_at": "2026-05-20T00:00:00Z",
+            "updated_at": "2026-05-20T00:00:00Z"
+        });
+
+        let worker: WorkerMeta = serde_json::from_value(value).unwrap();
+
+        assert_eq!(worker.spawn_mode, SpawnMode::Pty);
     }
 
     #[test]
@@ -482,6 +588,14 @@ mod tests {
         assert_eq!(
             paths.raw_replay_ring,
             PathBuf::from("/state/sessions/session-1/pty.replay")
+        );
+        assert_eq!(
+            paths.stdout_log,
+            PathBuf::from("/state/sessions/session-1/stdout.log")
+        );
+        assert_eq!(
+            paths.stderr_log,
+            PathBuf::from("/state/sessions/session-1/stderr.log")
         );
     }
 }

@@ -9,7 +9,7 @@ use millrace_sessions_core::{
     ids::{SessionId, UiId},
     paths::StatePaths,
     scrollback::ScrollbackBuffer,
-    state::{AttentionState, MonitorProfile, ProcessState, SessionMeta, SessionRole},
+    state::{AttentionState, MonitorProfile, ProcessState, SessionMeta, SessionRole, SpawnMode},
     storage::{append_raw_pty_log, write_json_atomic},
 };
 use nix::{
@@ -130,6 +130,7 @@ fn seed_large_output_session(host: &TempHost) -> String {
         workspace: None,
         cwd: host.state_dir().to_path_buf(),
         argv: vec!["fixture-agent".to_string(), large_text.clone()],
+        spawn_mode: SpawnMode::Pty,
         monitor_profile: MonitorProfile::Auto,
         env: BTreeMap::new(),
         worker_pid: None,
@@ -137,6 +138,8 @@ fn seed_large_output_session(host: &TempHost) -> String {
         child_pgid: None,
         started_at: None,
         ended_at: Some("2026-05-26T18:00:00Z".to_string()),
+        stop_requested_at: None,
+        stop_reason: None,
         exit_code: Some(0),
         exit_signal: None,
         failure_message: None,
@@ -244,6 +247,86 @@ fn cli_smoke_short_reader_pipelines_exit_cleanly_for_json_and_line_outputs() {
     assert_short_reader_pipeline(&host, &["inspect", &session_id]);
     assert_short_reader_pipeline(&host, &["logs", &session_id]);
     assert_short_reader_pipeline(&host, &["events", "--json", &session_id]);
+}
+
+#[test]
+fn cli_smoke_pipe_start_logs_events_stop_and_delete_json() {
+    let host = TempHost::new();
+    let workspace = host.state_dir().join("pipe-workspace");
+    fs::create_dir_all(&workspace).unwrap();
+
+    let output = millmux_command(&host)
+        .args([
+            "start",
+            "--json",
+            "--spawn-mode",
+            "pipe",
+            "--name",
+            "pipe-cli",
+            "--role",
+            "shell",
+            "--workspace",
+        ])
+        .arg(&workspace)
+        .args(["--cwd"])
+        .arg(&workspace)
+        .args([
+            "--",
+            "sh",
+            "-c",
+            "printf 'pipe-cli-out\\n'; printf 'pipe-cli-err\\n' >&2; sleep 5",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let start: Value = serde_json::from_slice(&output).expect("pipe start json");
+    assert_eq!(start["session"]["spawn_mode"], "pipe");
+    assert_eq!(start["session"]["capabilities"]["send"], false);
+    let session_id = start["session"]["session_id"].as_str().unwrap().to_string();
+
+    wait_for_logs(&host, &session_id, "[stdout] pipe-cli-out");
+    wait_for_logs(&host, &session_id, "[stderr] pipe-cli-err");
+
+    let logs_output = millmux_command(&host)
+        .args(["logs", "--json", &session_id])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let logs: Value = serde_json::from_slice(&logs_output).expect("pipe logs json");
+    let lines = logs["lines"].as_array().expect("log lines");
+    assert!(lines
+        .iter()
+        .any(|line| line["stream"] == "stdout" && line["line"] == "pipe-cli-out"));
+    assert!(lines
+        .iter()
+        .any(|line| line["stream"] == "stderr" && line["line"] == "pipe-cli-err"));
+
+    let events_output = millmux_command(&host)
+        .args(["events", "--json", &session_id])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let events: Value = serde_json::from_slice(&events_output).expect("pipe events json");
+    assert!(events["events"].as_array().unwrap().iter().any(|event| {
+        event["kind"] == "output"
+            && event["fields"]["stream"] == "stdout"
+            && event["fields"]["record_kind"] == "chunk"
+    }));
+
+    millmux_command(&host)
+        .args(["stop", "--json", "--grace-seconds", "1", &session_id])
+        .assert()
+        .success();
+    millmux_command(&host)
+        .args(["delete", "--json", &session_id])
+        .assert()
+        .success();
 }
 
 #[test]
