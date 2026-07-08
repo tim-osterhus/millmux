@@ -18,7 +18,7 @@ rust-version = "1.78"
 assert_cmd = "2.0"
 base64 = "0.22"
 clap = { version = "4.5", features = ["derive"] }
-crossterm = "0.28"
+crossterm = { version = "0.28", features = ["bracketed-paste"] }
 directories = "5.0"
 insta = "1.39"
 nix = { version = "0.29", features = ["fs", "process", "signal", "socket", "term"] }

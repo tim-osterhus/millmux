@@ -8,7 +8,9 @@ use std::{
 
 use crossterm::{
     cursor::MoveTo,
-    event::{self, Event, KeyCode, KeyEvent, KeyModifiers},
+    event::{
+        self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEvent, KeyModifiers,
+    },
     execute,
     terminal::{
         disable_raw_mode, enable_raw_mode, Clear, ClearType, EnterAlternateScreen,
@@ -57,6 +59,8 @@ const TERMINAL_SCROLLBACK: usize = 4000;
 const CONTEXT_FILE_ENV: &str = "MILLMUX_CONTEXT_FILE";
 const AGENT_SESSION_ID_ENV: &str = "MILLMUX_AGENT_SESSION_ID";
 const MILLRACE_WORKSPACE_ENV: &str = "MILLRACE_WORKSPACE";
+const BRACKETED_PASTE_BEGIN: &str = "\x1b[200~";
+const BRACKETED_PASTE_END: &str = "\x1b[201~";
 
 pub async fn run_cockpit(args: CockpitArgs) -> Result<(), CockpitError> {
     let client = SessionControlClient::new()?;
@@ -584,6 +588,10 @@ async fn run_interactive_cockpit(
                         break;
                     }
                 }
+                Event::Paste(text) => {
+                    handle_cockpit_paste(&app, &mut attach, text).await?;
+                    redraw.mark_dirty();
+                }
                 Event::Resize(width, height) => {
                     if let Some((rows, cols)) = app.agent_terminal_size_for(width, height) {
                         if (rows, cols) != last_size {
@@ -929,10 +937,8 @@ async fn handle_cockpit_key(
             )
             .await?;
         }
-        KeyAction::Input(event)
-            if app.focused_agent_terminal() && app.agent_terminal_can_accept_input() =>
-        {
-            if let Some(text) = key_event_to_text(event) {
+        KeyAction::Input(event) => {
+            if let Some(text) = cockpit_key_input_text(app, event) {
                 attach
                     .writer
                     .write_frame(&AttachStreamFrame::Input { text })
@@ -945,6 +951,20 @@ async fn handle_cockpit_key(
         record_active_daemon_changed(client, app).await?;
     }
     Ok(false)
+}
+
+async fn handle_cockpit_paste(
+    app: &AppModel,
+    attach: &mut OpenedAgentAttach,
+    text: String,
+) -> Result<(), CockpitError> {
+    if let Some(text) = cockpit_paste_input_text(app, &text) {
+        attach
+            .writer
+            .write_frame(&AttachStreamFrame::Input { text })
+            .await?;
+    }
+    Ok(())
 }
 
 fn handle_daemon_switcher_key(app: &mut AppModel, event: KeyEvent) {
@@ -1057,25 +1077,83 @@ fn bound_fields(key: &str, session_id: Option<SessionId>) -> BTreeMap<String, St
     fields
 }
 
+fn cockpit_accepts_agent_text_input(app: &AppModel) -> bool {
+    !cockpit_overlay_accepts_input(app)
+        && app.focused_agent_terminal()
+        && app.agent_terminal_can_accept_input()
+}
+
+fn cockpit_overlay_accepts_input(app: &AppModel) -> bool {
+    app.daemon_switcher.open
+        || app.command_palette.open
+        || app.help_overlay.open
+        || app.confirmation.is_some()
+}
+
+fn cockpit_key_input_text(app: &AppModel, event: KeyEvent) -> Option<String> {
+    cockpit_accepts_agent_text_input(app)
+        .then(|| key_event_to_text(event))
+        .flatten()
+}
+
+fn cockpit_paste_input_text(app: &AppModel, text: &str) -> Option<String> {
+    cockpit_accepts_agent_text_input(app).then(|| paste_event_to_text(text))
+}
+
 fn key_event_to_text(event: KeyEvent) -> Option<String> {
+    let mut modifiers = event.modifiers;
+    if matches!(event.code, KeyCode::Char(_)) {
+        modifiers.remove(KeyModifiers::SHIFT);
+    }
+
     match event.code {
-        KeyCode::Char(value) if event.modifiers.contains(KeyModifiers::CONTROL) => {
-            control_char(value)
-        }
-        KeyCode::Char(value) => Some(value.to_string()),
-        KeyCode::Enter => Some("\r".to_string()),
-        KeyCode::Tab => Some("\t".to_string()),
-        KeyCode::Backspace => Some("\x7f".to_string()),
-        KeyCode::Esc => Some("\x1b".to_string()),
-        KeyCode::Left => Some("\x1b[D".to_string()),
-        KeyCode::Right => Some("\x1b[C".to_string()),
-        KeyCode::Up => Some("\x1b[A".to_string()),
-        KeyCode::Down => Some("\x1b[B".to_string()),
-        KeyCode::Home => Some("\x1b[H".to_string()),
-        KeyCode::End => Some("\x1b[F".to_string()),
-        KeyCode::PageUp => Some("\x1b[5~".to_string()),
-        KeyCode::PageDown => Some("\x1b[6~".to_string()),
-        KeyCode::Delete => Some("\x1b[3~".to_string()),
+        KeyCode::Char(value) if modifiers == KeyModifiers::CONTROL => control_char(value),
+        KeyCode::Char(value) if modifiers == KeyModifiers::ALT => Some(format!("\x1b{value}")),
+        KeyCode::Char(value) if modifiers.is_empty() => Some(value.to_string()),
+        KeyCode::Enter if modifiers.is_empty() => Some("\r".to_string()),
+        KeyCode::Tab if modifiers.is_empty() => Some("\t".to_string()),
+        KeyCode::Backspace if modifiers.is_empty() => Some("\x7f".to_string()),
+        KeyCode::Esc if modifiers.is_empty() => Some("\x1b".to_string()),
+        KeyCode::Left if modifiers.is_empty() => Some("\x1b[D".to_string()),
+        KeyCode::Right if modifiers.is_empty() => Some("\x1b[C".to_string()),
+        KeyCode::Up if modifiers.is_empty() => Some("\x1b[A".to_string()),
+        KeyCode::Down if modifiers.is_empty() => Some("\x1b[B".to_string()),
+        KeyCode::Home if modifiers.is_empty() => Some("\x1b[H".to_string()),
+        KeyCode::End if modifiers.is_empty() => Some("\x1b[F".to_string()),
+        KeyCode::PageUp if modifiers.is_empty() => Some("\x1b[5~".to_string()),
+        KeyCode::PageDown if modifiers.is_empty() => Some("\x1b[6~".to_string()),
+        KeyCode::Delete if modifiers.is_empty() => Some("\x1b[3~".to_string()),
+        KeyCode::F(value) if modifiers.is_empty() => f_key_sequence(value).map(str::to_string),
+        _ => None,
+    }
+}
+
+fn paste_event_to_text(text: &str) -> String {
+    if is_bracketed_paste(text) || !(text.contains('\n') || text.contains('\r')) {
+        text.to_string()
+    } else {
+        format!("{BRACKETED_PASTE_BEGIN}{text}{BRACKETED_PASTE_END}")
+    }
+}
+
+fn is_bracketed_paste(text: &str) -> bool {
+    text.starts_with(BRACKETED_PASTE_BEGIN) && text.ends_with(BRACKETED_PASTE_END)
+}
+
+fn f_key_sequence(value: u8) -> Option<&'static str> {
+    match value {
+        1 => Some("\x1bOP"),
+        2 => Some("\x1bOQ"),
+        3 => Some("\x1bOR"),
+        4 => Some("\x1bOS"),
+        5 => Some("\x1b[15~"),
+        6 => Some("\x1b[17~"),
+        7 => Some("\x1b[18~"),
+        8 => Some("\x1b[19~"),
+        9 => Some("\x1b[20~"),
+        10 => Some("\x1b[21~"),
+        11 => Some("\x1b[23~"),
+        12 => Some("\x1b[24~"),
         _ => None,
     }
 }
@@ -1232,6 +1310,233 @@ mod tests {
         assert!(!gate.should_draw(start + REDRAW_INTERVAL * 2));
     }
 
+    #[test]
+    fn cockpit_key_input_contract_maps_supported_keys() {
+        let cases = [
+            (
+                "printable unicode",
+                key(KeyCode::Char('λ'), KeyModifiers::NONE),
+                Some("λ"),
+            ),
+            (
+                "ctrl letter",
+                key(KeyCode::Char('c'), KeyModifiers::CONTROL),
+                Some("\x03"),
+            ),
+            (
+                "ctrl escape alias",
+                key(KeyCode::Char('['), KeyModifiers::CONTROL),
+                Some("\x1b"),
+            ),
+            (
+                "alt printable",
+                key(KeyCode::Char('x'), KeyModifiers::ALT),
+                Some("\x1bx"),
+            ),
+            ("enter", key(KeyCode::Enter, KeyModifiers::NONE), Some("\r")),
+            ("tab", key(KeyCode::Tab, KeyModifiers::NONE), Some("\t")),
+            (
+                "backspace",
+                key(KeyCode::Backspace, KeyModifiers::NONE),
+                Some("\x7f"),
+            ),
+            (
+                "escape",
+                key(KeyCode::Esc, KeyModifiers::NONE),
+                Some("\x1b"),
+            ),
+            (
+                "left",
+                key(KeyCode::Left, KeyModifiers::NONE),
+                Some("\x1b[D"),
+            ),
+            (
+                "right",
+                key(KeyCode::Right, KeyModifiers::NONE),
+                Some("\x1b[C"),
+            ),
+            ("up", key(KeyCode::Up, KeyModifiers::NONE), Some("\x1b[A")),
+            (
+                "down",
+                key(KeyCode::Down, KeyModifiers::NONE),
+                Some("\x1b[B"),
+            ),
+            (
+                "home",
+                key(KeyCode::Home, KeyModifiers::NONE),
+                Some("\x1b[H"),
+            ),
+            ("end", key(KeyCode::End, KeyModifiers::NONE), Some("\x1b[F")),
+            (
+                "delete",
+                key(KeyCode::Delete, KeyModifiers::NONE),
+                Some("\x1b[3~"),
+            ),
+            (
+                "page up",
+                key(KeyCode::PageUp, KeyModifiers::NONE),
+                Some("\x1b[5~"),
+            ),
+            (
+                "page down",
+                key(KeyCode::PageDown, KeyModifiers::NONE),
+                Some("\x1b[6~"),
+            ),
+            ("f1", key(KeyCode::F(1), KeyModifiers::NONE), Some("\x1bOP")),
+            (
+                "f5",
+                key(KeyCode::F(5), KeyModifiers::NONE),
+                Some("\x1b[15~"),
+            ),
+            (
+                "f12",
+                key(KeyCode::F(12), KeyModifiers::NONE),
+                Some("\x1b[24~"),
+            ),
+            (
+                "unsupported alt arrow",
+                key(KeyCode::Left, KeyModifiers::ALT),
+                None,
+            ),
+            (
+                "unsupported shifted arrow",
+                key(KeyCode::Left, KeyModifiers::SHIFT),
+                None,
+            ),
+            (
+                "unsupported shifted tab",
+                key(KeyCode::Tab, KeyModifiers::SHIFT),
+                None,
+            ),
+            (
+                "unsupported shifted enter",
+                key(KeyCode::Enter, KeyModifiers::SHIFT),
+                None,
+            ),
+            (
+                "unsupported shifted f-key",
+                key(KeyCode::F(5), KeyModifiers::SHIFT),
+                None,
+            ),
+            (
+                "unsupported ctrl alt char",
+                key(
+                    KeyCode::Char('x'),
+                    KeyModifiers::CONTROL | KeyModifiers::ALT,
+                ),
+                None,
+            ),
+            (
+                "unsupported f13",
+                key(KeyCode::F(13), KeyModifiers::NONE),
+                None,
+            ),
+        ];
+
+        for (name, event, expected) in cases {
+            assert_eq!(
+                key_event_to_text(event),
+                expected.map(str::to_string),
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn cockpit_paste_contract_wraps_multiline_once() {
+        assert_eq!(paste_event_to_text("one line"), "one line");
+        assert_eq!(
+            paste_event_to_text("first\nsecond"),
+            "\x1b[200~first\nsecond\x1b[201~"
+        );
+
+        let already_bracketed = "\x1b[200~first\nsecond\x1b[201~";
+        assert_eq!(paste_event_to_text(already_bracketed), already_bracketed);
+    }
+
+    #[test]
+    fn cockpit_paste_rejects_read_only_or_unfocused_agent_pane() {
+        let mut app = cockpit_input_app(true, false);
+        assert_eq!(
+            cockpit_paste_input_text(&app, "first\nsecond"),
+            Some("\x1b[200~first\nsecond\x1b[201~".to_string())
+        );
+
+        app.set_agent_input_read_only();
+        assert_eq!(cockpit_paste_input_text(&app, "blocked"), None);
+
+        let mut app = cockpit_input_app(true, false);
+        app.switch_focus();
+        assert_eq!(cockpit_paste_input_text(&app, "blocked"), None);
+    }
+
+    #[test]
+    fn cockpit_paste_rejects_while_overlay_owns_ui_focus() {
+        let mut app = cockpit_input_app(true, false);
+
+        app.open_daemon_switcher();
+
+        assert_eq!(cockpit_paste_input_text(&app, "blocked"), None);
+        assert_eq!(
+            cockpit_key_input_text(&app, key(KeyCode::Char('x'), KeyModifiers::NONE)),
+            None
+        );
+    }
+
+    #[test]
+    fn cockpit_reserved_prefix_and_scroll_keys_do_not_become_input_text() {
+        let mut app = cockpit_input_app(true, false);
+        assert_eq!(
+            forwarded_key_text(&mut app, key(KeyCode::Char(']'), KeyModifiers::CONTROL)),
+            None
+        );
+        assert_eq!(
+            forwarded_key_text(&mut app, key(KeyCode::Char('d'), KeyModifiers::NONE)),
+            None
+        );
+
+        let mut app = cockpit_input_app(true, false);
+        assert_eq!(
+            forwarded_key_text(&mut app, key(KeyCode::Char(']'), KeyModifiers::CONTROL)),
+            None
+        );
+        assert_eq!(
+            forwarded_key_text(&mut app, key(KeyCode::Char('['), KeyModifiers::NONE)),
+            None
+        );
+        assert_eq!(
+            forwarded_key_text(&mut app, key(KeyCode::Char('G'), KeyModifiers::SHIFT)),
+            None
+        );
+    }
+
+    fn forwarded_key_text(app: &mut AppModel, event: KeyEvent) -> Option<String> {
+        match app.handle_key(event, 10) {
+            KeyAction::Input(event) => cockpit_key_input_text(app, event),
+            _ => None,
+        }
+    }
+
+    fn key(code: KeyCode, modifiers: KeyModifiers) -> KeyEvent {
+        KeyEvent::new(code, modifiers)
+    }
+
+    fn cockpit_input_app(input_owner: bool, read_only: bool) -> AppModel {
+        let agent = session_summary("agent", SessionRole::Agent);
+        let daemon = session_summary("daemon", SessionRole::MillraceDaemon);
+        let daemon_id = daemon.session_id;
+        AppModel::agent_cockpit(
+            UiId::new(),
+            agent,
+            vec![daemon],
+            Some(daemon_id),
+            BTreeMap::new(),
+            AgentTerminalPane::new(8, 72, input_owner, read_only),
+            AgentCockpitLayout::Right,
+            MonitorProfile::Basic,
+        )
+    }
+
     fn session_summary(
         name: &str,
         role: SessionRole,
@@ -1270,6 +1575,7 @@ mod tests {
 
 struct TerminalSession {
     terminal: Terminal<CrosstermBackend<Stdout>>,
+    bracketed_paste_enabled: bool,
 }
 
 impl TerminalSession {
@@ -1277,9 +1583,13 @@ impl TerminalSession {
         enable_raw_mode()?;
         let mut stdout = io::stdout();
         execute!(stdout, EnterAlternateScreen)?;
+        let bracketed_paste_enabled = execute!(stdout, EnableBracketedPaste).is_ok();
         let backend = CrosstermBackend::new(stdout);
         let terminal = Terminal::new(backend)?;
-        Ok(Self { terminal })
+        Ok(Self {
+            terminal,
+            bracketed_paste_enabled,
+        })
     }
 
     fn recover_display(&mut self) -> Result<(), CockpitError> {
@@ -1289,6 +1599,9 @@ impl TerminalSession {
             Clear(ClearType::All),
             MoveTo(0, 0)
         )?;
+        if self.bracketed_paste_enabled {
+            execute!(self.terminal.backend_mut(), EnableBracketedPaste)?;
+        }
         self.terminal.clear()?;
         Ok(())
     }
@@ -1296,6 +1609,9 @@ impl TerminalSession {
 
 impl Drop for TerminalSession {
     fn drop(&mut self) {
+        if self.bracketed_paste_enabled {
+            let _ = execute!(self.terminal.backend_mut(), DisableBracketedPaste);
+        }
         let _ = disable_raw_mode();
         let _ = execute!(self.terminal.backend_mut(), LeaveAlternateScreen);
         let _ = self.terminal.show_cursor();

@@ -3,9 +3,10 @@
 Date: 2026-07-07
 
 Status: Batch 0 baseline, Batch 2 pipe-mode substrate, Batch 3 lifecycle
-recovery, and Batch 4 Packet 02 raw attach byte/resize fidelity verified in a
-clean Windows handoff linked worktree. Batch 2, Batch 3, and Batch 4 evidence
-were appended on 2026-07-08 UTC from WSL/Linux.
+recovery, Batch 4 raw attach byte/resize fidelity, Batch 5 screen API, and
+Batch 6 cockpit boundary/release evidence verified in a clean Windows handoff
+linked worktree. Batch 2 through Batch 6 evidence was appended on 2026-07-08
+UTC from WSL/Linux.
 
 ## Scope And Baseline
 
@@ -15,11 +16,17 @@ compatibility gate for future attach remediation. Batch 2 adds the opt-in
 summary shapes, persisted stop request metadata, and real Millrace daemon
 dogfood. Batch 3 adds lifecycle recovery invariants for client loss and
 `sessiond` restart, separates worker/child liveness, records orphaned-child
-diagnostics, and captures MVP handoff evidence. Batch 4 Packet 02 adds
-negotiated raw byte input and resize fidelity for raw human attach.
+diagnostics, and captures MVP handoff evidence. Batch 4 adds negotiated raw
+byte input and resize fidelity for raw human attach. Batch 5 adds structured
+screen snapshot/unavailable surfaces for agents and scripts. Batch 6 documents
+and tests the cockpit boundary as operator preview/control, then records final
+handoff release evidence.
 
-It does not claim structured screen snapshots or cockpit boundary follow-up
-work.
+Earlier versions of this document did not claim structured screen snapshots or
+cockpit boundary follow-up work; the Batch 5 and Batch 6 sections below now
+record that follow-up evidence while keeping macOS Terminal.app, SSH, and fully
+interactive terminal-matrix cells explicitly reduced until canonical
+revalidation.
 
 ## Checkout Identity
 
@@ -32,6 +39,9 @@ work.
 - Batch 0 implementation branch: `codex/batch-0-native-substrate-remediation`
 - Batch 2 implementation branch: `codex/batch-2-spawn-pipe-substrate`
 - Batch 3 implementation branch: `codex/batch-3-lifecycle-recovery`
+- Batch 4 implementation branch: `codex/batch-4-raw-attach-fidelity`
+- Batch 5 implementation branch: `codex/batch-5-screen-api`
+- Batch 6 implementation branch: `codex/batch-6-cockpit-release`
 - Batch 3 implementation base: `d9cc0c609916e23de13ae3bb22280e057d5d6237`
   (`Add Batch 2 pipe spawn substrate`)
 - Batch 3 implementation upstream before push: none configured for
@@ -177,7 +187,43 @@ checks were not executable from this runner and are not claimed.
 
 ## Screen API Evidence
 
-Deferred to Batch 5.
+Batch 5 implemented the structured `session.screen` / `millmux screen`
+surface:
+
+- PTY sessions return `screen_snapshot` responses with structured cells,
+  cursor, alternate-screen state, dimensions, source replay offsets, and
+  capture timestamp.
+- Pipe sessions and unusable PTY snapshots return structured
+  `snapshot_unavailable` metadata rather than legacy line scrollback.
+- `millmux screen --text` renders from the structured response.
+- `session.attach` can request initial structured screen replay only through
+  v2 negotiation.
+
+Batch 6 release evidence revalidated this through:
+
+```text
+cargo test --workspace
+  pass; screen protocol, host, worker, CLI, and attach replay tests included
+
+cargo test -p millrace-sessions-host --test session_lifecycle
+  pass; includes screen attach replay, stale/mismatched replay, and pipe
+  unavailable cases
+
+MILLMUX_STATE_DIR=/tmp/millmux-batch6-release.bTpva5/state \
+  /tmp/millmux-batch6-release.bTpva5/install/bin/millmux screen \
+  5634dab2-337b-40fa-a047-e0d2a5cad696 --json
+  pass; returned type=screen_snapshot for the PTY Millrace daemon
+
+MILLMUX_STATE_DIR=/tmp/millmux-batch6-release.bTpva5/state \
+  /tmp/millmux-batch6-release.bTpva5/install/bin/millmux screen \
+  7fd08b90-98f5-4a07-bcda-e3fcd5fd6fc1 --json
+  pass; returned type=snapshot_unavailable reason=unsupported_spawn_mode
+```
+
+Detailed logs are under
+`/tmp/millmux-batch6-release.bTpva5/cargo-test-workspace.log`,
+`/tmp/millmux-batch6-release.bTpva5/focused-deterministic-tests.log`, and
+`/tmp/millmux-batch6-release.bTpva5/dogfood-session-surfaces.log`.
 
 ## Spawn Mode / Pipe Mode Evidence
 
@@ -323,7 +369,56 @@ alive.
 
 ## Cockpit Boundary Evidence
 
-Deferred to Batch 6.
+Batch 6 documented and regression-protected the cockpit boundary:
+
+- Cockpit is an operator preview/control surface with daemon/agent context and
+  focused text input.
+- `millmux attach <session> --raw` remains the byte-exact terminal interaction
+  path.
+- `millmux screen <session> --json|--text` remains the structured read surface
+  for agents and scripts.
+- Cockpit forwards printable Unicode, Ctrl-letter chords, Alt-printable
+  characters, Enter, Tab, Backspace, Esc, arrows, Home, End, Delete, PageUp,
+  PageDown, and F1-F12.
+- Multiline paste is forwarded as bracketed paste unless the payload is already
+  detectably bracketed.
+- Paste and key input are rejected when the agent pane is read-only or
+  unfocused, or when a cockpit overlay owns UI focus.
+- Shift-modified non-character keys fail closed instead of degrading to plain
+  arrows, Tab, Enter, or F-keys.
+- Prefix detach and scroll/jump controls remain Millmux controls and do not
+  leak into PTY input.
+
+Packet-named verification observed passing:
+
+```text
+cargo test -p millrace-sessions-tui
+  pass
+
+cargo test -p millrace-sessions --test cli_smoke cockpit
+  pass; 5 passed
+
+cargo test --workspace cockpit
+  pass; cockpit unit, CLI smoke, TUI app, render snapshot, and binding tests
+  included
+```
+
+Additional cockpit dogfood:
+
+```text
+MILLMUX_STATE_DIR=/tmp/millmux-batch6-release.bTpva5/state \
+  /tmp/millmux-batch6-release.bTpva5/install/bin/millmux cockpit \
+  --workspace /tmp/millmux-batch6-release.bTpva5/cockpit-workspace \
+  --monitor basic --once --agent fixture-agent --agent-argv -- \
+  /tmp/millmux-batch6-release.bTpva5/raw-fixture.sh
+  pass; rendered Agent Terminal and Daemon Monitor, input=ready, status=ready
+```
+
+Detailed logs are under
+`/tmp/millmux-batch6-release.bTpva5/focused-deterministic-tests.log` and
+`/tmp/millmux-batch6-release.bTpva5/final-adversarial-fix-tests.log`, with
+one-shot dogfood in
+`/tmp/millmux-batch6-release.bTpva5/dogfood-cockpit-once.log`.
 
 ## Doctor / Artifact Diagnostics Evidence
 
@@ -584,6 +679,139 @@ processes from previous local runs were left untouched.
 No daemon default switch was made. Console/cockpit autostart requests still set
 `spawn_mode=pty`.
 
+## Batch 6 Release Gate Evidence
+
+Batch 6 final gate used the handoff checkout:
+
+- Checkout:
+  `/mnt/f/_Millrace/mac-handoff/dev/millmux-batch0-clean`
+- Branch: `codex/batch-6-cockpit-release`
+- Evidence root: `/tmp/millmux-batch6-release.bTpva5`
+- Installed Millmux binary:
+  `/tmp/millmux-batch6-release.bTpva5/install/bin/millmux`
+- State root: `/tmp/millmux-batch6-release.bTpva5/state`
+- Pipe workspace:
+  `/tmp/millmux-batch6-release.bTpva5/pipe-workspace`
+- PTY workspace:
+  `/tmp/millmux-batch6-release.bTpva5/pty-workspace`
+- Cockpit workspace:
+  `/tmp/millmux-batch6-release.bTpva5/cockpit-workspace`
+- Shell/raw-attach workspace:
+  `/tmp/millmux-batch6-release.bTpva5/shell-workspace`
+- Millrace binary: `/home/tim/.local/bin/millrace`
+- Millrace version: `millrace 0.17.3`
+
+Automated gate results:
+
+```text
+cargo fmt --all --check
+  pass; log cargo-fmt-check.log
+
+cargo clippy --workspace --all-targets -- -D warnings
+  pass; log cargo-clippy.log
+
+cargo test --workspace
+  pass; log cargo-test-workspace.log
+
+cargo build --workspace --release
+  pass; log cargo-build-release.log
+
+cargo install --path crates/millrace-sessions --locked --force \
+  --root /tmp/millmux-batch6-release.bTpva5/install
+  pass; installed millmux, millrace-session-worker, and millrace-sessiond;
+  log cargo-install.log
+
+git diff --check
+  pass with Windows Git in the linked worktree; WSL Git cannot read this
+  worktree's Windows-path `.git` indirection
+
+cargo test -p millrace-sessions cockpit_
+cargo test --workspace cockpit
+  pass after final adversarial fixes for shifted non-character keys and
+  overlay paste/key rejection; log final-adversarial-fix-tests.log
+```
+
+Focused deterministic evidence was also recorded in
+`focused-deterministic-tests.log`:
+
+```text
+cargo test -p millrace-sessions-host --test session_lifecycle
+  pass; PTY lifecycle, pipe lifecycle, sessiond restart, raw attach after
+  restart, requested-size/replay ordering, raw attach invalid bytes/resize,
+  screen snapshot/unavailable, observer lag/backpressure, client loss, worker
+  death/reconcile, and control surface behavior included
+
+cargo test -p millrace-sessions-worker --test lifecycle
+  pass
+
+cargo test -p millrace-sessions-worker --test logging
+  pass
+
+cargo test -p millrace-sessions-worker --test pty
+  pass
+
+cargo test -p millrace-sessions-host --test doctor
+  pass
+
+cargo test -p millrace-sessions --test attach_smoke raw
+  pass
+
+cargo test -p millrace-sessions --test cli_smoke cockpit
+  pass
+
+cargo test --workspace cockpit
+  pass
+
+cargo test --workspace reconcile
+  pass
+```
+
+Dogfood sessions:
+
+```text
+pipe Millrace daemon:
+  7fd08b90-98f5-4a07-bcda-e3fcd5fd6fc1
+  spawn_mode=pipe, capabilities attach/raw_attach/send/resize/screen=false
+  logs/events/status/inspect recorded in dogfood-session-surfaces.log
+
+PTY Millrace daemon:
+  5634dab2-337b-40fa-a047-e0d2a5cad696
+  spawn_mode=pty, capabilities attach/raw_attach/send/resize/screen=true
+  status/logs/events/screen recorded in dogfood-session-surfaces.log
+
+raw attach shell fixture:
+  34bebb10-5fba-45a3-a0a8-96098c5d5c1d
+  raw replay attach captured `shell-raw-ready` plus ANSI red bytes; screen text
+  rendered plain `red`; log dogfood-raw-attach-shell-final.log
+
+cockpit disposable daemon:
+  ec9e2f0f-2cc3-48db-b880-1285db94bb83
+  `millmux cockpit --once` rendered Agent Terminal and Daemon Monitor against
+  /tmp/millmux-batch6-release.bTpva5/cockpit-workspace; log
+  dogfood-cockpit-once.log
+```
+
+Host restart and client-loss evidence:
+
+- Original temporary `sessiond` pid: `1304670`.
+- Replacement temporary `sessiond` pid after host restart: `1310368`.
+- Killing only `sessiond` left PTY daemon
+  `5634dab2-337b-40fa-a047-e0d2a5cad696` running with worker/child liveness
+  `alive/alive`; subsequent raw attach replay worked.
+- Timeout-bounded raw attach to shell and PTY sessions exercised client detach
+  without stopping hosted processes.
+- Short-reader pipelines for `list --json` and `logs --json` exited cleanly;
+  see `dogfood-short-reader.log`.
+
+Cleanup evidence:
+
+- `dogfood-cleanup.log` records stopping the pipe daemon, PTY daemon, and
+  cockpit daemon.
+- Final `millmux list --json` returned an empty session list.
+- Final doctor status was `ok`.
+- `dogfood-sessiond-cleanup.log` records terminating temporary `sessiond`
+  pid `1310368`; no process remained for that PID.
+
 ## Reduced Or Unavailable Evidence
 
 Native Windows cargo/host tests are not the acceptance runner for Unix socket
@@ -592,6 +820,20 @@ verification.
 
 macOS Terminal.app and SSH terminal checks are unavailable from this Windows
 handoff runner unless recorded separately.
+
+Fully interactive terminal-matrix checks are reduced evidence in this handoff
+run. WSL/Linux non-interactive PTY evidence covers raw replay, screen, cockpit
+one-shot rendering, and timeout-bounded attach detach behavior, while automated
+tests cover cockpit key forwarding, reserved-key non-leakage, read-only paste
+rejection, bracketed paste, raw attach invalid bytes, resize, and restart
+behavior. It does not claim macOS Terminal.app, SSH, or manual full-screen TUI
+terminal parity.
+
+One early raw-attach dogfood fixture was written from PowerShell with BOM/CRLF
+line endings and exited before attach could open. That run is reduced evidence
+only. The final LF/no-BOM fixture at
+`/tmp/millmux-batch6-release.bTpva5/raw-fixture.sh` produced the raw attach
+evidence listed above.
 
 An initial pipe run before workspace initialization produced expected pipe
 artifacts and `[stdout]` logs but exited with `exit_code=1` because Millrace
@@ -602,9 +844,14 @@ archived as
 
 ## Release / Publish Statement
 
-Batch 0, Batch 2, Batch 3, and Batch 4 do not tag, publish crates, switch
-daemon defaults, or push a canonical release branch from this Windows handoff
-checkout.
+Batch 0, Batch 2, Batch 3, Batch 4, Batch 5, and Batch 6 do not tag, publish
+crates, switch daemon defaults, or push a canonical release branch from this
+Windows handoff checkout.
 
-Batch 3 implementation branch:
-`codex/batch-3-lifecycle-recovery`.
+Batch 6 implementation branch:
+`codex/batch-6-cockpit-release`.
+
+Canonical Mac-side revalidation still needs to rerun the full automated gates,
+installed-binary dogfood, raw attach in a real macOS terminal, cockpit
+interactive detach/key/paste checks, and any SSH terminal-matrix checks before
+release tagging, crate publishing, or canonical release branch push.

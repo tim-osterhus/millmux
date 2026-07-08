@@ -7,14 +7,26 @@ Key behavior:
 
 - The TUI remains a SessionControl client. SessionHost and workers retain
   process, PTY, attach, input ownership, and resize authority.
+- Cockpit is an operator preview/control surface with daemon and agent context.
+  `millmux attach <session> --raw` is the byte-exact terminal interaction path,
+  and `millmux screen <session> --json|--text` is the structured read surface
+  for agents and scripts.
 - The agent pane uses a small Millmux adapter around the MIT-licensed `vt100`
   crate. Compatibility fixtures cover prompt output, line-oriented CLI output,
   cursor movement, alternate-screen output, resize, basic color/style, and a
   Millracer operator prompt.
 - Normal keys route to the focused agent pane when its attach stream owns PTY
-  input. If another attach owns input, the cockpit reattaches read-only and the
-  pane is marked `input=read-only`. After the owning attach closes or detaches,
-  cockpit can reopen a writable attach and clear the read-only state.
+  input and no cockpit overlay owns UI focus. If another attach owns input, the
+  cockpit reattaches read-only and the pane is marked `input=read-only`. After
+  the owning attach closes or detaches, cockpit can reopen a writable attach
+  and clear the read-only state. Paste and key input are rejected while the
+  agent pane is read-only, unfocused, or behind an active cockpit overlay.
+- Forwarded focused-agent input is intentionally text-oriented: printable
+  Unicode, Ctrl-letter chords, Alt-printable characters, Enter, Tab, Backspace,
+  Esc, arrows, Home, End, Delete, PageUp, PageDown, and F1-F12. Multiline paste
+  is forwarded as bracketed paste unless the payload is already detectably
+  bracketed. Unsupported modified keys fail closed rather than degrading to
+  plain characters.
 - Active attach state is worker-owned and queryable through `millmux list
   --json`, `millmux status --json`, and `millmux inspect --json` as
   `attached_clients` and `input_owner`; terminal session records suppress stale
@@ -27,7 +39,11 @@ Key behavior:
   page inside Millmux state, use `G` to jump back to the live bottom, and use
   `Ctrl-] d` to detach without stopping the agent or daemon. Unix terminals may
   report the Ctrl-] byte through crossterm as `Ctrl-5`; cockpit treats that as
-  the same prefix.
+  the same prefix. Reserved cockpit controls include `Ctrl-] Tab`, `Ctrl-] l`,
+  `Ctrl-] p`, `Ctrl-] ?`, `Ctrl-] r`, and `Ctrl-] q`; scroll-mode controls
+  include Up, Down, PageUp, PageDown, Home, End, `g`, `G`, `/`, `n`, `N`, and
+  Esc. These controls stay in Millmux state and are not forwarded as hosted
+  agent input.
 - Daemon panes refresh session summaries before rendering and surface degraded
   states such as `failed_start`, exited, killed, and stale with failure detail
   and recovery choices instead of a ready-looking global status.

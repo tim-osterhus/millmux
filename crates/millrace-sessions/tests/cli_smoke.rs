@@ -717,7 +717,7 @@ exit 1
             "--",
             "sh",
             "-c",
-            "printf 'agent:%s\\n' \"$MILLMUX_AGENT_SESSION_ID\"; printf 'workspace:%s\\n' \"$MILLRACE_WORKSPACE\"; printf 'context:%s\\n' \"${MILLMUX_CONTEXT_FILE##*/}\"; sleep 5",
+            "printf 'agent:%s\\n' \"$MILLMUX_AGENT_SESSION_ID\"; printf 'workspace:%s\\n' \"$MILLRACE_WORKSPACE\"; printf 'context:%s\\n' \"${MILLMUX_CONTEXT_FILE##*/}\"; printf 'ui-set:%s\\n' \"${MILLMUX_UI_ID:+yes}\"; printf 'state-set:%s\\n' \"${MILLMUX_STATE_DIR:+yes}\"; printf 'sock:%s\\n' \"${MILLMUX_CONTROL_SOCK##*/}\"; printf 'daemon-set:%s\\n' \"${MILLMUX_ACTIVE_DAEMON_SESSION_ID:+yes}\"; sleep 5",
         ])
         .assert()
         .success()
@@ -730,6 +730,10 @@ exit 1
     assert!(text.contains("agent:"), "{text}");
     assert!(text.contains("workspace:"), "{text}");
     assert!(text.contains("context:context.json"), "{text}");
+    assert!(text.contains("ui-set:yes"), "{text}");
+    assert!(text.contains("state-set:yes"), "{text}");
+    assert!(text.contains("sock:session-control.sock"), "{text}");
+    assert!(text.contains("daemon-set:yes"), "{text}");
 
     let context_output = millmux_command(&host)
         .args(["context", "--json"])

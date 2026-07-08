@@ -8,6 +8,25 @@ environment was automated Linux/WSL PTY dogfood with real Millrace daemon
 startup, deterministic integration fixtures, full workspace gates, release
 build, and locked install.
 
+## Batch 6 Boundary Addendum
+
+Batch 6 narrows the cockpit claim: cockpit is an operator preview/control
+surface with daemon context and focused text input. `millmux attach --raw` is
+the byte-exact terminal path, and `millmux screen` is the structured read
+surface for agents and scripts.
+
+Batch 6 added regression coverage for printable Unicode, Ctrl-letter chords,
+Alt-printable characters, arrows, Home, End, Delete, PageUp, PageDown, F1-F12,
+Enter, Tab, Backspace, Esc, multiline bracketed paste, read-only/unfocused
+paste rejection, overlay paste/key rejection, shifted non-character fail-closed
+behavior, and prefix/scroll keys not leaking into PTY input.
+
+Current WSL handoff evidence is recorded in
+`docs/2026-07-07-native-substrate-remediation-qa.md` under "Cockpit Boundary
+Evidence" and "Batch 6 Release Gate Evidence". macOS Terminal.app, SSH, and
+fully interactive terminal-matrix checks remain reduced evidence until rerun in
+the canonical Mac-side environment.
+
 ## Artifact Roots
 
 - Dogfood root: `/tmp/millmux-r7-qa-final2.DQkWYL`

@@ -45,8 +45,9 @@ For Millrace workflows, keep three layers separate:
   UI adapter.
 
 Rendering is an adapter, not substrate truth. Cockpit is an operator preview
-and control surface. Future raw attach work is the intended byte-exact
-terminal fidelity path.
+and control surface. Raw attach is the byte-exact terminal fidelity path for
+human shell/TUI interaction, and the screen API is the structured read surface
+for agents and scripts.
 
 ## Install
 
@@ -235,11 +236,21 @@ millmux cockpit --workspace "$WORKSPACE" --monitor raw --agent millracer
 millmux cockpit --workspace "$WORKSPACE" --layout wide --agent-argv -- codex exec
 ```
 
-The agent pane is a real terminal. Normal input goes to the focused agent pane
-when Millmux owns PTY input. If another client owns input, cockpit attaches
-read-only and marks the agent pane accordingly. When the owning attach closes
-or detaches, cockpit can reopen a writable attach and clear the read-only pane
-state without stopping the hosted agent or daemon session.
+The agent pane is a vt100-backed operator preview/control surface. Normal text
+input goes to the focused agent pane when Millmux owns PTY input and no cockpit
+overlay owns UI focus. If another client owns input, cockpit attaches read-only
+and marks the agent pane accordingly. Paste and key input are ignored while the
+agent pane is read-only, unfocused, or behind an active cockpit overlay. When
+the owning attach closes or detaches, cockpit can reopen a writable attach and
+clear the read-only pane state without stopping the hosted agent or daemon
+session.
+
+Cockpit forwards printable Unicode, Ctrl-letter chords, Alt-printable
+characters, Enter, Tab, Backspace, Esc, arrows, Home, End, Delete, PageUp,
+PageDown, and F1-F12. Multiline paste is forwarded as bracketed paste unless
+the paste payload is already detectably bracketed. Unsupported modified keys
+fail closed instead of degrading into plain text. Cockpit does not attempt
+byte-exact input; use `millmux attach <session> --raw` for that path.
 
 Cockpit avoids legacy line scrollback when rendering agent panes. Reattach and
 one-shot snapshots use TUI-safe terminal snapshot/raw replay seed paths, show an
@@ -247,7 +258,11 @@ explicit initializing state when no safe frame is available, and keep
 agent-pane scroll/page/jump controls inside Millmux state so scroll keys are
 not sent to the agent process. The cockpit prefix is `Ctrl-]`; `Ctrl-] [`
 enters scroll mode, `G` jumps back to the live bottom, and `Ctrl-] d` detaches.
-Jump-to-bottom resumes live follow.
+`Ctrl-] Tab`, `Ctrl-] l`, `Ctrl-] p`, `Ctrl-] ?`, `Ctrl-] r`, and `Ctrl-] q`
+are reserved for cockpit controls. Scroll-mode keys such as Up, Down, PageUp,
+PageDown, Home, End, `g`, `G`, `/`, `n`, `N`, and Esc remain inside Millmux
+state and are not sent to the agent process. Jump-to-bottom resumes live
+follow.
 
 Cockpit daemon panes distinguish degraded daemon states such as `failed_start`,
 exited, killed, and stale. Failed or exited daemon auto-starts show failure

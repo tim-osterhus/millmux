@@ -809,18 +809,19 @@ impl ScreenCell {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ScreenColor {
+    #[default]
     Default,
-    Indexed { index: u8 },
-    Rgb { r: u8, g: u8, b: u8 },
-}
-
-impl Default for ScreenColor {
-    fn default() -> Self {
-        Self::Default
-    }
+    Indexed {
+        index: u8,
+    },
+    Rgb {
+        r: u8,
+        g: u8,
+        b: u8,
+    },
 }
 
 impl ScreenColor {
