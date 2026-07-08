@@ -1,6 +1,6 @@
 [package]
 name = "millrace-sessions"
-version = "0.2.0"
+version = "0.3.0"
 description = "Durable local PTY-backed session layer for Millrace daemons and agent processes"
 edition.workspace = true
 license.workspace = true
@@ -13,10 +13,10 @@ categories = ["command-line-utilities", "development-tools"]
 [dependencies]
 clap.workspace = true
 crossterm.workspace = true
-millrace-sessions-core = { path = "../millrace-sessions-core", version = "0.2.0" }
-millrace-sessions-host = { path = "../millrace-sessions-host", version = "0.2.0" }
-millrace-sessions-tui = { path = "../millrace-sessions-tui", version = "0.2.0" }
-millrace-sessions-worker = { path = "../millrace-sessions-worker", version = "0.2.0" }
+millrace-sessions-core = { path = "../millrace-sessions-core", version = "0.3.0" }
+millrace-sessions-host = { path = "../millrace-sessions-host", version = "0.3.0" }
+millrace-sessions-tui = { path = "../millrace-sessions-tui", version = "0.3.0" }
+millrace-sessions-worker = { path = "../millrace-sessions-worker", version = "0.3.0" }
 nix.workspace = true
 ratatui.workspace = true
 serde.workspace = true
