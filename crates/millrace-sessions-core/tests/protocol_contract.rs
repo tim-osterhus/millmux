@@ -163,6 +163,7 @@ fn session_list_request_and_response_match_m1_jsonl_contract() {
             input_owner: None,
             capabilities: SessionCapabilities::for_spawn_mode(SpawnMode::Pty),
             artifacts: SessionArtifacts::default(),
+            liveness: Default::default(),
         }],
     };
 
@@ -203,6 +204,11 @@ fn session_list_request_and_response_match_m1_jsonl_contract() {
                     },
                     "artifacts": {
                         "schema_version": 1
+                    },
+                    "liveness": {
+                        "schema_version": 1,
+                        "worker": "unknown",
+                        "child": "unknown"
                     }
                 }]
             }

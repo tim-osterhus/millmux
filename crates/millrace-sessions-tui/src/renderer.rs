@@ -609,6 +609,7 @@ fn process_label(value: &millrace_sessions_core::state::ProcessState) -> &'stati
         millrace_sessions_core::state::ProcessState::Failed => "failed",
         millrace_sessions_core::state::ProcessState::Lost => "lost",
         millrace_sessions_core::state::ProcessState::Stale => "stale",
+        millrace_sessions_core::state::ProcessState::Orphaned => "orphaned",
     }
 }
 
@@ -630,7 +631,8 @@ fn recovery_actions_label(value: &millrace_sessions_core::state::ProcessState) -
         millrace_sessions_core::state::ProcessState::Crashed
         | millrace_sessions_core::state::ProcessState::Failed
         | millrace_sessions_core::state::ProcessState::Lost
-        | millrace_sessions_core::state::ProcessState::Stale => {
+        | millrace_sessions_core::state::ProcessState::Stale
+        | millrace_sessions_core::state::ProcessState::Orphaned => {
             "inspect logs doctor archive delete"
         }
     }

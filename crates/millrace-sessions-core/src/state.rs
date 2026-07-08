@@ -62,6 +62,7 @@ impl<'de> Deserialize<'de> for SessionRole {
 pub enum ProcessState {
     Starting,
     Running,
+    Orphaned,
     Exited,
     Crashed,
     Killed,
@@ -69,6 +70,40 @@ pub enum ProcessState {
     Failed,
     Lost,
     Stale,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LivenessState {
+    #[default]
+    Unknown,
+    Alive,
+    Dead,
+    Indeterminate,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionLiveness {
+    #[serde(default = "default_liveness_schema_version")]
+    pub schema_version: u32,
+    #[serde(default)]
+    pub worker: LivenessState,
+    #[serde(default)]
+    pub child: LivenessState,
+}
+
+fn default_liveness_schema_version() -> u32 {
+    1
+}
+
+impl Default for SessionLiveness {
+    fn default() -> Self {
+        Self {
+            schema_version: default_liveness_schema_version(),
+            worker: LivenessState::default(),
+            child: LivenessState::default(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -445,6 +480,15 @@ mod tests {
             serde_json::to_string(&ProcessState::Running).unwrap(),
             "\"running\""
         );
+        assert_eq!(
+            serde_json::to_string(&ProcessState::Orphaned).unwrap(),
+            "\"orphaned\""
+        );
+        assert_eq!(
+            serde_json::to_string(&LivenessState::Indeterminate).unwrap(),
+            "\"indeterminate\""
+        );
+        assert_eq!(SessionLiveness::default().schema_version, 1);
         assert_eq!(serde_json::to_string(&SpawnMode::Pty).unwrap(), "\"pty\"");
         assert_eq!(serde_json::to_string(&SpawnMode::Pipe).unwrap(), "\"pipe\"");
         assert_eq!(

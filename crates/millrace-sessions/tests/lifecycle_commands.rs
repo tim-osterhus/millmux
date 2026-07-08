@@ -1,6 +1,15 @@
-use std::{fs, path::Path, process::Command, thread, time::Duration};
+use std::{
+    fs,
+    io::{BufRead, BufReader, Write},
+    os::unix::net::UnixStream,
+    path::Path,
+    process::Command,
+    thread,
+    time::Duration,
+};
 
 use assert_cmd::prelude::*;
+use millrace_sessions_core::protocol::{AttachStreamFrame, ControlResponse, SessionAttachResponse};
 use nix::{
     sys::signal::{kill, Signal},
     unistd::Pid,
@@ -20,6 +29,29 @@ impl TempHost {
 
     fn state_dir(&self) -> &Path {
         self.state_dir.path()
+    }
+
+    fn current_host_pid(&self) -> Pid {
+        let host_json = self.state_dir.path().join("host.json");
+        let raw = fs::read_to_string(host_json).expect("host metadata exists");
+        let value: Value = serde_json::from_str(&raw).expect("host metadata json");
+        let pid = value
+            .get("pid")
+            .and_then(Value::as_u64)
+            .expect("host pid is recorded");
+        Pid::from_raw(pid as i32)
+    }
+
+    fn kill_host(&self) -> i32 {
+        let pid = self.current_host_pid();
+        kill(pid, Signal::SIGKILL).expect("kill host");
+        for _ in 0..40 {
+            if kill(pid, None).is_err() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(25));
+        }
+        pid.as_raw()
     }
 }
 
@@ -259,6 +291,196 @@ fn pipe_lifecycle_commands_emit_stable_json_results() {
     assert_eq!(purged["purged"], true);
 }
 
+#[test]
+fn restart_pty_commands_autostart_host_and_preserve_supported_surfaces() {
+    let host = TempHost::new();
+    let workspace = tempfile::tempdir().expect("workspace");
+
+    let session_id = start_session(
+        &host,
+        workspace.path(),
+        "cli-restart-pty",
+        "printf 'ready\\n'; while IFS= read -r line; do printf 'got:%s\\n' \"$line\"; done",
+    );
+    let session_root = host.state_dir().join("sessions").join(&session_id);
+    let worker = read_json_file(&session_root.join("worker.json"));
+    let worker_pid = worker["pid"].as_i64().expect("worker pid") as i32;
+    let child_pid = worker["child_pid"].as_i64().expect("child pid") as i32;
+
+    let old_host_pid = host.kill_host();
+    assert_pid_alive(worker_pid, "worker after CLI host kill");
+    assert_pid_alive(child_pid, "child after CLI host kill");
+
+    let status_output = millmux_command(&host)
+        .args(["status", &session_id, "--json"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let status: Value = serde_json::from_slice(&status_output).expect("status json");
+    assert_eq!(status["session"]["process_state"], "running");
+    assert_eq!(status["session"]["spawn_mode"], "pty");
+    assert_eq!(status["session"]["liveness"]["worker"], "alive");
+    assert_eq!(status["session"]["liveness"]["child"], "alive");
+    assert_ne!(host.current_host_pid().as_raw(), old_host_pid);
+
+    let inspect_output = millmux_command(&host)
+        .args(["inspect", &session_id, "--json"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let inspect: Value = serde_json::from_slice(&inspect_output).expect("inspect json");
+    assert_eq!(inspect["session"]["process_state"], "running");
+    assert_eq!(inspect["worker"]["pid"], worker_pid);
+
+    let logs_output = millmux_command(&host)
+        .args(["logs", "--json", "--tail", "10", &session_id])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let logs: Value = serde_json::from_slice(&logs_output).expect("logs json");
+    assert!(logs["lines"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|line| line["line"]
+            .as_str()
+            .is_some_and(|line| line.contains("ready"))));
+
+    let events_output = millmux_command(&host)
+        .args(["events", "--json", &session_id])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let events: Value = serde_json::from_slice(&events_output).expect("events json");
+    assert!(events["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|event| event["kind"] == "output"));
+
+    let send_output = millmux_command(&host)
+        .args(["send", &session_id, "--text", "after-restart\n", "--json"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let sent: Value = serde_json::from_slice(&send_output).expect("send json");
+    assert_eq!(sent["session_id"], session_id);
+    wait_for_file_contains(&session_root.join("pty.log"), "got:after-restart");
+    assert_attach_scrollback_contains(&host, &session_id, "ready");
+
+    millmux_command(&host)
+        .args(["kill", &session_id, "--json"])
+        .assert()
+        .success();
+}
+
+#[test]
+fn restart_pipe_commands_autostart_host_and_preserve_supported_surfaces() {
+    let host = TempHost::new();
+    let workspace = tempfile::tempdir().expect("workspace");
+
+    let session_id = start_pipe_session(
+        &host,
+        workspace.path(),
+        "cli-restart-pipe",
+        "trap 'exit 0' TERM; printf 'ready\\n'; while true; do sleep 1; done",
+    );
+    let session_root = host.state_dir().join("sessions").join(&session_id);
+    let worker = read_json_file(&session_root.join("worker.json"));
+    let worker_pid = worker["pid"].as_i64().expect("worker pid") as i32;
+    let child_pid = worker["child_pid"].as_i64().expect("child pid") as i32;
+
+    let old_host_pid = host.kill_host();
+    assert_pid_alive(worker_pid, "pipe worker after CLI host kill");
+    assert_pid_alive(child_pid, "pipe child after CLI host kill");
+
+    let status_output = millmux_command(&host)
+        .args(["status", &session_id, "--json"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let status: Value = serde_json::from_slice(&status_output).expect("pipe status json");
+    assert_eq!(status["session"]["process_state"], "running");
+    assert_eq!(status["session"]["spawn_mode"], "pipe");
+    assert_eq!(status["session"]["liveness"]["worker"], "alive");
+    assert_eq!(status["session"]["liveness"]["child"], "alive");
+    assert_ne!(host.current_host_pid().as_raw(), old_host_pid);
+
+    let inspect_output = millmux_command(&host)
+        .args(["inspect", &session_id, "--json"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let inspect: Value = serde_json::from_slice(&inspect_output).expect("pipe inspect json");
+    assert_eq!(inspect["session"]["spawn_mode"], "pipe");
+    assert_eq!(inspect["worker"]["pid"], worker_pid);
+
+    let logs_output = millmux_command(&host)
+        .args(["logs", "--json", &session_id])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let logs: Value = serde_json::from_slice(&logs_output).expect("pipe logs json");
+    assert!(logs["lines"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|line| { line["stream"] == "stdout" && line["line"].as_str() == Some("ready") }));
+
+    let events_output = millmux_command(&host)
+        .args(["events", "--json", &session_id])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let events: Value = serde_json::from_slice(&events_output).expect("pipe events json");
+    assert!(events["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|event| { event["kind"] == "output" && event["fields"]["stream"] == "stdout" }));
+
+    let stop_output = millmux_command(&host)
+        .args(["stop", &session_id, "--grace-seconds", "2", "--json"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let stopped: Value = serde_json::from_slice(&stop_output).expect("pipe stop json");
+    assert_eq!(stopped["session_id"], session_id);
+    assert_eq!(stopped["stop_requested"], true);
+    wait_for_terminal_meta(&session_root.join("meta.json"));
+
+    let delete_output = millmux_command(&host)
+        .args(["delete", &session_id, "--json"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let deleted: Value = serde_json::from_slice(&delete_output).expect("pipe delete json");
+    assert_eq!(deleted["session_id"], session_id);
+    assert_eq!(deleted["archived"], true);
+}
+
 fn start_session(host: &TempHost, workspace: &Path, name: &str, script: &str) -> String {
     let output = millmux_command(host)
         .args([
@@ -382,6 +604,64 @@ fn wait_for_file_contains(path: &Path, needle: &str) {
         thread::sleep(Duration::from_millis(25));
     }
     panic!("{} did not contain {needle:?}", path.display());
+}
+
+fn read_json_file(path: &Path) -> Value {
+    let raw = fs::read_to_string(path).unwrap_or_else(|error| {
+        panic!("failed to read {}: {error}", path.display());
+    });
+    serde_json::from_str(&raw).unwrap_or_else(|error| {
+        panic!("failed to parse {} as json: {error}", path.display());
+    })
+}
+
+fn assert_pid_alive(pid: i32, label: &str) {
+    assert!(
+        kill(Pid::from_raw(pid), None).is_ok(),
+        "{label} pid {pid} should still be alive"
+    );
+}
+
+fn assert_attach_scrollback_contains(host: &TempHost, session_id: &str, needle: &str) {
+    let mut stream =
+        UnixStream::connect(host.state_dir().join("session-control.sock")).expect("connect attach");
+    stream
+        .write_all(
+            format!(
+                "{}\n",
+                serde_json::to_string(&serde_json::json!({
+                    "id": "attach-after-cli-restart",
+                    "method": "session.attach",
+                    "params": {
+                        "selector": {"type": "id", "session_id": session_id},
+                        "read_only": true,
+                        "replay": "line_scrollback"
+                    }
+                }))
+                .unwrap()
+            )
+            .as_bytes(),
+        )
+        .unwrap();
+
+    let mut reader = BufReader::new(stream.try_clone().unwrap());
+    let mut response_line = String::new();
+    reader.read_line(&mut response_line).unwrap();
+    let response: ControlResponse = serde_json::from_str(response_line.trim_end()).unwrap();
+    assert!(response.ok, "{response:#?}");
+    let attach: SessionAttachResponse = response.result_as().unwrap();
+    assert!(attach.stream.read_only);
+
+    let mut frame_line = String::new();
+    reader.read_line(&mut frame_line).unwrap();
+    let frame = AttachStreamFrame::from_json_line(frame_line.trim_end()).unwrap();
+    assert!(
+        matches!(&frame, AttachStreamFrame::Scrollback { lines } if lines.iter().any(|line| line.contains(needle))),
+        "attach scrollback did not contain {needle:?}: {frame:?}"
+    );
+    stream
+        .write_all(AttachStreamFrame::Close.to_json_line().unwrap().as_bytes())
+        .unwrap();
 }
 
 fn wait_for_terminal_meta(path: &Path) {

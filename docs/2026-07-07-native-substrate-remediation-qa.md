@@ -2,9 +2,9 @@
 
 Date: 2026-07-07
 
-Status: Batch 0 baseline and Batch 2 pipe-mode substrate verified in a clean
-Windows handoff linked worktree. Batch 2 evidence was appended on 2026-07-08
-UTC from WSL/Linux.
+Status: Batch 0 baseline, Batch 2 pipe-mode substrate, and Batch 3 lifecycle
+recovery verified in a clean Windows handoff linked worktree. Batch 2 and
+Batch 3 evidence were appended on 2026-07-08 UTC from WSL/Linux.
 
 ## Scope And Baseline
 
@@ -12,10 +12,12 @@ Batch 0 covers the native substrate ADR, baseline capture, and protocol
 compatibility gate for future attach remediation. Batch 2 adds the opt-in
 `spawn_mode=pipe` substrate, stream-tagged pipe logs, artifact/capability
 summary shapes, persisted stop request metadata, and real Millrace daemon
-dogfood.
+dogfood. Batch 3 adds lifecycle recovery invariants for client loss and
+`sessiond` restart, separates worker/child liveness, records orphaned-child
+diagnostics, and captures MVP handoff evidence.
 
-It does not claim raw attach UX, structured screen snapshots, lifecycle
-restart recovery, or cockpit boundary follow-up work.
+It does not claim raw attach UX, structured screen snapshots, or cockpit
+boundary follow-up work.
 
 ## Checkout Identity
 
@@ -27,6 +29,11 @@ restart recovery, or cockpit boundary follow-up work.
 - `origin/main` at baseline capture: `5e31047bb866747f33dd319fed237dc1a7d47147`
 - Batch 0 implementation branch: `codex/batch-0-native-substrate-remediation`
 - Batch 2 implementation branch: `codex/batch-2-spawn-pipe-substrate`
+- Batch 3 implementation branch: `codex/batch-3-lifecycle-recovery`
+- Batch 3 implementation base: `d9cc0c609916e23de13ae3bb22280e057d5d6237`
+  (`Add Batch 2 pipe spawn substrate`)
+- Batch 3 implementation upstream before push: none configured for
+  `codex/batch-3-lifecycle-recovery`
 - Verification runner: WSL/Linux from `/mnt/f/_Millrace/mac-handoff/dev/millmux-batch0-clean`
 
 ## Dirty Tree / Behind-Origin Baseline
@@ -199,8 +206,79 @@ console/cockpit daemon panes label pipe lines as `[stdout]` or `[stderr]`.
 
 ## Lifecycle And Recovery Evidence
 
-Batch 2 only covers pipe lifecycle substrate behavior. Full host restart and
-recovery invariants remain deferred to Batch 3.
+Batch 3 lifecycle recovery result: GREEN after implementation, focused
+verification, real daemon dogfood, and adversarial review.
+
+Implemented lifecycle behavior:
+
+- Client attach loss is independent of hosted child lifetime. PTY workers and
+  hosted children remain alive after attach stream drop, and subsequent
+  `send` still reaches the child in deterministic coverage.
+- Killing only `sessiond` does not kill PTY or pipe workers/children. A new
+  host autostarts from the durable state root and revalidates status, inspect,
+  logs, events, and supported control surfaces.
+- `SessionSummary` now exposes versioned worker/child `liveness` with
+  `unknown`, `alive`, `dead`, and `indeterminate` states.
+- Startup reconciliation marks worker-dead/child-alive records as `orphaned`
+  instead of healthy `running`, marks worker-alive/child-dead records as
+  stale/degraded, and records reconciliation evidence in events.
+- Doctor reports `orphaned_child_process`,
+  `worker_child_liveness_mismatch`, worker socket reachability, and stale
+  attach owner/client metadata. Recovery remains explicit rather than an
+  automatic restart or purge policy.
+
+Focused Batch 3 verification observed passing:
+
+```bash
+cargo test -p millrace-sessions-host --test host_bootstrap
+cargo test -p millrace-sessions-host --test session_lifecycle restart
+cargo test -p millrace-sessions --test lifecycle_commands restart
+cargo test --workspace reconcile
+cargo test -p millrace-sessions-host --test session_lifecycle liveness
+cargo test -p millrace-sessions-host --test doctor orphan
+cargo test -p millrace-sessions-worker --test lifecycle
+cargo test -p millrace-sessions --test doctor_commands
+```
+
+Additional Batch 3 gates are listed in the Dogfood Matrix and release gate
+sections below.
+
+Full Batch 3 verification after dogfood:
+
+```text
+cargo fmt --all -- --check
+  pass
+
+cargo check --workspace --tests
+  pass
+
+cargo clippy --workspace --all-targets -- -D warnings
+  pass
+
+cargo test --workspace
+  pass
+
+cargo build --workspace --release
+  pass
+
+cargo install --path crates/millrace-sessions --locked --force \
+  --root /tmp/millmux-batch3-install-codex-final
+  pass; installed millmux, millrace-session-worker, and millrace-sessiond
+
+git diff --check
+  pass
+```
+
+Final verification/re-review caught three issues before the green run:
+clippy requested `contains()` in liveness PID status checks; the full protocol
+contract exposed that derived `SessionLiveness::default()` emitted
+`schema_version=0`; and adversarial review found doctor skipped liveness
+diagnostics after startup reconciliation had already marked a record
+`orphaned`. These were patched. The contract now asserts the additive
+`liveness` object with `schema_version=1`, and doctor now has a regression
+that reconciles a worker-dead/child-alive record to `orphaned`, reports
+`orphaned_child_process`, and refuses to archive it while the child PID is
+alive.
 
 ## Cockpit Boundary Evidence
 
@@ -337,9 +415,133 @@ Remaining later-batch dogfood:
 
 - raw attach to a shell/TUI;
 - cockpit against a disposable workspace;
-- host restart while a daemon is running;
-- client crash/detach while a worker keeps running;
 - short-reader pipelines such as `millmux list --json | head -c 200`.
+
+Batch 3 real Millrace daemon restart dogfood used:
+
+- Implementation checkout:
+  `/mnt/f/_Millrace/mac-handoff/dev/millmux-batch0-clean`
+- Install root: `/tmp/millmux-batch3-install-codex`
+- State root: `/tmp/millmux-batch3-state`
+- Evidence directory: `/tmp/millmux-batch3-state/evidence`
+- Pipe workspace: `/tmp/millmux-batch3-pipe-workspace`
+- PTY workspace: `/tmp/millmux-batch3-pty-workspace`
+- Installed Millmux binary:
+  `/tmp/millmux-batch3-install-codex/bin/millmux`
+- Millrace binary: `/home/tim/.local/bin/millrace`
+- Millrace version: `millrace 0.17.3`
+
+Install command:
+
+```bash
+cargo install --path crates/millrace-sessions --locked --force \
+  --root /tmp/millmux-batch3-install-codex
+```
+
+Workspace initialization:
+
+```bash
+millrace init --workspace /tmp/millmux-batch3-pipe-workspace
+millrace init --workspace /tmp/millmux-batch3-pty-workspace
+```
+
+PTY daemon command:
+
+```bash
+MILLMUX_STATE_DIR=/tmp/millmux-batch3-state \
+millmux start --json --spawn-mode pty --role millrace-daemon \
+  --workspace /tmp/millmux-batch3-pty-workspace \
+  --cwd /tmp/millmux-batch3-pty-workspace \
+  -- millrace run daemon \
+    --workspace /tmp/millmux-batch3-pty-workspace \
+    --monitor basic
+```
+
+PTY session id:
+`66a08501-556c-41a0-842d-194694f9053b`.
+
+Pipe daemon command:
+
+```bash
+MILLMUX_STATE_DIR=/tmp/millmux-batch3-state \
+millmux start --json --spawn-mode pipe --role millrace-daemon \
+  --workspace /tmp/millmux-batch3-pipe-workspace \
+  --cwd /tmp/millmux-batch3-pipe-workspace \
+  -- millrace run daemon \
+    --workspace /tmp/millmux-batch3-pipe-workspace \
+    --monitor basic
+```
+
+Pipe session id:
+`76c0c351-1bbf-4bf8-8f1a-564c5195b45b`.
+
+Restart and liveness evidence:
+
+- Original `sessiond` pid: `839482`.
+- Replacement `sessiond` pid after `SIGTERM` and CLI autostart: `840100`.
+- PTY worker/child pids before restart: `839581` / `839583`.
+- Pipe worker/child pids before restart: `839896` / `839898`.
+- `kill -0` checks passed for all four worker/child pids after killing only
+  `sessiond`.
+- PTY `status --json` after host restart reported
+  `process_state=running`, `spawn_mode=pty`,
+  `liveness.worker=alive`, `liveness.child=alive`,
+  `capabilities.attach=true`, `capabilities.send=true`, and
+  `capabilities.resize=true`.
+- Pipe `status --json` after host restart reported
+  `process_state=running`, `spawn_mode=pipe`,
+  `liveness.worker=alive`, `liveness.child=alive`,
+  `capabilities.attach=false`, `capabilities.send=false`, and
+  `capabilities.resize=false`.
+- PTY `inspect --json`, `logs --json --tail 80`,
+  `events --json`, `send --text $'\n' --json`, and
+  `resize --rows 31 --cols 99 --json` all succeeded after host restart.
+  The send response recorded `bytes_sent=1`; resize returned
+  `rows=31`, `cols=99`.
+- Pipe `inspect --json`, `logs --json --tail 80`, and `events --json` all
+  succeeded after host restart. Pipe logs showed `stream=stdout` daemon
+  lines including `runtime started`, `snapshot status execution=IDLE`, and
+  `idle reason=no_work`.
+- `doctor --json` after host restart returned `status=ok` with only info
+  issues for private state-dir permissions and responsive host socket.
+- Pipe `stop --json --grace-seconds 5` returned
+  `process_state=exited`, `stop_requested=true`,
+  `stop_reason=session_stop`; `delete --json` archived the session.
+- PTY `stop --json --grace-seconds 5` returned
+  `process_state=exited`, `stop_requested=true`,
+  `stop_reason=session_stop`; `delete --json` archived the session.
+- Archived pipe artifacts include `stdout.log`, `stderr.log`,
+  `events.jsonl`, `meta.json`, and `worker.json`.
+- Archived PTY artifacts include `pty.log`, `pty.replay`,
+  `scrollback.snapshot`, `terminal.snapshot.json`, `events.jsonl`,
+  `meta.json`, and `worker.json`.
+
+Client-loss and MVP attach evidence:
+
+- A read-only PTY Millrace daemon attach before host restart returned a CLI
+  parse error under the redirected test harness, but the event ledger records
+  `attach_opened` and `attach_closed`, and subsequent PTY status still
+  reported `running` with worker/child liveness `alive/alive`.
+- A writable PTY Millrace daemon attach after host restart was killed by a
+  5s timeout (`rc=124`). The archived event ledger records
+  `attach_opened` and `attach_closed` for the replacement host stream, then
+  native Millrace stop exited cleanly with `exit_code=0`.
+- A supplemental PTY shell run under
+  `/tmp/millmux-batch3-attach-state` killed only `sessiond`
+  (`848459 -> 848514`), opened an attach stream for session
+  `01344fdf-2b9b-4079-8315-90eb35fc86bc`, kept emitting
+  `attach-batch3-*` output while the attach client was killed by timeout,
+  then allowed explicit kill/delete. This supplements the deterministic
+  `restart_preserves_pty_session_and_supported_surfaces_work` test, which
+  asserts attach replay contains the expected scrollback frame.
+
+The disposable Batch 3 host process was sent `SIGTERM` after dogfood. No
+Batch 3 daemon or worker command lines under `/tmp/millmux-batch3-*` remained
+visible in the process table after cleanup. Older unrelated temp-state worker
+processes from previous local runs were left untouched.
+
+No daemon default switch was made. Console/cockpit autostart requests still set
+`spawn_mode=pty`.
 
 ## Reduced Or Unavailable Evidence
 
@@ -359,9 +561,9 @@ archived as
 
 ## Release / Publish Statement
 
-Batch 0 and Batch 2 handoff work does not tag, publish crates, switch daemon
+Batch 0, Batch 2, and Batch 3 do not tag, publish crates, switch daemon
 defaults, or push a canonical release branch from this Windows handoff
 checkout.
 
-Branch prepared for handoff push:
-`codex/batch-2-spawn-pipe-substrate`.
+Batch 3 implementation branch:
+`codex/batch-3-lifecycle-recovery`.

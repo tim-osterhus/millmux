@@ -3,7 +3,7 @@ use std::collections::BTreeSet;
 use millrace_sessions_core::{
     events::{append_event, current_timestamp, read_events, SessionEvent, SessionEventKind},
     paths::StatePaths,
-    state::{ProcessState, SessionMeta, WorkerMeta},
+    state::{LivenessState, ProcessState, SessionMeta, WorkerMeta},
     storage::{create_private_dir_all, read_json, write_json_atomic},
 };
 use nix::{errno::Errno, sys::signal::kill, unistd::Pid};
@@ -36,6 +36,20 @@ pub(crate) enum PidStatus {
     Indeterminate,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RecordLiveness {
+    pub worker: LivenessState,
+    pub child: LivenessState,
+    pub worker_pids: Vec<u32>,
+    pub child_pids: Vec<u32>,
+}
+
+impl RecordLiveness {
+    fn has_indeterminate(&self) -> bool {
+        self.worker == LivenessState::Indeterminate || self.child == LivenessState::Indeterminate
+    }
+}
+
 pub fn reconcile_startup(paths: &StatePaths) -> Result<ReconcileSummary, ReconcileError> {
     let registry = HostRegistry::load(paths.clone())?;
     let mut summary = ReconcileSummary::default();
@@ -46,22 +60,57 @@ pub fn reconcile_startup(paths: &StatePaths) -> Result<ReconcileSummary, Reconci
         }
         summary.scanned += 1;
 
-        let pids = collect_record_pids(record);
-        if pids.iter().any(|pid| pid_status(*pid) == PidStatus::Alive) {
-            summary.preserved += 1;
-            continue;
-        }
-        if pids
-            .iter()
-            .any(|pid| pid_status(*pid) == PidStatus::Indeterminate)
-        {
+        let liveness = record_liveness(record);
+        if liveness.has_indeterminate() {
             summary.skipped += 1;
             continue;
         }
 
-        let target_state = terminal_state_from_evidence(record).unwrap_or(ProcessState::Lost);
-        mark_record_terminal(record, target_state)?;
-        summary.marked_terminal += 1;
+        match (liveness.worker, liveness.child) {
+            (LivenessState::Alive, LivenessState::Alive | LivenessState::Unknown) => {
+                summary.preserved += 1;
+            }
+            (LivenessState::Alive, LivenessState::Dead) => {
+                mark_record_terminal(
+                    record,
+                    ProcessState::Stale,
+                    "stale_worker_child_dead",
+                    Some(
+                        "startup reconciliation found a live worker but the child process was gone",
+                    ),
+                    &liveness,
+                )?;
+                summary.marked_terminal += 1;
+            }
+            (LivenessState::Dead | LivenessState::Unknown, LivenessState::Alive) => {
+                mark_record_terminal(
+                    record,
+                    ProcessState::Orphaned,
+                    "orphaned_child",
+                    Some("startup reconciliation found a live child without a live worker"),
+                    &liveness,
+                )?;
+                summary.marked_terminal += 1;
+            }
+            (
+                LivenessState::Dead | LivenessState::Unknown,
+                LivenessState::Dead | LivenessState::Unknown,
+            ) => {
+                let target_state =
+                    terminal_state_from_evidence(record).unwrap_or(ProcessState::Lost);
+                mark_record_terminal(
+                    record,
+                    target_state,
+                    "all_recorded_processes_dead",
+                    Some("startup reconciliation found no live recorded process"),
+                    &liveness,
+                )?;
+                summary.marked_terminal += 1;
+            }
+            (_, LivenessState::Indeterminate) | (LivenessState::Indeterminate, _) => {
+                summary.skipped += 1;
+            }
+        }
     }
 
     Ok(summary)
@@ -76,20 +125,60 @@ pub(crate) fn is_terminal_process_state(state: &ProcessState) -> bool {
 }
 
 pub(crate) fn collect_record_pids(record: &SessionRecord) -> Vec<u32> {
+    let mut pids = collect_worker_pids(record);
+    pids.extend(collect_child_pids(record));
+    pids.sort_unstable();
+    pids.dedup();
+    pids
+}
+
+pub(crate) fn record_liveness(record: &SessionRecord) -> RecordLiveness {
+    let worker_pids = collect_worker_pids(record);
+    let child_pids = collect_child_pids(record);
+    RecordLiveness {
+        worker: liveness_from_pids(&worker_pids),
+        child: liveness_from_pids(&child_pids),
+        worker_pids,
+        child_pids,
+    }
+}
+
+fn collect_worker_pids(record: &SessionRecord) -> Vec<u32> {
     let mut pids = BTreeSet::new();
     if let Some(pid) = record.meta.worker_pid {
         pids.insert(pid);
     }
+    if let Some(worker) = &record.worker {
+        pids.insert(worker.pid);
+    }
+    pids.into_iter().filter(|pid| *pid > 0).collect()
+}
+
+fn collect_child_pids(record: &SessionRecord) -> Vec<u32> {
+    let mut pids = BTreeSet::new();
     if let Some(pid) = record.meta.child_pid {
         pids.insert(pid);
     }
     if let Some(worker) = &record.worker {
-        pids.insert(worker.pid);
         if let Some(pid) = worker.child_pid {
             pids.insert(pid);
         }
     }
     pids.into_iter().filter(|pid| *pid > 0).collect()
+}
+
+fn liveness_from_pids(pids: &[u32]) -> LivenessState {
+    if pids.is_empty() {
+        return LivenessState::Unknown;
+    }
+    let statuses = pids.iter().map(|pid| pid_status(*pid)).collect::<Vec<_>>();
+    if statuses.contains(&PidStatus::Alive) {
+        return LivenessState::Alive;
+    }
+    if statuses.contains(&PidStatus::Indeterminate) {
+        return LivenessState::Indeterminate;
+    }
+    LivenessState::Dead
 }
 
 pub(crate) fn pid_status(pid: u32) -> PidStatus {
@@ -121,6 +210,9 @@ fn terminal_state_from_evidence(record: &SessionRecord) -> Option<ProcessState> 
 fn mark_record_terminal(
     record: &SessionRecord,
     target_state: ProcessState,
+    liveness_reason: &'static str,
+    failure_message: Option<&'static str>,
+    liveness: &RecordLiveness,
 ) -> Result<(), ReconcileError> {
     let now = current_timestamp();
     let mut meta = read_json::<SessionMeta>(&record.paths.meta_json)?;
@@ -130,8 +222,13 @@ fn mark_record_terminal(
     meta.process_state = target_state.clone();
     meta.ended_at.get_or_insert_with(|| now.clone());
     meta.updated_at = now.clone();
-    if meta.failure_message.is_none() && target_state == ProcessState::Lost {
-        meta.failure_message = Some("startup reconciliation found no live recorded process".into());
+    if meta.failure_message.is_none() {
+        if let Some(message) = failure_message {
+            meta.failure_message = Some(message.to_string());
+        } else if target_state == ProcessState::Lost {
+            meta.failure_message =
+                Some("startup reconciliation found no live recorded process".to_string());
+        }
     }
     write_json_atomic(&record.paths.meta_json, &meta)?;
 
@@ -160,8 +257,38 @@ fn mark_record_terminal(
     event
         .fields
         .insert("reason".to_string(), "startup_reconcile".to_string());
+    event
+        .fields
+        .insert("liveness_reason".to_string(), liveness_reason.to_string());
+    event.fields.insert(
+        "worker_liveness".to_string(),
+        serde_json::to_string(&liveness.worker)
+            .unwrap_or_else(|_| "\"unknown\"".to_string())
+            .trim_matches('"')
+            .to_string(),
+    );
+    event.fields.insert(
+        "child_liveness".to_string(),
+        serde_json::to_string(&liveness.child)
+            .unwrap_or_else(|_| "\"unknown\"".to_string())
+            .trim_matches('"')
+            .to_string(),
+    );
+    event
+        .fields
+        .insert("worker_pids".to_string(), pid_list(&liveness.worker_pids));
+    event
+        .fields
+        .insert("child_pids".to_string(), pid_list(&liveness.child_pids));
     append_event(&record.paths.events_jsonl, &event)?;
     Ok(())
+}
+
+fn pid_list(pids: &[u32]) -> String {
+    pids.iter()
+        .map(u32::to_string)
+        .collect::<Vec<_>>()
+        .join(",")
 }
 
 #[cfg(test)]

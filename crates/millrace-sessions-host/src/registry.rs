@@ -12,7 +12,7 @@ use millrace_sessions_core::{
         SessionArtifacts, SessionCapabilities, SessionInspectResponse, SessionListRequest,
         SessionSelector, SessionSummary, M1_PROTOCOL_VERSION,
     },
-    state::{MonitorProfile, ProcessState, SessionMeta, SessionRole, WorkerMeta},
+    state::{MonitorProfile, ProcessState, SessionLiveness, SessionMeta, SessionRole, WorkerMeta},
     storage::read_json,
     workspace::WorkspaceIdentity,
 };
@@ -244,7 +244,14 @@ fn load_optional_worker(path: &Path, registry: &mut HostRegistry) -> Option<Work
 }
 
 fn summary_from_record(record: &SessionRecord) -> SessionSummary {
-    summary_from_meta(&record.meta, record.worker.as_ref(), &record.paths)
+    let mut summary = summary_from_meta(&record.meta, record.worker.as_ref(), &record.paths);
+    let liveness = crate::reconcile::record_liveness(record);
+    summary.liveness = SessionLiveness {
+        schema_version: 1,
+        worker: liveness.worker,
+        child: liveness.child,
+    };
+    summary
 }
 
 fn summary_from_meta(
@@ -289,6 +296,7 @@ fn summary_from_meta(
         input_owner,
         capabilities: SessionCapabilities::for_spawn_mode(meta.spawn_mode),
         artifacts: SessionArtifacts::for_paths(meta.spawn_mode, paths),
+        liveness: SessionLiveness::default(),
     }
 }
 

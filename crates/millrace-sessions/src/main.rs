@@ -428,6 +428,7 @@ mod tests {
             input_owner: None,
             capabilities: SessionCapabilities::for_spawn_mode(SpawnMode::Pty),
             artifacts: SessionArtifacts::default(),
+            liveness: Default::default(),
         }
     }
 }

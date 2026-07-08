@@ -1,9 +1,12 @@
 use std::{collections::BTreeMap, fs, os::unix::net::UnixListener, path::Path};
 
 use millrace_sessions_core::{
+    events::{append_event, read_events, SessionEvent, SessionEventKind},
     ids::SessionId,
     paths::StatePaths,
-    state::{AttentionState, HostMeta, ProcessState, SessionMeta, SessionRole, SpawnMode},
+    state::{
+        AttentionState, HostMeta, ProcessState, SessionMeta, SessionRole, SpawnMode, WorkerMeta,
+    },
     storage::{read_json, write_json_atomic},
     workspace::WorkspaceIdentity,
 };
@@ -126,6 +129,76 @@ fn registry_detects_duplicate_millrace_daemon_through_symlink_alias() {
 
     assert_eq!(duplicate.session_id, daemon.id);
     assert_eq!(duplicate.role, SessionRole::MillraceDaemon);
+}
+
+#[test]
+fn bootstrap_reconcile_preserves_raw_evidence_when_marking_stale_active_session() {
+    let temp = tempfile::tempdir().unwrap();
+    let paths = StatePaths::new(temp.path().join("state"));
+    fs::create_dir_all(&paths.sessions_dir).unwrap();
+    let workspace = temp.path().join("workspace");
+    fs::create_dir_all(&workspace).unwrap();
+
+    let meta = sample_session(&workspace, SessionRole::Shell);
+    let session_paths = paths.session_paths(meta.id);
+    fs::create_dir_all(&session_paths.root).unwrap();
+    write_json_atomic(&session_paths.meta_json, &meta).unwrap();
+    write_json_atomic(
+        &session_paths.worker_json,
+        &WorkerMeta {
+            session_id: meta.id,
+            pid: 0,
+            child_pid: None,
+            child_pgid: None,
+            spawn_mode: SpawnMode::Pty,
+            process_state: ProcessState::Running,
+            started_at: "2026-05-20T18:00:00Z".to_string(),
+            ended_at: None,
+            stop_requested_at: None,
+            stop_reason: None,
+            exit_code: None,
+            exit_signal: None,
+            attached_clients: 1,
+            input_owner: Some("lost-client".to_string()),
+            updated_at: "2026-05-20T18:01:00Z".to_string(),
+        },
+    )
+    .unwrap();
+    fs::write(&session_paths.pty_log, b"raw pty evidence\n").unwrap();
+    fs::write(&session_paths.raw_replay_ring, b"raw replay evidence").unwrap();
+    append_event(
+        &session_paths.events_jsonl,
+        &SessionEvent::new(meta.id, SessionEventKind::Output),
+    )
+    .unwrap();
+
+    let _host = bootstrap_foreground(paths.clone()).expect("bootstrap succeeds");
+
+    assert_eq!(
+        fs::read_to_string(&session_paths.pty_log).unwrap(),
+        "raw pty evidence\n"
+    );
+    assert_eq!(
+        fs::read(&session_paths.raw_replay_ring).unwrap(),
+        b"raw replay evidence"
+    );
+    let reconciled: SessionMeta = read_json(&session_paths.meta_json).unwrap();
+    assert_eq!(reconciled.process_state, ProcessState::Lost);
+    let worker: WorkerMeta = read_json(&session_paths.worker_json).unwrap();
+    assert_eq!(worker.process_state, ProcessState::Lost);
+    assert_eq!(worker.attached_clients, 0);
+    assert_eq!(worker.input_owner, None);
+
+    let events = read_events(&session_paths.events_jsonl).unwrap();
+    assert!(events
+        .iter()
+        .any(|event| event.kind == SessionEventKind::Output));
+    assert!(events.iter().any(|event| {
+        event.kind == SessionEventKind::StateChanged
+            && event.fields.get("reason").map(String::as_str) == Some("startup_reconcile")
+            && event.fields.get("liveness_reason").map(String::as_str)
+                == Some("all_recorded_processes_dead")
+    }));
 }
 
 fn write_session_meta(paths: &StatePaths, meta: &SessionMeta) {

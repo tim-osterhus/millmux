@@ -1,4 +1,5 @@
 use std::{
+    collections::BTreeMap,
     fs,
     io::{BufRead, BufReader, Write},
     net::Shutdown,
@@ -11,19 +12,31 @@ use std::{
 };
 
 use millrace_sessions_core::{
-    events::{read_events, SessionEventKind},
+    events::{append_event, read_events, SessionEvent, SessionEventKind},
+    ids::SessionId,
     paths::{StatePaths, STATE_DIR_ENV},
     protocol::{
         AttachFrameType, AttachInitialReplay, AttachStreamFrame, ControlErrorCode, ControlResponse,
         LogStream, SessionAttachResponse, SessionDeleteResponse, SessionEventsResponse,
-        SessionKillResponse, SessionLogsResponse, SessionResizeResponse, SessionSendResponse,
-        SessionStartResponse, SessionStopResponse, SnapshotUnavailableReason,
+        SessionInspectResponse, SessionKillResponse, SessionLogsResponse, SessionResizeResponse,
+        SessionSelector, SessionSendResponse, SessionStartResponse, SessionStopResponse,
+        SnapshotUnavailableReason,
     },
     scrollback::{restore_terminal_replay, TerminalSnapshot, TerminalStateBuffer},
-    state::{ProcessState, SessionMeta, SpawnMode, WorkerMeta},
-    storage::{append_raw_pty_log, read_json},
+    state::{
+        AttentionState, MonitorProfile, ProcessState, SessionMeta, SessionRole, SpawnMode,
+        WorkerMeta,
+    },
+    storage::{append_raw_pty_log, create_private_dir_all, read_json, write_json_atomic},
 };
-use nix::sys::socket::{setsockopt, sockopt::RcvBuf};
+use millrace_sessions_host::{reconcile::reconcile_startup, registry::HostRegistry};
+use nix::{
+    sys::{
+        signal::kill,
+        socket::{setsockopt, sockopt::RcvBuf},
+    },
+    unistd::Pid,
+};
 use serde_json::{json, Value};
 
 #[test]
@@ -593,6 +606,53 @@ fn pipe_session_rejects_pty_only_control_methods() {
 }
 
 #[test]
+fn liveness_reconciliation_marks_pty_and_pipe_worker_dead_child_alive_orphaned() {
+    let temp = tempfile::tempdir().unwrap();
+    let paths = StatePaths::new(temp.path().join("state"));
+    create_private_dir_all(&paths.sessions_dir).unwrap();
+    create_private_dir_all(&paths.archive_dir).unwrap();
+
+    let live_child_pid = std::process::id();
+    let pty_session = write_liveness_orphan_session(&paths, SpawnMode::Pty, live_child_pid);
+    let pipe_session = write_liveness_orphan_session(&paths, SpawnMode::Pipe, live_child_pid);
+
+    let summary = reconcile_startup(&paths).unwrap();
+    assert_eq!(summary.scanned, 2);
+    assert_eq!(summary.preserved, 0);
+    assert_eq!(summary.marked_terminal, 2);
+
+    let registry = HostRegistry::load(paths.clone()).unwrap();
+    for session_id in [pty_session, pipe_session] {
+        let inspected = registry
+            .inspect(&SessionSelector::Id { session_id })
+            .expect("session remains inspectable");
+        assert_eq!(inspected.session.process_state, ProcessState::Orphaned);
+        assert_eq!(inspected.session.attached_clients, 0);
+        assert_eq!(inspected.session.input_owner, None);
+        assert_eq!(
+            inspected.session.failure_message.as_deref(),
+            Some("startup reconciliation found a live child without a live worker")
+        );
+
+        let session_paths = paths.session_paths(session_id);
+        let meta: SessionMeta = read_json(&session_paths.meta_json).unwrap();
+        let worker: WorkerMeta = read_json(&session_paths.worker_json).unwrap();
+        assert_eq!(meta.child_pid, Some(live_child_pid));
+        assert_eq!(worker.child_pid, Some(live_child_pid));
+        assert_eq!(worker.process_state, ProcessState::Orphaned);
+        assert_eq!(worker.attached_clients, 0);
+        assert_eq!(worker.input_owner, None);
+
+        let events = read_events(&session_paths.events_jsonl).unwrap();
+        assert!(events.iter().any(|event| {
+            event.kind == SessionEventKind::StateChanged
+                && event.process_state == Some(ProcessState::Orphaned)
+                && event.fields.get("liveness_reason").map(String::as_str) == Some("orphaned_child")
+        }));
+    }
+}
+
+#[test]
 fn events_reads_structured_session_events() {
     let temp = tempfile::tempdir().unwrap();
     let paths = StatePaths::new(temp.path().join("state"));
@@ -629,6 +689,326 @@ fn events_reads_structured_session_events() {
         .any(|event| event.kind == SessionEventKind::Output));
 
     daemon.kill();
+}
+
+#[test]
+fn client_loss_does_not_kill_hosted_child() {
+    let temp = tempfile::tempdir().unwrap();
+    let paths = StatePaths::new(temp.path().join("state"));
+    let workspace = temp.path().join("workspace");
+    fs::create_dir_all(&workspace).unwrap();
+    let mut daemon = DaemonChild::spawn(&paths);
+    wait_for_socket(&paths.control_sock);
+
+    let start = start_session(
+        &paths,
+        &workspace,
+        "client-loss-shell",
+        "printf 'ready\\n'; while IFS= read -r line; do printf 'got:%s\\n' \"$line\"; done",
+    );
+    let session_paths = paths.session_paths(start.session.session_id);
+    wait_for_worker_socket(&session_paths.worker_sock);
+    wait_for_running_meta(&session_paths.meta_json);
+    wait_for_file_contains(&session_paths.pty_log, "ready");
+    let worker: WorkerMeta = read_json(&session_paths.worker_json).unwrap();
+    let child_pid = worker.child_pid.expect("child pid is recorded");
+
+    let stream = open_attach_stream(&paths, start.session.session_id, false);
+    let attach = read_attach_response(&stream);
+    assert!(attach.stream.input_owner);
+    drop(stream);
+
+    wait_for_attach_closed_count(&session_paths.events_jsonl, 1);
+    assert_process_alive(worker.pid, "worker after client loss");
+    assert_process_alive(child_pid, "child after client loss");
+
+    let after_loss = request_json(
+        &paths,
+        json!({
+            "id": "send-after-client-loss",
+            "method": "session.send",
+            "params": {
+                "selector": {"type": "id", "session_id": start.session.session_id},
+                "text": "after-client-loss\n"
+            }
+        }),
+    );
+    assert_eq!(after_loss["ok"], true, "{after_loss:#}");
+    wait_for_file_contains(&session_paths.pty_log, "got:after-client-loss");
+
+    let cleanup = request_json(
+        &paths,
+        json!({
+            "id": "kill-after-client-loss",
+            "method": "session.kill",
+            "params": {
+                "selector": {"type": "id", "session_id": start.session.session_id}
+            }
+        }),
+    );
+    assert_eq!(cleanup["ok"], true, "{cleanup:#}");
+
+    daemon.kill();
+}
+
+#[test]
+fn restart_preserves_pty_session_and_supported_surfaces_work() {
+    let temp = tempfile::tempdir().unwrap();
+    let paths = StatePaths::new(temp.path().join("state"));
+    let workspace = temp.path().join("workspace");
+    fs::create_dir_all(&workspace).unwrap();
+    let mut daemon = DaemonChild::spawn(&paths);
+    wait_for_socket(&paths.control_sock);
+
+    let start = start_session(
+        &paths,
+        &workspace,
+        "restart-pty-shell",
+        "printf 'ready\\n'; while IFS= read -r line; do printf 'got:%s\\n' \"$line\"; done",
+    );
+    let session_paths = paths.session_paths(start.session.session_id);
+    wait_for_worker_socket(&session_paths.worker_sock);
+    wait_for_running_meta(&session_paths.meta_json);
+    wait_for_file_contains(&session_paths.pty_log, "ready");
+    let worker_before: WorkerMeta = read_json(&session_paths.worker_json).unwrap();
+    let child_pid = worker_before.child_pid.expect("child pid is recorded");
+
+    daemon.kill();
+    assert_process_alive(worker_before.pid, "worker after sessiond restart");
+    assert_process_alive(child_pid, "child after sessiond restart");
+
+    let mut restarted = DaemonChild::spawn(&paths);
+    wait_for_socket(&paths.control_sock);
+    let host_status = request_json(
+        &paths,
+        json!({"id": "host-status-after-restart", "method": "host.status", "params": {}}),
+    );
+    assert_eq!(host_status["ok"], true, "{host_status:#}");
+
+    let inspected = request_json(
+        &paths,
+        json!({
+            "id": "inspect-after-restart",
+            "method": "session.inspect",
+            "params": {
+                "selector": {"type": "id", "session_id": start.session.session_id}
+            }
+        }),
+    );
+    assert_eq!(inspected["ok"], true, "{inspected:#}");
+    let inspect: SessionInspectResponse =
+        serde_json::from_value(inspected["result"].clone()).expect("inspect result");
+    assert_eq!(inspect.session.process_state, ProcessState::Running);
+    assert_eq!(inspect.session.spawn_mode, SpawnMode::Pty);
+    assert_eq!(
+        inspect.worker.as_ref().map(|worker| worker.pid),
+        Some(worker_before.pid)
+    );
+
+    let logs = request_json(
+        &paths,
+        json!({
+            "id": "logs-after-restart",
+            "method": "session.logs",
+            "params": {
+                "selector": {"type": "id", "session_id": start.session.session_id},
+                "tail": 10
+            }
+        }),
+    );
+    assert_eq!(logs["ok"], true, "{logs:#}");
+    let logs: SessionLogsResponse =
+        serde_json::from_value(logs["result"].clone()).expect("logs result");
+    assert!(logs.lines.iter().any(|line| line.line.contains("ready")));
+
+    let events = request_json(
+        &paths,
+        json!({
+            "id": "events-after-restart",
+            "method": "session.events",
+            "params": {
+                "selector": {"type": "id", "session_id": start.session.session_id}
+            }
+        }),
+    );
+    assert_eq!(events["ok"], true, "{events:#}");
+    let events: SessionEventsResponse =
+        serde_json::from_value(events["result"].clone()).expect("events result");
+    assert!(events
+        .events
+        .iter()
+        .any(|event| event.kind == SessionEventKind::Output));
+
+    let send = request_json(
+        &paths,
+        json!({
+            "id": "send-after-restart",
+            "method": "session.send",
+            "params": {
+                "selector": {"type": "id", "session_id": start.session.session_id},
+                "text": "after-restart\n"
+            }
+        }),
+    );
+    assert_eq!(send["ok"], true, "{send:#}");
+    wait_for_file_contains(&session_paths.pty_log, "got:after-restart");
+
+    let mut attach =
+        open_attach_stream_with_replay(&paths, start.session.session_id, true, "line_scrollback");
+    let attach_response = read_attach_response(&attach);
+    assert!(attach_response.stream.read_only);
+    let mut reader = BufReader::new(attach.try_clone().unwrap());
+    let frame = wait_for_attach_frame(
+        &mut reader,
+        |frame| matches!(frame, AttachStreamFrame::Scrollback { lines } if lines.iter().any(|line| line.contains("ready"))),
+    );
+    assert!(matches!(frame, AttachStreamFrame::Scrollback { .. }));
+    attach
+        .write_all(AttachStreamFrame::Close.to_json_line().unwrap().as_bytes())
+        .unwrap();
+    wait_for_attach_closed_count(&session_paths.events_jsonl, 1);
+
+    let cleanup = request_json(
+        &paths,
+        json!({
+            "id": "kill-after-pty-restart",
+            "method": "session.kill",
+            "params": {
+                "selector": {"type": "id", "session_id": start.session.session_id}
+            }
+        }),
+    );
+    assert_eq!(cleanup["ok"], true, "{cleanup:#}");
+
+    restarted.kill();
+}
+
+#[test]
+fn restart_preserves_pipe_session_and_supported_surfaces_work() {
+    let temp = tempfile::tempdir().unwrap();
+    let paths = StatePaths::new(temp.path().join("state"));
+    let workspace = temp.path().join("workspace");
+    fs::create_dir_all(&workspace).unwrap();
+    let mut daemon = DaemonChild::spawn(&paths);
+    wait_for_socket(&paths.control_sock);
+
+    let start = start_pipe_session(
+        &paths,
+        &workspace,
+        "restart-pipe-shell",
+        "trap 'printf pipe-stopped\\n; exit 0' TERM; printf 'ready\\n'; while true; do sleep 1; done",
+    );
+    let session_paths = paths.session_paths(start.session.session_id);
+    wait_for_file_contains(&session_paths.stdout_log, "ready");
+    wait_for_running_meta(&session_paths.meta_json);
+    let worker_before: WorkerMeta = read_json(&session_paths.worker_json).unwrap();
+    let child_pid = worker_before.child_pid.expect("child pid is recorded");
+
+    daemon.kill();
+    assert_process_alive(worker_before.pid, "pipe worker after sessiond restart");
+    assert_process_alive(child_pid, "pipe child after sessiond restart");
+
+    let mut restarted = DaemonChild::spawn(&paths);
+    wait_for_socket(&paths.control_sock);
+    let inspected = request_json(
+        &paths,
+        json!({
+            "id": "pipe-inspect-after-restart",
+            "method": "session.inspect",
+            "params": {
+                "selector": {"type": "id", "session_id": start.session.session_id}
+            }
+        }),
+    );
+    assert_eq!(inspected["ok"], true, "{inspected:#}");
+    let inspect: SessionInspectResponse =
+        serde_json::from_value(inspected["result"].clone()).expect("pipe inspect result");
+    assert_eq!(inspect.session.process_state, ProcessState::Running);
+    assert_eq!(inspect.session.spawn_mode, SpawnMode::Pipe);
+    assert_eq!(
+        inspect.worker.as_ref().map(|worker| worker.pid),
+        Some(worker_before.pid)
+    );
+
+    let logs = request_json(
+        &paths,
+        json!({
+            "id": "pipe-logs-after-restart",
+            "method": "session.logs",
+            "params": {
+                "selector": {"type": "id", "session_id": start.session.session_id},
+                "tail": 10
+            }
+        }),
+    );
+    assert_eq!(logs["ok"], true, "{logs:#}");
+    let logs: SessionLogsResponse =
+        serde_json::from_value(logs["result"].clone()).expect("pipe logs result");
+    assert!(logs
+        .lines
+        .iter()
+        .any(|line| line.stream == LogStream::Stdout && line.line == "ready"));
+
+    let events = request_json(
+        &paths,
+        json!({
+            "id": "pipe-events-after-restart",
+            "method": "session.events",
+            "params": {
+                "selector": {"type": "id", "session_id": start.session.session_id}
+            }
+        }),
+    );
+    assert_eq!(events["ok"], true, "{events:#}");
+    let events: SessionEventsResponse =
+        serde_json::from_value(events["result"].clone()).expect("pipe events result");
+    assert!(events.events.iter().any(|event| {
+        event.kind == SessionEventKind::Output
+            && event.fields.get("stream").map(String::as_str) == Some("stdout")
+    }));
+
+    let stop = request_json(
+        &paths,
+        json!({
+            "id": "pipe-stop-after-restart",
+            "method": "session.stop",
+            "params": {
+                "selector": {"type": "id", "session_id": start.session.session_id},
+                "grace_seconds": 2
+            }
+        }),
+    );
+    assert_eq!(stop["ok"], true, "{stop:#}");
+    let stop: SessionStopResponse =
+        serde_json::from_value(stop["result"].clone()).expect("pipe stop result");
+    assert!(stop.stop_requested);
+    let meta = wait_for_terminal_meta(&session_paths.meta_json);
+    assert!(matches!(
+        meta.process_state,
+        ProcessState::Exited | ProcessState::Crashed | ProcessState::Killed
+    ));
+
+    let deleted = request_json(
+        &paths,
+        json!({
+            "id": "pipe-delete-after-restart",
+            "method": "session.delete",
+            "params": {
+                "selector": {"type": "id", "session_id": start.session.session_id}
+            }
+        }),
+    );
+    assert_eq!(deleted["ok"], true, "{deleted:#}");
+    let delete: SessionDeleteResponse =
+        serde_json::from_value(deleted["result"].clone()).expect("pipe delete result");
+    assert!(delete.deleted);
+    assert!(delete.archived);
+    let archive_root = paths.archive_dir.join(start.session.session_id.to_string());
+    assert!(archive_root.join("stdout.log").exists());
+    assert!(archive_root.join("stderr.log").exists());
+    assert!(archive_root.join("events.jsonl").exists());
+
+    restarted.kill();
 }
 
 #[test]
@@ -1772,6 +2152,77 @@ fn inspected_session_summary(
     inspected["result"]["session"].clone()
 }
 
+fn write_liveness_orphan_session(
+    paths: &StatePaths,
+    spawn_mode: SpawnMode,
+    live_child_pid: u32,
+) -> SessionId {
+    let session_id = SessionId::new();
+    let dead_worker_pid = dead_process_pid();
+    let now = "2026-05-20T18:00:00Z".to_string();
+    let session_paths = paths.session_paths(session_id);
+    create_private_dir_all(&session_paths.root).unwrap();
+
+    let meta = SessionMeta {
+        id: session_id,
+        name: Some(format!("liveness-{spawn_mode}")),
+        role: SessionRole::Shell,
+        process_state: ProcessState::Running,
+        attention_state: AttentionState::Active,
+        workspace: None,
+        cwd: paths.root.clone(),
+        argv: vec!["sh".to_string(), "-c".to_string(), "sleep 60".to_string()],
+        spawn_mode,
+        monitor_profile: MonitorProfile::Auto,
+        env: BTreeMap::new(),
+        worker_pid: Some(dead_worker_pid),
+        child_pid: Some(live_child_pid),
+        child_pgid: Some(live_child_pid),
+        started_at: Some(now.clone()),
+        ended_at: None,
+        stop_requested_at: None,
+        stop_reason: None,
+        exit_code: None,
+        exit_signal: None,
+        failure_message: None,
+        created_at: now.clone(),
+        updated_at: now.clone(),
+    };
+    let worker = WorkerMeta {
+        session_id,
+        pid: dead_worker_pid,
+        child_pid: Some(live_child_pid),
+        child_pgid: Some(live_child_pid),
+        spawn_mode,
+        process_state: ProcessState::Running,
+        started_at: now.clone(),
+        ended_at: None,
+        stop_requested_at: None,
+        stop_reason: None,
+        exit_code: None,
+        exit_signal: None,
+        attached_clients: if spawn_mode.is_pty() { 1 } else { 0 },
+        input_owner: spawn_mode.is_pty().then(|| "stale-owner".to_string()),
+        updated_at: now,
+    };
+
+    write_json_atomic(&session_paths.meta_json, &meta).unwrap();
+    write_json_atomic(&session_paths.worker_json, &worker).unwrap();
+    match spawn_mode {
+        SpawnMode::Pty => append_raw_pty_log(&session_paths.pty_log, b"orphan pty\n").unwrap(),
+        SpawnMode::Pipe => {
+            fs::write(&session_paths.stdout_log, b"orphan stdout\n").unwrap();
+            fs::write(&session_paths.stderr_log, b"orphan stderr\n").unwrap();
+        }
+    }
+    append_event(
+        &session_paths.events_jsonl,
+        &SessionEvent::new(session_id, SessionEventKind::SessionCreated),
+    )
+    .unwrap();
+    session_id
+}
+
 fn request_json(paths: &StatePaths, value: Value) -> Value {
     let mut stream = UnixStream::connect(&paths.control_sock).expect("connect to daemon socket");
     stream
@@ -1784,10 +2235,26 @@ fn request_json(paths: &StatePaths, value: Value) -> Value {
     serde_json::from_str(response.trim_end()).expect("response is json")
 }
 
+fn dead_process_pid() -> u32 {
+    let mut child = Command::new("sh").arg("-c").arg("exit 0").spawn().unwrap();
+    let pid = child.id();
+    child.wait().unwrap();
+    pid
+}
+
 fn open_attach_stream(
     paths: &StatePaths,
     session_id: millrace_sessions_core::ids::SessionId,
     read_only: bool,
+) -> UnixStream {
+    open_attach_stream_with_replay(paths, session_id, read_only, "none")
+}
+
+fn open_attach_stream_with_replay(
+    paths: &StatePaths,
+    session_id: millrace_sessions_core::ids::SessionId,
+    read_only: bool,
+    replay: &str,
 ) -> UnixStream {
     let mut stream = UnixStream::connect(&paths.control_sock).expect("connect attach stream");
     stream
@@ -1800,7 +2267,7 @@ fn open_attach_stream(
                     "params": {
                         "selector": {"type": "id", "session_id": session_id},
                         "read_only": read_only,
-                        "replay": "none"
+                        "replay": replay
                     }
                 }))
                 .unwrap()
@@ -1809,6 +2276,13 @@ fn open_attach_stream(
         )
         .unwrap();
     stream
+}
+
+fn assert_process_alive(pid: u32, label: &str) {
+    assert!(
+        kill(Pid::from_raw(pid as i32), None).is_ok(),
+        "{label} pid {pid} should still be alive"
+    );
 }
 
 fn read_attach_response(stream: &UnixStream) -> SessionAttachResponse {

@@ -47,6 +47,39 @@ fn lifecycle_writes_worker_facts_and_state_transitions() {
     assert_eq!(meta.exit_signal, None);
 }
 
+#[test]
+fn lifecycle_clears_attach_state_on_process_exit() {
+    let temp = tempfile::tempdir().unwrap();
+    let state_paths = StatePaths::new(temp.path().join("state"));
+    let session = sample_session(temp.path());
+    let paths = state_paths.session_paths(session.id);
+    fs::create_dir_all(&paths.root).unwrap();
+    write_json_atomic(&paths.meta_json, &session).unwrap();
+
+    write_worker_meta(
+        &paths,
+        WorkerFacts {
+            worker_pid: 42,
+            child_pid: Some(99),
+            child_pgid: Some(99),
+            spawn_mode: SpawnMode::Pty,
+        },
+    )
+    .expect("write worker meta");
+    record_running(&paths, Some(99), Some(99)).expect("running transition");
+    let mut worker: WorkerMeta = read_json(&paths.worker_json).unwrap();
+    worker.attached_clients = 3;
+    worker.input_owner = Some("stale-owner".to_string());
+    write_json_atomic(&paths.worker_json, &worker).unwrap();
+
+    record_process_exit(&paths, 0, None).expect("exit transition");
+
+    let worker: WorkerMeta = read_json(&paths.worker_json).unwrap();
+    assert_eq!(worker.process_state, ProcessState::Exited);
+    assert_eq!(worker.attached_clients, 0);
+    assert_eq!(worker.input_owner, None);
+}
+
 #[cfg(unix)]
 #[test]
 fn worker_lifecycle_writes_private_metadata() {

@@ -8,8 +8,8 @@ use crate::{
     events::SessionEvent,
     ids::{SessionId, UiId},
     state::{
-        AttentionState, HostMeta, MonitorProfile, ProcessState, SessionPaths, SessionRole,
-        SpawnMode, UiContext, UiContextPaths, UiEvent, WorkerMeta,
+        AttentionState, HostMeta, MonitorProfile, ProcessState, SessionLiveness, SessionPaths,
+        SessionRole, SpawnMode, UiContext, UiContextPaths, UiEvent, WorkerMeta,
     },
     workspace::WorkspaceIdentity,
 };
@@ -721,6 +721,8 @@ pub struct SessionSummary {
     pub capabilities: SessionCapabilities,
     #[serde(default)]
     pub artifacts: SessionArtifacts,
+    #[serde(default)]
+    pub liveness: SessionLiveness,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

@@ -943,15 +943,17 @@ fn daemon_recovery_actions(state: &ProcessState) -> Vec<UiDaemonRecoveryAction> 
             UiDaemonRecoveryAction::Archive,
             UiDaemonRecoveryAction::Delete,
         ],
-        ProcessState::Crashed | ProcessState::Failed | ProcessState::Lost | ProcessState::Stale => {
-            vec![
-                UiDaemonRecoveryAction::Inspect,
-                UiDaemonRecoveryAction::Logs,
-                UiDaemonRecoveryAction::Doctor,
-                UiDaemonRecoveryAction::Archive,
-                UiDaemonRecoveryAction::Delete,
-            ]
-        }
+        ProcessState::Crashed
+        | ProcessState::Failed
+        | ProcessState::Lost
+        | ProcessState::Stale
+        | ProcessState::Orphaned => vec![
+            UiDaemonRecoveryAction::Inspect,
+            UiDaemonRecoveryAction::Logs,
+            UiDaemonRecoveryAction::Doctor,
+            UiDaemonRecoveryAction::Archive,
+            UiDaemonRecoveryAction::Delete,
+        ],
     }
 }
 
@@ -966,6 +968,7 @@ fn process_state_label(state: &ProcessState) -> &'static str {
         ProcessState::Failed => "failed",
         ProcessState::Lost => "lost",
         ProcessState::Stale => "stale",
+        ProcessState::Orphaned => "orphaned",
     }
 }
 
@@ -1342,6 +1345,7 @@ mod tests {
             input_owner: None,
             capabilities: SessionCapabilities::for_spawn_mode(SpawnMode::Pty),
             artifacts: SessionArtifacts::default(),
+            liveness: Default::default(),
         }
     }
 }

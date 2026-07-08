@@ -9,7 +9,7 @@ use assert_cmd::prelude::*;
 use millrace_sessions_core::{
     ids::SessionId,
     paths::StatePaths,
-    state::{AttentionState, ProcessState, SessionMeta, SessionRole, SpawnMode},
+    state::{AttentionState, ProcessState, SessionMeta, SessionRole, SpawnMode, WorkerMeta},
     storage::write_json_atomic,
 };
 use serde_json::Value;
@@ -69,6 +69,48 @@ fn doctor_archive_stale_repair_is_explicit_json() {
     assert!(paths.archive_dir.join(stale.id.to_string()).exists());
 }
 
+#[test]
+fn doctor_json_reports_worker_child_liveness_issue_without_starting_host() {
+    let temp = tempfile::tempdir().unwrap();
+    let paths = prepared_state(temp.path());
+    let dead_worker_pid = dead_process_pid();
+    let live_child_pid = std::process::id();
+    let mut session = sample_meta(ProcessState::Running, temp.path());
+    session.worker_pid = Some(dead_worker_pid);
+    session.child_pid = Some(live_child_pid);
+    session.child_pgid = Some(live_child_pid);
+    let mut worker = sample_worker(session.id, dead_worker_pid);
+    worker.child_pid = Some(live_child_pid);
+    worker.child_pgid = Some(live_child_pid);
+    write_session(&paths, &session);
+    write_json_atomic(&paths.session_paths(session.id).worker_json, &worker).unwrap();
+
+    let output = millmux_command(&paths)
+        .args(["doctor", "--json"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    let value: Value = serde_json::from_slice(&output).expect("doctor json");
+    assert_issue(&value, "orphaned_child_process", "critical");
+    assert_issue(&value, "worker_socket_missing", "warning");
+    let issues = value["issues"].as_array().expect("issues array");
+    let issue = issues
+        .iter()
+        .find(|issue| issue["code"] == "orphaned_child_process")
+        .expect("worker/child liveness issue");
+    assert_eq!(issue["details"]["worker_liveness"], "dead");
+    assert_eq!(issue["details"]["child_liveness"], "alive");
+    assert!(issue["details"]["recovery_actions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|action| action == "signal_child"));
+    assert!(!paths.host_json.exists(), "doctor should not start a host");
+}
+
 fn prepared_state(root: &Path) -> StatePaths {
     let paths = StatePaths::new(root.join("state"));
     fs::create_dir_all(&paths.sessions_dir).unwrap();
@@ -121,10 +163,41 @@ fn sample_meta(state: ProcessState, root: &Path) -> SessionMeta {
     }
 }
 
+fn sample_worker(session_id: SessionId, pid: u32) -> WorkerMeta {
+    WorkerMeta {
+        session_id,
+        pid,
+        child_pid: None,
+        child_pgid: None,
+        spawn_mode: SpawnMode::Pty,
+        process_state: ProcessState::Running,
+        started_at: "2026-05-20T18:00:00Z".to_string(),
+        ended_at: None,
+        stop_requested_at: None,
+        stop_reason: None,
+        exit_code: None,
+        exit_signal: None,
+        attached_clients: 0,
+        input_owner: None,
+        updated_at: "2026-05-20T18:01:00Z".to_string(),
+    }
+}
+
 fn millmux_command(paths: &StatePaths) -> std::process::Command {
     let mut command = std::process::Command::cargo_bin("millmux").expect("millmux binary");
     command.env("MILLMUX_STATE_DIR", &paths.root);
     command
+}
+
+fn dead_process_pid() -> u32 {
+    let mut child = std::process::Command::new("sh")
+        .arg("-c")
+        .arg("exit 0")
+        .spawn()
+        .unwrap();
+    let pid = child.id();
+    child.wait().unwrap();
+    pid
 }
 
 fn assert_issue(value: &Value, code: &str, severity: &str) {

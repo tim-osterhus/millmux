@@ -35,8 +35,8 @@ use millrace_sessions_core::{
         WorkerSendRequest, WorkerSendResponse, M1_PROTOCOL_VERSION,
     },
     state::{
-        AttentionState, HostMeta, MonitorProfile, ProcessState, SessionMeta, SessionPaths,
-        SessionRole, UiContext, UiContextPaths, UiEvent, UiEventKind, WorkerMeta,
+        AttentionState, HostMeta, MonitorProfile, ProcessState, SessionLiveness, SessionMeta,
+        SessionPaths, SessionRole, UiContext, UiContextPaths, UiEvent, UiEventKind, WorkerMeta,
     },
     storage::{append_json_line, create_private_dir_all, read_json, write_json_atomic},
     workspace::WorkspaceIdentity,
@@ -1276,11 +1276,11 @@ fn delete_session(
     let session_id = inspected.session.session_id;
     let is_active_root = is_active_session_root(paths, &inspected.paths.root);
 
-    if is_active_process_state(&inspected.session.process_state) {
+    if delete_requires_kill(&inspected.session.process_state) {
         if !request.kill {
             return Err(ControlErrorBody::new(
                 ControlErrorCode::UnsafeDeleteRunning,
-                "refusing to delete a running session without --kill",
+                "refusing to delete a running or orphaned session without --kill",
             )
             .with_details(json!({
                 "session_id": session_id,
@@ -1341,6 +1341,10 @@ fn delete_session(
         purged: false,
         archive_path: Some(inspected.paths.root),
     })
+}
+
+fn delete_requires_kill(state: &ProcessState) -> bool {
+    is_active_process_state(state) || *state == ProcessState::Orphaned
 }
 
 fn resolve_ui_context(
@@ -2613,6 +2617,7 @@ fn summary_from_meta(
         input_owner,
         capabilities: SessionCapabilities::for_spawn_mode(meta.spawn_mode),
         artifacts: SessionArtifacts::for_paths(meta.spawn_mode, paths),
+        liveness: SessionLiveness::default(),
     }
 }
 

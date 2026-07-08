@@ -69,6 +69,76 @@ fn doctor_reports_structured_state_socket_and_session_issues() {
 }
 
 #[test]
+fn doctor_reports_orphaned_child_process_with_recovery_actions() {
+    let temp = tempfile::tempdir().unwrap();
+    let paths = prepared_state(temp.path());
+
+    let dead_worker_pid = dead_process_pid();
+    let live_child_pid = std::process::id();
+    let mut orphan = sample_meta(ProcessState::Running, temp.path());
+    orphan.role = SessionRole::MillraceDaemon;
+    orphan.worker_pid = Some(dead_worker_pid);
+    orphan.child_pid = Some(live_child_pid);
+    orphan.child_pgid = Some(live_child_pid);
+    let mut worker = sample_worker(orphan.id, dead_worker_pid, ProcessState::Running);
+    worker.child_pid = Some(live_child_pid);
+    worker.child_pgid = Some(live_child_pid);
+    worker.attached_clients = 1;
+    worker.input_owner = Some("stale-owner".to_string());
+    write_session(&paths, &orphan, Some(worker), true);
+
+    let result = run_doctor(&paths, None, &DoctorRequest::default()).unwrap();
+
+    let orphan_issue = issue_by_code(&result, "orphaned_child_process");
+    assert_eq!(orphan_issue.severity, DoctorSeverity::Critical);
+    let details = orphan_issue.details.as_ref().expect("orphan details");
+    assert_eq!(details["worker_liveness"], "dead");
+    assert_eq!(details["child_liveness"], "alive");
+    let actions = details["recovery_actions"]
+        .as_array()
+        .expect("recovery actions");
+    assert!(actions.iter().any(|action| action == "native_stop"));
+    assert!(actions.iter().any(|action| action == "signal_child"));
+    assert!(actions
+        .iter()
+        .any(|action| action == "archive_after_stopped"));
+    assert!(orphan_issue
+        .suggested_action
+        .as_deref()
+        .unwrap_or_default()
+        .contains("worker is gone while the child remains alive"));
+
+    assert_issue(&result, "worker_socket_missing", DoctorSeverity::Warning);
+    assert_issue(
+        &result,
+        "attach_state_inconsistent",
+        DoctorSeverity::Warning,
+    );
+}
+
+#[test]
+fn doctor_reports_stale_attach_state_after_terminal_session_end() {
+    let temp = tempfile::tempdir().unwrap();
+    let paths = prepared_state(temp.path());
+
+    let terminal = sample_meta(ProcessState::Exited, temp.path());
+    let mut worker = sample_worker(terminal.id, dead_process_pid(), ProcessState::Exited);
+    worker.attached_clients = 2;
+    worker.input_owner = Some("ended-owner".to_string());
+    write_session(&paths, &terminal, Some(worker), true);
+
+    let result = run_doctor(&paths, None, &DoctorRequest::default()).unwrap();
+
+    let issue = issue_by_code(&result, "attach_state_inconsistent");
+    assert_eq!(issue.severity, DoctorSeverity::Warning);
+    let details = issue.details.as_ref().expect("attach issue details");
+    assert_eq!(details["attached_clients"], 2);
+    assert_eq!(details["input_owner"], "ended-owner");
+    assert_eq!(details["session_process_state"], "exited");
+    assert_eq!(details["worker_process_state"], "exited");
+}
+
+#[test]
 fn doctor_checks_pipe_artifacts_without_requiring_pty_log() {
     let temp = tempfile::tempdir().unwrap();
     let paths = prepared_state(temp.path());
@@ -468,6 +538,147 @@ fn startup_reconciliation_preserves_live_and_marks_dead_without_deleting() {
         event.kind == SessionEventKind::StateChanged
             && event.process_state == Some(ProcessState::Lost)
             && event.fields.get("reason").map(String::as_str) == Some("startup_reconcile")
+    }));
+}
+
+#[test]
+fn startup_reconciliation_splits_worker_and_child_liveness() {
+    let temp = tempfile::tempdir().unwrap();
+    let paths = prepared_state(temp.path());
+    let live_pid = std::process::id();
+
+    let mut both_alive = sample_meta(ProcessState::Running, temp.path());
+    both_alive.worker_pid = Some(live_pid);
+    both_alive.child_pid = Some(live_pid);
+    let mut both_alive_worker = sample_worker(both_alive.id, live_pid, ProcessState::Running);
+    both_alive_worker.child_pid = Some(live_pid);
+    write_session(&paths, &both_alive, Some(both_alive_worker), true);
+
+    let mut worker_dead_child_alive = sample_meta(ProcessState::Running, temp.path());
+    worker_dead_child_alive.worker_pid = Some(dead_process_pid());
+    worker_dead_child_alive.child_pid = Some(live_pid);
+    let mut orphan_worker = sample_worker(
+        worker_dead_child_alive.id,
+        worker_dead_child_alive.worker_pid.unwrap(),
+        ProcessState::Running,
+    );
+    orphan_worker.child_pid = Some(live_pid);
+    orphan_worker.attached_clients = 1;
+    orphan_worker.input_owner = Some("stale-owner".to_string());
+    write_session(&paths, &worker_dead_child_alive, Some(orphan_worker), true);
+
+    let mut worker_alive_child_dead = sample_meta(ProcessState::Running, temp.path());
+    worker_alive_child_dead.worker_pid = Some(live_pid);
+    worker_alive_child_dead.child_pid = Some(dead_process_pid());
+    let mut stale_child_worker =
+        sample_worker(worker_alive_child_dead.id, live_pid, ProcessState::Running);
+    stale_child_worker.child_pid = worker_alive_child_dead.child_pid;
+    write_session(
+        &paths,
+        &worker_alive_child_dead,
+        Some(stale_child_worker),
+        true,
+    );
+
+    let mut both_dead = sample_meta(ProcessState::Running, temp.path());
+    both_dead.worker_pid = Some(dead_process_pid());
+    both_dead.child_pid = Some(dead_process_pid());
+    let mut both_dead_worker = sample_worker(
+        both_dead.id,
+        both_dead.worker_pid.unwrap(),
+        ProcessState::Running,
+    );
+    both_dead_worker.child_pid = both_dead.child_pid;
+    write_session(&paths, &both_dead, Some(both_dead_worker), true);
+
+    let summary = reconcile_startup(&paths).unwrap();
+
+    assert_eq!(summary.scanned, 4);
+    assert_eq!(summary.preserved, 1);
+    assert_eq!(summary.marked_terminal, 3);
+
+    let both_alive_after: SessionMeta =
+        read_json(&paths.session_paths(both_alive.id).meta_json).unwrap();
+    let orphan_after: SessionMeta =
+        read_json(&paths.session_paths(worker_dead_child_alive.id).meta_json).unwrap();
+    let stale_child_after: SessionMeta =
+        read_json(&paths.session_paths(worker_alive_child_dead.id).meta_json).unwrap();
+    let both_dead_after: SessionMeta =
+        read_json(&paths.session_paths(both_dead.id).meta_json).unwrap();
+
+    assert_eq!(both_alive_after.process_state, ProcessState::Running);
+    assert_eq!(orphan_after.process_state, ProcessState::Orphaned);
+    assert_eq!(
+        orphan_after.failure_message.as_deref(),
+        Some("startup reconciliation found a live child without a live worker")
+    );
+    assert_eq!(stale_child_after.process_state, ProcessState::Stale);
+    assert_eq!(both_dead_after.process_state, ProcessState::Lost);
+
+    let orphan_worker_after: WorkerMeta =
+        read_json(&paths.session_paths(worker_dead_child_alive.id).worker_json).unwrap();
+    assert_eq!(orphan_worker_after.attached_clients, 0);
+    assert_eq!(orphan_worker_after.input_owner, None);
+
+    let events = read_events(paths.session_paths(worker_dead_child_alive.id).events_jsonl).unwrap();
+    assert!(events.iter().any(|event| {
+        event.kind == SessionEventKind::StateChanged
+            && event.process_state == Some(ProcessState::Orphaned)
+            && event.fields.get("reason").map(String::as_str) == Some("startup_reconcile")
+            && event.fields.get("liveness_reason").map(String::as_str) == Some("orphaned_child")
+            && event.fields.get("worker_liveness").map(String::as_str) == Some("dead")
+            && event.fields.get("child_liveness").map(String::as_str) == Some("alive")
+    }));
+}
+
+#[test]
+fn doctor_reports_reconciled_orphaned_child_process() {
+    let temp = tempfile::tempdir().unwrap();
+    let paths = prepared_state(temp.path());
+    let live_child_pid = std::process::id();
+
+    let mut orphan = sample_meta(ProcessState::Running, temp.path());
+    orphan.role = SessionRole::MillraceDaemon;
+    orphan.worker_pid = Some(dead_process_pid());
+    orphan.child_pid = Some(live_child_pid);
+    orphan.child_pgid = Some(live_child_pid);
+    let mut worker = sample_worker(orphan.id, orphan.worker_pid.unwrap(), ProcessState::Running);
+    worker.child_pid = Some(live_child_pid);
+    worker.child_pgid = Some(live_child_pid);
+    write_session(&paths, &orphan, Some(worker), true);
+
+    let summary = reconcile_startup(&paths).unwrap();
+    assert_eq!(summary.marked_terminal, 1);
+    let reconciled: SessionMeta = read_json(&paths.session_paths(orphan.id).meta_json).unwrap();
+    assert_eq!(reconciled.process_state, ProcessState::Orphaned);
+
+    let result = run_doctor(&paths, None, &DoctorRequest::default()).unwrap();
+    let orphan_issue = issue_by_code(&result, "orphaned_child_process");
+    assert_eq!(orphan_issue.severity, DoctorSeverity::Critical);
+    let details = orphan_issue.details.as_ref().expect("orphan details");
+    assert_eq!(details["worker_liveness"], "dead");
+    assert_eq!(details["child_liveness"], "alive");
+    let actions = details["recovery_actions"]
+        .as_array()
+        .expect("recovery actions");
+    assert!(actions.iter().any(|action| action == "native_stop"));
+    assert!(actions.iter().any(|action| action == "signal_child"));
+    assert!(actions
+        .iter()
+        .any(|action| action == "archive_after_stopped"));
+
+    let repaired = run_doctor(
+        &paths,
+        None,
+        &DoctorRequest {
+            repair: Some(DoctorRepairMode::ArchiveStale),
+        },
+    )
+    .unwrap();
+    assert!(paths.session_paths(orphan.id).root.exists());
+    assert!(!paths.archive_dir.join(orphan.id.to_string()).exists());
+    assert!(!repaired.repairs.iter().any(|repair| {
+        repair.session_id == Some(orphan.id) && repair.status == DoctorRepairStatus::Applied
     }));
 }
 

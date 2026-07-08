@@ -1,7 +1,10 @@
 use std::{
     collections::BTreeSet,
     fs,
-    os::unix::fs::{FileTypeExt, PermissionsExt},
+    os::unix::{
+        fs::{FileTypeExt, PermissionsExt},
+        net::UnixStream,
+    },
     path::{Path, PathBuf},
 };
 
@@ -15,8 +18,8 @@ use millrace_sessions_core::{
     },
     scrollback::{legacy_line_scrollback_tui_sequence_name, ScrollbackBuffer},
     state::{
-        HostMeta, ProcessState, SessionRole, SpawnMode, UiContext, UiContextPaths, UiEvent,
-        UiEventKind,
+        HostMeta, LivenessState, ProcessState, SessionRole, SpawnMode, UiContext, UiContextPaths,
+        UiEvent, UiEventKind,
     },
     storage::{append_json_line, create_private_dir_all, read_json},
 };
@@ -25,7 +28,10 @@ use thiserror::Error;
 use time::{Duration, OffsetDateTime};
 
 use crate::{
-    reconcile::{collect_record_pids, is_active_process_state, pid_status, PidStatus},
+    reconcile::{
+        collect_record_pids, is_active_process_state, pid_status, record_liveness, PidStatus,
+        RecordLiveness,
+    },
     registry::{HostRegistry, RegistryError, SessionRecord},
 };
 
@@ -298,9 +304,15 @@ fn check_session_record(record: &SessionRecord, issues: &mut Vec<DoctorIssue>) {
     }
     check_legacy_line_scrollback(record, issues);
     check_attach_stream_lag(record, issues);
+    check_attach_state_consistency(record, issues);
 
-    if record.archived || !is_active_process_state(&record.meta.process_state) {
+    if !should_check_liveness(record) {
         return;
+    }
+
+    let liveness = record_liveness(record);
+    if is_active_process_state(&record.meta.process_state) {
+        check_worker_socket(record, &liveness, issues);
     }
 
     let pids = collect_record_pids(record);
@@ -309,7 +321,7 @@ fn check_session_record(record: &SessionRecord, issues: &mut Vec<DoctorIssue>) {
             "missing_pid",
             DoctorSeverity::Critical,
             format!(
-                "running session {} has no recorded worker or child pid",
+                "session {} has no recorded worker or child pid for liveness diagnostics",
                 record.meta.id
             ),
             Some(record.meta.id),
@@ -321,31 +333,279 @@ fn check_session_record(record: &SessionRecord, issues: &mut Vec<DoctorIssue>) {
         return;
     }
 
-    let statuses = pids
-        .iter()
-        .map(|pid| (*pid, pid_status(*pid)))
-        .collect::<Vec<_>>();
-    if statuses
-        .iter()
-        .all(|(_, status)| *status == PidStatus::Dead)
-    {
+    match (liveness.worker, liveness.child) {
+        (LivenessState::Dead | LivenessState::Unknown, LivenessState::Alive) => {
+            issues.push(issue(
+                "orphaned_child_process",
+                DoctorSeverity::Critical,
+                format!(
+                    "session {} has no live worker but its child process is still alive",
+                    record.meta.id
+                ),
+                Some(record.meta.id),
+                Some(record.paths.meta_json.clone()),
+                false,
+                Some(orphan_recovery_action(record)),
+                Some(liveness_details(
+                    record,
+                    &liveness,
+                    orphan_recovery_actions(record),
+                )),
+            ));
+        }
+        (LivenessState::Alive, LivenessState::Dead) => {
+            issues.push(issue(
+                "worker_child_liveness_mismatch",
+                DoctorSeverity::Warning,
+                format!(
+                    "session {} has a live worker but its child process is gone",
+                    record.meta.id
+                ),
+                Some(record.meta.id),
+                Some(record.paths.meta_json.clone()),
+                false,
+                Some(
+                    "inspect worker.json and events.jsonl; run startup reconciliation or stop the stale worker before archiving"
+                        .to_string(),
+                ),
+                Some(liveness_details(
+                    record,
+                    &liveness,
+                    vec!["inspect".to_string(), "signal_worker".to_string(), "archive_after_stopped".to_string()],
+                )),
+            ));
+        }
+        _ => {
+            let statuses = pids
+                .iter()
+                .map(|pid| (*pid, pid_status(*pid)))
+                .collect::<Vec<_>>();
+            if statuses
+                .iter()
+                .all(|(_, status)| *status == PidStatus::Dead)
+            {
+                issues.push(issue(
+                    "stale_worker_record",
+                    DoctorSeverity::Warning,
+                    format!(
+                        "session {} is active or degraded in metadata but all recorded pids are gone",
+                        record.meta.id
+                    ),
+                    Some(record.meta.id),
+                    Some(record.paths.meta_json.clone()),
+                    true,
+                    Some(
+                        "run millmux doctor --repair ARCHIVE_STALE if the session is no longer needed"
+                            .to_string(),
+                    ),
+                    Some(json!({
+                        "pids": pids,
+                        "worker_liveness": liveness.worker,
+                        "child_liveness": liveness.child,
+                    })),
+                ));
+            }
+        }
+    }
+}
+
+fn should_check_liveness(record: &SessionRecord) -> bool {
+    if record.archived {
+        return false;
+    }
+    is_active_process_state(&record.meta.process_state)
+        || matches!(
+            record.meta.process_state,
+            ProcessState::Orphaned | ProcessState::Stale
+        )
+}
+
+fn check_worker_socket(
+    record: &SessionRecord,
+    liveness: &RecordLiveness,
+    issues: &mut Vec<DoctorIssue>,
+) {
+    if record.archived || !is_active_process_state(&record.meta.process_state) {
+        return;
+    }
+    if !record.meta.spawn_mode.is_pty() {
+        return;
+    }
+    if record.meta.worker_pid.is_none() && record.worker.is_none() {
+        return;
+    }
+
+    if !record.paths.worker_sock.exists() {
         issues.push(issue(
-            "stale_worker_record",
+            "worker_socket_missing",
             DoctorSeverity::Warning,
             format!(
-                "session {} is active in metadata but all recorded pids are gone",
+                "session {} has active worker metadata but no worker socket",
                 record.meta.id
             ),
             Some(record.meta.id),
-            Some(record.paths.meta_json.clone()),
-            true,
+            Some(record.paths.worker_sock.clone()),
+            false,
             Some(
-                "run millmux doctor --repair ARCHIVE_STALE if the session is no longer needed"
+                "inspect worker liveness; stop or archive only after recovery is explicit"
                     .to_string(),
             ),
-            Some(json!({ "pids": pids })),
+            Some(json!({
+                "worker_liveness": liveness.worker,
+                "child_liveness": liveness.child,
+                "worker_pids": &liveness.worker_pids,
+                "child_pids": &liveness.child_pids,
+            })),
         ));
+        return;
     }
+
+    match UnixStream::connect(&record.paths.worker_sock) {
+        Ok(_) => {
+            if liveness.worker != LivenessState::Alive {
+                issues.push(issue(
+                    "worker_socket_without_live_worker",
+                    DoctorSeverity::Warning,
+                    format!(
+                        "session {} has a reachable worker socket but no live worker pid",
+                        record.meta.id
+                    ),
+                    Some(record.meta.id),
+                    Some(record.paths.worker_sock.clone()),
+                    false,
+                    Some(
+                        "inspect worker socket ownership and session metadata before recovery"
+                            .to_string(),
+                    ),
+                    Some(json!({
+                        "worker_liveness": liveness.worker,
+                        "child_liveness": liveness.child,
+                    })),
+                ));
+            }
+        }
+        Err(error) => issues.push(issue(
+            "worker_socket_unreachable",
+            DoctorSeverity::Warning,
+            format!(
+                "session {} worker socket is not reachable: {error}",
+                record.meta.id
+            ),
+            Some(record.meta.id),
+            Some(record.paths.worker_sock.clone()),
+            false,
+            Some(
+                "inspect worker liveness; use native stop or signal recovery before archiving"
+                    .to_string(),
+            ),
+            Some(json!({
+                "error": error.to_string(),
+                "worker_liveness": liveness.worker,
+                "child_liveness": liveness.child,
+                "worker_pids": &liveness.worker_pids,
+                "child_pids": &liveness.child_pids,
+            })),
+        )),
+    }
+}
+
+fn check_attach_state_consistency(record: &SessionRecord, issues: &mut Vec<DoctorIssue>) {
+    if record.archived {
+        return;
+    }
+    let Some(worker) = &record.worker else {
+        return;
+    };
+    if worker.attached_clients == 0 && worker.input_owner.is_none() {
+        return;
+    }
+
+    let liveness = record_liveness(record);
+    let active = is_active_process_state(&record.meta.process_state);
+    let worker_active = is_active_process_state(&worker.process_state);
+    let inconsistent = !active
+        || !worker_active
+        || !record.meta.spawn_mode.is_pty()
+        || liveness.worker != LivenessState::Alive
+        || liveness.child == LivenessState::Dead;
+
+    if !inconsistent {
+        return;
+    }
+
+    issues.push(issue(
+        "attach_state_inconsistent",
+        DoctorSeverity::Warning,
+        format!(
+            "session {} has stale attached_clients/input_owner metadata",
+            record.meta.id
+        ),
+        Some(record.meta.id),
+        Some(record.paths.worker_json.clone()),
+        false,
+        Some(
+            "clear by normal attach close or startup reconciliation; inspect before editing worker.json manually"
+                .to_string(),
+        ),
+        Some(json!({
+            "attached_clients": worker.attached_clients,
+            "input_owner": &worker.input_owner,
+            "session_process_state": &record.meta.process_state,
+            "worker_process_state": &worker.process_state,
+            "spawn_mode": record.meta.spawn_mode,
+            "worker_liveness": liveness.worker,
+            "child_liveness": liveness.child,
+        })),
+    ));
+}
+
+fn orphan_recovery_action(record: &SessionRecord) -> String {
+    let actions = orphan_recovery_actions(record);
+    format!(
+        "worker is gone while the child remains alive; available recovery actions: {}",
+        actions.join(", ")
+    )
+}
+
+fn orphan_recovery_actions(record: &SessionRecord) -> Vec<String> {
+    let mut actions = vec!["inspect".to_string()];
+    if record.meta.role == SessionRole::MillraceDaemon {
+        actions.push("native_stop".to_string());
+    }
+    if record.meta.child_pgid.is_some()
+        || record.meta.child_pid.is_some()
+        || record
+            .worker
+            .as_ref()
+            .and_then(|worker| worker.child_pgid)
+            .is_some()
+        || record
+            .worker
+            .as_ref()
+            .and_then(|worker| worker.child_pid)
+            .is_some()
+    {
+        actions.push("signal_child".to_string());
+    }
+    actions.push("archive_after_stopped".to_string());
+    actions
+}
+
+fn liveness_details(
+    record: &SessionRecord,
+    liveness: &RecordLiveness,
+    recovery_actions: Vec<String>,
+) -> serde_json::Value {
+    json!({
+        "worker_liveness": liveness.worker,
+        "child_liveness": liveness.child,
+        "worker_pids": &liveness.worker_pids,
+        "child_pids": &liveness.child_pids,
+        "worker_socket": record.paths.worker_sock.display().to_string(),
+        "worker_json": record.paths.worker_json.display().to_string(),
+        "events_jsonl": record.paths.events_jsonl.display().to_string(),
+        "recovery_actions": recovery_actions,
+    })
 }
 
 fn check_pipe_artifact(
@@ -763,9 +1023,10 @@ fn archive_eligible(record: &SessionRecord) -> bool {
 
     if matches!(
         record.meta.process_state,
-        ProcessState::Lost | ProcessState::Stale
+        ProcessState::Lost | ProcessState::Stale | ProcessState::Orphaned
     ) {
-        return true;
+        let pids = collect_record_pids(record);
+        return pids.is_empty() || pids.iter().all(|pid| pid_status(*pid) == PidStatus::Dead);
     }
 
     if !is_active_process_state(&record.meta.process_state) {

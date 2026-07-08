@@ -393,6 +393,12 @@ implemented or tested; use WSL for Windows-hosted development.
 Host startup reconciles recorded session metadata against local process ids.
 Live records are preserved, dead active records are marked terminal, and logs
 remain available for inspection.
+Worker liveness and hosted child liveness are checked separately. If the
+worker is gone but the child is still alive, the session is marked `orphaned`
+rather than healthy `running`, with the child pid retained as recovery
+evidence. If the worker is alive but the child is gone, reconciliation marks a
+terminal/degraded state from worker or event evidence instead of treating the
+worker alone as enough.
 
 ## Doctor
 
@@ -425,6 +431,13 @@ Doctor validates artifact shape by spawn mode: PTY sessions should have PTY
 artifacts, pipe sessions should have `stdout.log` and `stderr.log`, and
 unexpected artifacts from the other mode are reported as warnings rather than
 silently ignored.
+
+Doctor reports worker/child liveness separately, including
+`orphaned_child_process`, `worker_child_liveness_mismatch`, worker socket
+reachability warnings, and stale `attached_clients`/`input_owner` metadata.
+Recovery remains explicit: inspect evidence, use native Millrace stop for
+daemon sessions when available, signal the recorded child or process group when
+appropriate, and archive only after the session is stopped or proven stale.
 
 ## What Millmux Is Not
 
@@ -470,6 +483,10 @@ The repository includes dogfood notes for the core release path:
   gate with deterministic fixtures, live PTY dogfood, degraded daemon/PATH
   recovery, doctor output, broken-pipe checks, and cross-terminal evidence
   limits.
+- `docs/2026-07-07-native-substrate-remediation-qa.md`: native substrate
+  remediation evidence for Batch 0, Batch 2, and Batch 3 lifecycle recovery,
+  including real Millrace daemon dogfood across `sessiond` restart in PTY and
+  pipe modes.
 
 The main verification baseline is:
 

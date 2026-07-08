@@ -1249,6 +1249,7 @@ mod tests {
                 SpawnMode::Pty,
             ),
             artifacts: millrace_sessions_core::protocol::SessionArtifacts::default(),
+            liveness: Default::default(),
         }
     }
 }
