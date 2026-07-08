@@ -1,55 +1,24 @@
 # Millmux
 
-Millmux is a native local process/session substrate for long-running terminal
-and daemon-oriented work. The default substrate is PTY-backed; an opt-in pipe
-spawn mode is available for daemon-style processes that only need stdout/stderr
-capture and lifecycle control.
+Millmux is a local session and terminal substrate for durable PTY and
+pipe-backed processes.
 
-It gives operators and agents a narrow alternative to keeping important work
-alive inside tmux panes: start a process, detach, reattach, inspect logs, send
-input, and recover visibility from another terminal. Millmux is designed to be
-used with Millrace, but its core job is session and terminal ownership, not
-runtime scheduling.
+It is for operators and agents that need terminal work to survive client
+detach, host restart, and later inspection. Start a process once, then attach,
+reattach, inspect logs, read structured screen state, send input, or open an
+Agent Cockpit beside a Millrace daemon without treating terminal output as
+runtime truth.
 
-The Rust package is `millrace-sessions`. The main binary is `millmux`.
+| Field | Current repository fact |
+| --- | --- |
+| Rust package | `millrace-sessions` |
+| Main binary | `millmux` |
+| Helper binaries | `millrace-sessiond`, `millrace-session-worker` |
+| Primary use | durable local sessions for Millrace daemons, agents, shells, and long-running commands |
+| Status | early local-first infrastructure with JSON control commands, diagnostics, console, cockpit, screen API, and dogfood evidence |
+| Platforms | macOS and Linux. On Windows, use WSL; native Windows support is not documented or tested. |
 
-Status: early local-first infrastructure. The current `main` branch includes
-the session host, per-session workers, daemon console, Agent Cockpit, JSON
-control commands, diagnostics, and dogfood evidence.
-
-Supported platforms: macOS and Linux. On Windows, use WSL; native Windows
-support is not currently documented or tested.
-
-## Mental Model
-
-A Millmux session has three layers:
-
-- a hosted process, which is the command running inside a PTY or as a pipe
-  child;
-- a per-session worker, which owns the PTY or pipe capture and keeps running
-  while clients inspect or control the session;
-- one or more clients, such as the CLI, console, or cockpit, which observe or
-  control the same session.
-
-Millmux keeps the terminal/session record durable. If the hosted process has
-its own application state, that application remains the source of truth.
-
-For Millrace workflows, keep three layers separate:
-
-- Millrace runtime truth: tasks, queues, incidents, approvals, recovery, and
-  completion evidence.
-- Millmux substrate truth: sessions, workers, process state, attach state,
-  logs, events, PTY or pipe evidence, terminal replay checkpoints when present,
-  and UI context records.
-- Renderer/client truth: human attach, console, cockpit, and any future tmux or
-  UI adapter.
-
-Rendering is an adapter, not substrate truth. Cockpit is an operator preview
-and control surface. Raw attach is the byte-exact terminal fidelity path for
-human shell/TUI interaction, and the screen API is the structured read surface
-for agents and scripts.
-
-## Install
+## Quick Start
 
 From this checkout:
 
@@ -57,15 +26,7 @@ From this checkout:
 cargo install --path crates/millrace-sessions --locked --force
 ```
 
-That installs:
-
-```text
-millmux
-millrace-sessiond
-millrace-session-worker
-```
-
-From crates.io:
+From crates.io, install the latest published crate:
 
 ```bash
 cargo install millrace-sessions
@@ -74,18 +35,18 @@ cargo install millrace-sessions
 If you need behavior from the current `main` branch before a matching release is
 published, install from the checkout.
 
-## First Run
-
 Start any durable PTY session:
 
 ```bash
 millmux start --name shell --role shell --cwd "$PWD" -- bash
 millmux attach shell
-# For byte-exact terminal output, especially shells and TUIs:
 millmux attach shell --raw
 ```
 
-Start and inspect a long-running command:
+Use raw attach for byte-exact shell and TUI interaction. Closing the attach
+client detaches; it does not stop the hosted process.
+
+Inspect a long-running command:
 
 ```bash
 millmux start --name tests --role worker -- cargo test --workspace
@@ -93,15 +54,14 @@ millmux logs tests --tail 80
 millmux status tests --json
 ```
 
-Start a pipe-mode command when stdout/stderr capture is enough and PTY
-interaction is intentionally unavailable:
+Start pipe mode when stdout/stderr capture and lifecycle control are enough:
 
 ```bash
 millmux start --spawn-mode pipe --name daemon --role generic -- ./daemon
 millmux logs daemon --json
 ```
 
-Open the Millrace-oriented console when you are running a Millrace workspace:
+Open the Millrace-oriented console:
 
 ```bash
 WORKSPACE=/path/to/millrace-workspace
@@ -117,13 +77,46 @@ millmux cockpit \
   --agent millrace-cli
 ```
 
-Closing a Millmux client detaches from the session. It does not stop the hosted
-process.
-
 For active sessions, `millmux list --json`, `millmux status --json`, and
 `millmux inspect --json` expose `attached_clients` and `input_owner` from the
 worker so operators can tell whether a session is only being observed or has an
 active PTY input owner.
+
+## Session Surfaces
+
+| Surface | What it is for | Boundary |
+| --- | --- | --- |
+| PTY sessions | Shells, TUIs, agents, and daemon processes that need terminal semantics. | Supports attach, raw attach, send, resize, logs, events, and screen state when snapshots are available. |
+| Pipe sessions | Daemon-style commands where stdout/stderr capture and lifecycle control are enough. | No attach, raw attach, send, resize, or screen API. |
+| Raw attach | Human byte-exact terminal interaction. | Uses negotiated v2 raw-byte streams; this is the fidelity path for shells and TUIs. |
+| `millmux screen` | Structured one-shot screen reads for agents and scripts. | Returns `screen_snapshot` or explicit `snapshot_unavailable` metadata; text output is derived from structured state. |
+| Console | Millrace daemon monitor and control TUI. | Shows daemon context but does not become Millrace runtime truth. |
+| Agent Cockpit | Operator preview/control surface for an agent PTY beside a daemon monitor. | Text-oriented control surface, not a byte-exact terminal path. |
+| Doctor | Local state, socket, worker, child, artifact, and UI-context diagnostics. | Repairs are explicit and preserve logs by default. |
+
+## Session Truth
+
+A Millmux session has three layers:
+
+- a hosted process running inside a PTY or as a pipe child;
+- a per-session worker that owns PTY or pipe capture while clients come and go;
+- one or more clients, such as the CLI, console, or cockpit.
+
+Millmux keeps the session and terminal record durable. If the hosted process
+has its own application state, that application remains the source of truth.
+
+For Millrace workflows, keep these authority boundaries separate:
+
+| Layer | Owns |
+| --- | --- |
+| Millrace runtime truth | tasks, queues, incidents, approvals, recovery, and completion evidence |
+| Millmux substrate truth | sessions, workers, process state, attach state, logs, events, PTY/pipe evidence, replay checkpoints, screen snapshots, and UI context records |
+| Renderer/client truth | human attach, console, cockpit, and any future UI or tmux adapter |
+
+Rendering is an adapter, not substrate truth. Cockpit is an operator preview
+and control surface. Raw attach is the byte-exact terminal fidelity path for
+human shell/TUI interaction. The screen API is the structured read surface for
+agents and scripts.
 
 ## What Millmux Owns
 
@@ -521,9 +514,9 @@ The repository includes dogfood notes for the core release path:
   recovery, doctor output, broken-pipe checks, and cross-terminal evidence
   limits.
 - `docs/2026-07-07-native-substrate-remediation-qa.md`: native substrate
-  remediation evidence for Batch 0, Batch 2, and Batch 3 lifecycle recovery,
-  including real Millrace daemon dogfood across `sessiond` restart in PTY and
-  pipe modes.
+  remediation evidence for protocol compatibility, pipe mode, lifecycle
+  recovery, raw attach, screen API, cockpit boundary checks, and final Batch 6
+  handoff gates.
 
 The main verification baseline is:
 

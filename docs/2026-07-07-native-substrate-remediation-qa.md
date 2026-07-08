@@ -8,6 +8,27 @@ Batch 6 cockpit boundary/release evidence verified in a clean Windows handoff
 linked worktree. Batch 2 through Batch 6 evidence was appended on 2026-07-08
 UTC from WSL/Linux.
 
+## Reader Summary
+
+This document is the evidence ledger for the native Millmux substrate
+remediation. It records what the Windows/WSL handoff runner proved, what it did
+not prove, and what must be rerun before a public crate release.
+
+| Area | Evidence status |
+| --- | --- |
+| Protocol compatibility | Passed additive attach-v2 guardrails and v1 compatibility checks. |
+| Pipe substrate | Passed opt-in pipe-mode capture, stream-tagged logs, lifecycle metadata, and real Millrace daemon dogfood. |
+| Lifecycle recovery | Passed client-loss, `sessiond` restart, worker/child liveness, stale/orphaned state, and cleanup checks. |
+| Raw attach | Passed deterministic raw-byte input, invalid byte preservation, resize, and WSL/Linux PTY dogfood. |
+| Screen API | Passed structured `screen_snapshot` / `snapshot_unavailable` protocol, host, worker, and CLI checks. |
+| Agent Cockpit | Passed focused text-input contract, read-only/unfocused/overlay rejection, reserved-key non-leakage, bracketed paste, and one-shot dogfood. |
+| Reduced evidence | macOS Terminal.app, SSH, and fully interactive terminal-matrix checks were not available from this runner. |
+
+Release consequence: this is strong handoff evidence for the next Millmux crate
+release, but the canonical Mac-side checkout still needs to rerun the gates and
+terminal matrix before tagging, publishing crates, or pushing a canonical
+release branch.
+
 ## Scope And Baseline
 
 Batch 0 covers the native substrate ADR, baseline capture, and protocol

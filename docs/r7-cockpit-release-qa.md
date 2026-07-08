@@ -1,12 +1,22 @@
-# R7 Cockpit Release QA
+# Cockpit Release QA
 
 Date: 2026-05-26
+Last updated: 2026-07-08
 
-This release-gate pass validates the cockpit terminal remediation after the R0
-through R6 implementation work. The deepest fresh evidence reached in this
-environment was automated Linux/WSL PTY dogfood with real Millrace daemon
-startup, deterministic integration fixtures, full workspace gates, release
-build, and locked install.
+This release-gate record validates the cockpit terminal remediation after the
+R0 through R6 implementation work. It is evidence for the Millmux cockpit
+boundary: cockpit is an operator preview/control surface beside daemon context,
+not the byte-exact terminal path and not Millrace runtime truth.
+
+## Release Readiness Summary
+
+| Question | Answer |
+| --- | --- |
+| What passed here? | Full automated cargo gates, deterministic cockpit fixtures, Linux/WSL PTY dogfood, real Millrace daemon startup, release build, and locked install. |
+| What is the cockpit claim? | Focused text input, detach/reattach, degraded daemon visibility, and operator controls beside daemon context. |
+| What is not claimed? | Byte-exact terminal parity through cockpit. Use `millmux attach --raw` for that path. |
+| What remains reduced evidence? | macOS Terminal.app, SSH, and fully interactive terminal-matrix checks until rerun in the canonical Mac-side environment. |
+| Release implication | Good handoff evidence, but not final public release authorization by itself. |
 
 ## Batch 6 Boundary Addendum
 
