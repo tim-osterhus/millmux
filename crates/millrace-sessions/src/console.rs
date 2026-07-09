@@ -551,6 +551,7 @@ async fn execute_console_command(
             client
                 .events(&SessionEventsRequest {
                     selector,
+                    tail: None,
                     follow: false,
                 })
                 .await,

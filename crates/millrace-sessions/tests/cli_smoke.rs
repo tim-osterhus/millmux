@@ -169,6 +169,51 @@ fn seed_large_output_session(host: &TempHost) -> String {
     session_id.to_string()
 }
 
+fn seed_tail_session(host: &TempHost) -> String {
+    let paths = StatePaths::new(host.state_dir().to_path_buf());
+    let session_id = SessionId::new();
+    let session_paths = paths.session_paths(session_id);
+    let meta = SessionMeta {
+        id: session_id,
+        name: Some("tail-fixture".to_string()),
+        role: SessionRole::Agent,
+        process_state: ProcessState::Exited,
+        attention_state: AttentionState::Active,
+        attention_items: Vec::new(),
+        status_summary: None,
+        workspace: None,
+        cwd: host.state_dir().to_path_buf(),
+        argv: vec!["tail-fixture".to_string()],
+        spawn_mode: SpawnMode::Pty,
+        monitor_profile: MonitorProfile::Auto,
+        env: BTreeMap::new(),
+        worker_pid: None,
+        child_pid: None,
+        child_pgid: None,
+        started_at: None,
+        ended_at: Some("2026-07-09T00:00:00Z".to_string()),
+        stop_requested_at: None,
+        stop_reason: None,
+        exit_code: Some(0),
+        exit_signal: None,
+        failure_message: None,
+        created_at: "2026-07-09T00:00:00Z".to_string(),
+        updated_at: "2026-07-09T00:00:01Z".to_string(),
+    };
+    write_json_atomic(&session_paths.meta_json, &meta).expect("seed tail session meta");
+    for index in 0..50 {
+        append_raw_pty_log(
+            &session_paths.pty_log,
+            format!("tail-line-{index:02}\n").as_bytes(),
+        )
+        .expect("seed tail pty log");
+        let mut event = SessionEvent::new(session_id, SessionEventKind::StatusSummaryUpdated);
+        event.message = Some(format!("tail-event-{index:02}"));
+        append_event(&session_paths.events_jsonl, &event).expect("seed tail event");
+    }
+    session_id.to_string()
+}
+
 fn seed_screen_session(host: &TempHost) -> String {
     let paths = StatePaths::new(host.state_dir().to_path_buf());
     let session_id = SessionId::new();
@@ -481,6 +526,42 @@ fn cli_smoke_short_reader_pipelines_exit_cleanly_for_json_and_line_outputs() {
 }
 
 #[test]
+fn cli_smoke_logs_and_events_tail_return_bounded_suffixes() {
+    let host = TempHost::new();
+    millmux_command(&host)
+        .args(["list", "--json"])
+        .assert()
+        .success();
+    let session_id = seed_tail_session(&host);
+
+    let logs_output = millmux_command(&host)
+        .args(["logs", &session_id, "--tail", "3", "--json"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let logs: Value = serde_json::from_slice(&logs_output).expect("tail logs json");
+    let lines = logs["lines"].as_array().expect("tail log lines");
+    assert_eq!(lines.len(), 3, "{logs:#?}");
+    assert_eq!(lines[0]["line"], "tail-line-47");
+    assert_eq!(lines[2]["line"], "tail-line-49");
+
+    let events_output = millmux_command(&host)
+        .args(["events", &session_id, "--tail", "3", "--json"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let events: Value = serde_json::from_slice(&events_output).expect("tail events json");
+    let events = events["events"].as_array().expect("tail events");
+    assert_eq!(events.len(), 3, "{events:#?}");
+    assert_eq!(events[0]["message"], "tail-event-47");
+    assert_eq!(events[2]["message"], "tail-event-49");
+}
+
+#[test]
 fn cli_smoke_screen_json_and_text_use_structured_snapshot() {
     let host = TempHost::new();
     millmux_command(&host)
@@ -730,6 +811,121 @@ fn cli_smoke_context_json_uses_protocol_and_millmux_ui_id() {
         String::from_utf8_lossy(&stderr).contains("ambiguous_ui_context"),
         "stderr should name ambiguous context error: {}",
         String::from_utf8_lossy(&stderr)
+    );
+}
+
+#[test]
+fn cli_smoke_context_export_without_workspace_uses_managed_sessions_only() {
+    let host = TempHost::new();
+    millmux_command(&host)
+        .args(["list", "--json"])
+        .assert()
+        .success();
+    let managed_session_id = seed_tail_session(&host);
+    let unrelated_session_id = seed_tail_session(&host);
+    let ui_id = UiId::new();
+    let paths = StatePaths::new(host.state_dir().to_path_buf());
+    let ui_paths = paths.ui_context_paths(ui_id);
+    write_json_atomic(
+        &ui_paths.context_json,
+        &serde_json::json!({
+            "schema_version": 1,
+            "ui_id": ui_id,
+            "mode": "agent_cockpit",
+            "active_pane_id": null,
+            "active_daemon_session_id": null,
+            "active_workspace": null,
+            "agent_session_id": managed_session_id,
+            "focused_session_id": managed_session_id,
+            "managed_session_ids": [managed_session_id],
+            "managed_daemon_session_ids": [],
+            "monitor_profile": "auto",
+            "updated_at": "2026-07-09T00:00:00Z"
+        }),
+    )
+    .expect("seed context without workspace");
+
+    let output = millmux_command(&host)
+        .args(["context", "export", "--ui", &ui_id.to_string(), "--json"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let export: Value = serde_json::from_slice(&output).expect("context export json");
+    let sessions = export["sessions"].as_array().expect("export sessions");
+    assert!(
+        sessions
+            .iter()
+            .any(|session| session["session_id"].as_str() == Some(managed_session_id.as_str())),
+        "{export:#?}"
+    );
+    assert!(
+        !sessions
+            .iter()
+            .any(|session| session["session_id"].as_str() == Some(unrelated_session_id.as_str())),
+        "{export:#?}"
+    );
+    assert!(
+        export["collection_issues"]
+            .as_array()
+            .is_some_and(|issues| issues
+                .iter()
+                .any(|issue| issue["surface"] == "session.list")),
+        "{export:#?}"
+    );
+}
+
+#[test]
+fn cli_smoke_context_export_with_stale_workspace_stays_on_managed_sessions() {
+    let host = TempHost::new();
+    let workspace = tempfile::tempdir().expect("workspace");
+    let managed_session_id = start_named_agent(&host, workspace.path(), "managed-agent");
+    let unrelated_session_id = start_named_agent(&host, workspace.path(), "unrelated-agent");
+    let managed_status = session_status(&host, &managed_session_id);
+    let active_workspace = managed_status["session"]["workspace"].clone();
+    let ui_id = UiId::new();
+    let paths = StatePaths::new(host.state_dir().to_path_buf());
+    let ui_paths = paths.ui_context_paths(ui_id);
+    write_json_atomic(
+        &ui_paths.context_json,
+        &serde_json::json!({
+            "schema_version": 1,
+            "ui_id": ui_id,
+            "mode": "agent_cockpit",
+            "active_pane_id": null,
+            "active_daemon_session_id": null,
+            "active_workspace": active_workspace,
+            "agent_session_id": managed_session_id,
+            "focused_session_id": managed_session_id,
+            "managed_session_ids": [managed_session_id],
+            "managed_daemon_session_ids": [],
+            "monitor_profile": "auto",
+            "updated_at": "2026-07-09T00:00:00Z"
+        }),
+    )
+    .expect("seed stale workspace context");
+
+    let output = millmux_command(&host)
+        .args(["context", "export", "--ui", &ui_id.to_string(), "--json"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let export: Value = serde_json::from_slice(&output).expect("context export json");
+    let sessions = export["sessions"].as_array().expect("export sessions");
+    assert!(
+        sessions
+            .iter()
+            .any(|session| session["session_id"].as_str() == Some(managed_session_id.as_str())),
+        "{export:#?}"
+    );
+    assert!(
+        !sessions
+            .iter()
+            .any(|session| session["session_id"].as_str() == Some(unrelated_session_id.as_str())),
+        "{export:#?}"
     );
 }
 
@@ -1071,6 +1267,347 @@ exit 1
             .iter()
             .any(|value| value.as_str() == Some(side_session_id.as_str())),
         "{managed:?}"
+    );
+
+    let ui_id = context["context"]["ui_id"]
+        .as_str()
+        .expect("context ui id")
+        .to_string();
+    wait_for_logs(&host, active_daemon_session_id, "cockpit daemon ready");
+    millmux_command(&host)
+        .args([
+            "attention",
+            "mark",
+            agent_session_id,
+            "--kind",
+            "needs_input",
+            "--severity",
+            "warning",
+            "--source",
+            "operator",
+            "--message",
+            "Batch 5 dogfood attention",
+            "--dedupe-key",
+            "batch5-dogfood",
+            "--json",
+        ])
+        .assert()
+        .success();
+
+    let export_output = millmux_command(&host)
+        .args([
+            "context",
+            "export",
+            "--ui",
+            &ui_id,
+            "--json",
+            "--objective",
+            "Batch 5 export smoke",
+            "--note",
+            "operator handoff note",
+            "--source-session",
+            agent_session_id,
+            "--destination-session",
+            "cwd-shell",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let export: Value = serde_json::from_slice(&export_output).expect("context export json");
+    assert_eq!(export["kind"], "millmux_context_export");
+    assert_eq!(export["ui"]["ui_id"], ui_id);
+    assert_eq!(export["ui"]["mode"], "agent_cockpit");
+    assert!(export["ui"]["updated_at"].is_string(), "{export:#?}");
+    assert_eq!(
+        export["ui"]["active_daemon_session_id"].as_str(),
+        Some(active_daemon_session_id)
+    );
+    assert_eq!(
+        export["handoff"]["source_session_id"].as_str(),
+        Some(agent_session_id)
+    );
+    assert_eq!(
+        export["handoff"]["source_session_selector"]["kind"].as_str(),
+        Some("session_id")
+    );
+    assert_eq!(
+        export["handoff"]["source_session_selector"]["value"].as_str(),
+        Some(agent_session_id)
+    );
+    assert_eq!(
+        export["handoff"]["intended_destination_session_id"].as_str(),
+        Some(shell_session_id)
+    );
+    assert_eq!(
+        export["handoff"]["intended_destination_session_selector"]["kind"].as_str(),
+        Some("session_name")
+    );
+    assert_eq!(
+        export["handoff"]["intended_destination_session_selector"]["value"].as_str(),
+        Some("cwd-shell")
+    );
+    assert_eq!(
+        export["handoff"]["current_objective"]["value"].as_str(),
+        Some("Batch 5 export smoke")
+    );
+    assert_eq!(
+        export["handoff"]["operator_note"]["value"].as_str(),
+        Some("operator handoff note")
+    );
+    assert_eq!(
+        export["handoff"]["last_approved_plan"]["source"].as_str(),
+        Some("unavailable")
+    );
+    assert!(export["source_attribution"]["session"]
+        .as_str()
+        .is_some_and(|value| value.contains("session metadata")));
+
+    let exported_sessions = export["sessions"].as_array().expect("export sessions");
+    assert!(
+        exported_sessions
+            .iter()
+            .any(
+                |session| session["session_id"].as_str() == Some(active_daemon_session_id)
+                    && session["role"] == "millrace_daemon"
+                    && session["bounded_log_summary"]["lines"]
+                        .as_array()
+                        .is_some_and(|lines| lines
+                            .iter()
+                            .any(|line| line["line"].as_str() == Some("cockpit daemon ready")))
+            ),
+        "{exported_sessions:#?}"
+    );
+    assert!(
+        exported_sessions
+            .iter()
+            .any(
+                |session| session["session_id"].as_str() == Some(agent_session_id)
+                    && session["role"] == "millrace_agent"
+                    && session["open_attention_items"]
+                        .as_array()
+                        .is_some_and(|items| items
+                            .iter()
+                            .any(|item| item["item"]["message"].as_str()
+                                == Some("Batch 5 dogfood attention")))
+                    && session["bounded_event_summary"]["event_stream"]["method"]
+                        == "events.subscribe"
+                    && session["artifact_references"]["artifacts"].is_object()
+            ),
+        "{exported_sessions:#?}"
+    );
+    assert!(
+        exported_sessions
+            .iter()
+            .any(
+                |session| session["session_id"].as_str() == Some(shell_session_id)
+                    && session["role"] == "shell"
+            ),
+        "{exported_sessions:#?}"
+    );
+    assert!(
+        !exported_sessions
+            .iter()
+            .any(|session| session["session_id"].as_str() == Some(side_session_id.as_str())),
+        "{exported_sessions:#?}"
+    );
+    assert!(
+        export["open_attention_items"]
+            .as_array()
+            .is_some_and(|items| items
+                .iter()
+                .any(|item| item["item"]["message"].as_str() == Some("Batch 5 dogfood attention"))),
+        "{export:#?}"
+    );
+    assert!(
+        export["daemon_monitor_summary"]["logs"]["lines"]
+            .as_array()
+            .is_some_and(|lines| lines
+                .iter()
+                .any(|line| line["line"].as_str() == Some("cockpit daemon ready"))),
+        "{export:#?}"
+    );
+}
+
+#[test]
+fn cli_smoke_cockpit_reopen_preserves_sessions_and_exports_detached_attention() {
+    let host = TempHost::new();
+    let workspace = tempfile::tempdir().expect("workspace");
+    let daemon_id = start_daemon(
+        &host,
+        workspace.path(),
+        "printf 'reopen daemon ready\\n'; sleep 5",
+    );
+    let agent_script = "printf 'reopen agent ready\\n'; sleep 5";
+    let agent_id = start_agent_with_argv(&host, workspace.path(), "/bin/sh", agent_script);
+    wait_for_logs(&host, &daemon_id, "reopen daemon ready");
+    wait_for_logs(&host, &agent_id, "reopen agent ready");
+
+    let ui_id = UiId::new().to_string();
+    let first_output = millmux_command(&host)
+        .args(["cockpit", "--workspace"])
+        .arg(workspace.path())
+        .args([
+            "--no-start",
+            "--ui",
+            &ui_id,
+            "--once",
+            "--agent-argv",
+            "--",
+            "/bin/sh",
+            "-c",
+            agent_script,
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let first_text = String::from_utf8_lossy(&first_output);
+    assert!(first_text.contains("Agent Terminal"), "{first_text}");
+    assert!(first_text.contains("reopen agent ready"), "{first_text}");
+
+    millmux_command(&host)
+        .args([
+            "attention",
+            "mark",
+            &agent_id,
+            "--kind",
+            "unread",
+            "--severity",
+            "warning",
+            "--source",
+            "operator",
+            "--message",
+            "detached attention accumulated",
+            "--dedupe-key",
+            "batch5-detached",
+            "--json",
+        ])
+        .assert()
+        .success();
+
+    let reopen_output = millmux_command(&host)
+        .args(["cockpit", "--workspace"])
+        .arg(workspace.path())
+        .args([
+            "--no-start",
+            "--ui",
+            &ui_id,
+            "--once",
+            "--agent-argv",
+            "--",
+            "/bin/sh",
+            "-c",
+            agent_script,
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let reopen_text = String::from_utf8_lossy(&reopen_output);
+    assert!(reopen_text.contains("Agent Terminal"), "{reopen_text}");
+    assert!(reopen_text.contains("reopen agent ready"), "{reopen_text}");
+
+    assert_eq!(
+        session_status(&host, &daemon_id)["session"]["process_state"],
+        "running"
+    );
+    assert_eq!(
+        session_status(&host, &agent_id)["session"]["process_state"],
+        "running"
+    );
+
+    let export_output = millmux_command(&host)
+        .args([
+            "context",
+            "export",
+            "--ui",
+            &ui_id,
+            "--json",
+            "--source-session",
+            "fixture-agent",
+            "--destination-session",
+            "fixture-agent",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let export: Value = serde_json::from_slice(&export_output).expect("context export json");
+    assert_eq!(
+        export["ui"]["active_daemon_session_id"].as_str(),
+        Some(daemon_id.as_str())
+    );
+    assert_eq!(
+        export["handoff"]["source_session_id"].as_str(),
+        Some(agent_id.as_str())
+    );
+    assert_eq!(
+        export["handoff"]["source_session_selector"]["kind"].as_str(),
+        Some("session_name")
+    );
+    assert_eq!(
+        export["handoff"]["intended_destination_session_id"].as_str(),
+        Some(agent_id.as_str())
+    );
+    assert_eq!(
+        export["ui"]["agent_session_id"].as_str(),
+        Some(agent_id.as_str())
+    );
+    assert_eq!(
+        export["ui"]["focused_session_id"].as_str(),
+        Some(agent_id.as_str())
+    );
+    let active_pane_id = export["ui"]["active_pane_id"]
+        .as_str()
+        .expect("active pane id");
+    assert!(
+        export["ui"]["panes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|pane| {
+                pane["id"].as_str() == Some(active_pane_id)
+                    && pane["focused"].as_bool() == Some(true)
+                    && pane["view"]["kind"].as_str() == Some("session_terminal")
+                    && pane["view"]["session_id"].as_str() == Some(agent_id.as_str())
+            }),
+        "{export:#?}"
+    );
+    assert!(
+        export["sessions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|session| {
+                session["session_id"].as_str() == Some(agent_id.as_str())
+                    && session["process_state"] == "running"
+                    && session["open_attention_items"]
+                        .as_array()
+                        .is_some_and(|items| {
+                            items.iter().any(|item| {
+                                item["item"]["message"].as_str()
+                                    == Some("detached attention accumulated")
+                            })
+                        })
+            }),
+        "{export:#?}"
+    );
+
+    let ui_events = fs::read_to_string(
+        host.state_dir()
+            .join("views")
+            .join(&ui_id)
+            .join("events.jsonl"),
+    )
+    .expect("ui events");
+    assert!(
+        ui_events.matches("\"kind\":\"ui_detached\"").count() >= 2,
+        "{ui_events}"
     );
 }
 
@@ -1417,6 +1954,26 @@ fn start_agent_with_argv(host: &TempHost, workspace: &Path, command: &str, scrip
         .stdout
         .clone();
     let value: Value = serde_json::from_slice(&output).expect("start agent json");
+    value["session"]["session_id"]
+        .as_str()
+        .expect("session id")
+        .to_string()
+}
+
+fn start_named_agent(host: &TempHost, workspace: &Path, name: &str) -> String {
+    let output = millmux_command(host)
+        .args(["start", "--json", "--name", name, "--role", "agent"])
+        .args(["--workspace"])
+        .arg(workspace)
+        .args(["--cwd"])
+        .arg(workspace)
+        .args(["--", "sh", "-c", "sleep 5"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let value: Value = serde_json::from_slice(&output).expect("start named agent json");
     value["session"]["session_id"]
         .as_str()
         .expect("session id")

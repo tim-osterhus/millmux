@@ -523,6 +523,8 @@ pub struct EventsArgs {
     #[command(flatten)]
     pub selector: SelectorArgs,
     #[arg(long)]
+    pub tail: Option<usize>,
+    #[arg(long)]
     pub follow: bool,
     #[arg(long)]
     pub json: bool,
@@ -560,6 +562,7 @@ impl EventsArgs {
     pub fn request(&self) -> Result<SessionEventsRequest, CommandError> {
         Ok(SessionEventsRequest {
             selector: self.selector.required()?,
+            tail: self.tail,
             follow: self.follow,
         })
     }
@@ -882,6 +885,14 @@ pub struct ContextExportArgs {
     pub json: bool,
     #[arg(long)]
     pub ui: Option<String>,
+    #[arg(long)]
+    pub objective: Option<String>,
+    #[arg(long)]
+    pub note: Option<String>,
+    #[arg(long)]
+    pub source_session: Option<String>,
+    #[arg(long)]
+    pub destination_session: Option<String>,
 }
 
 impl ContextExportArgs {

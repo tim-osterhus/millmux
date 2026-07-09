@@ -79,10 +79,13 @@ impl HostRegistry {
     }
 
     pub fn list(&self, request: &SessionListRequest) -> Vec<SessionSummary> {
-        let workspace = request
-            .workspace
-            .as_ref()
-            .and_then(|path| WorkspaceIdentity::capture(path).ok());
+        let workspace = match request.workspace.as_ref() {
+            Some(path) => match WorkspaceIdentity::capture(path) {
+                Ok(identity) => Some(identity),
+                Err(_) => return Vec::new(),
+            },
+            None => None,
+        };
 
         self.sessions
             .values()

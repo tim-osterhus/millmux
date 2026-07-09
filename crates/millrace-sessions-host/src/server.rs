@@ -77,6 +77,8 @@ const KILL_SETTLE_TIMEOUT: Duration = Duration::from_millis(250);
 const DEFAULT_STOP_REASON: &str = "session_stop";
 const SIGTERM_STOP_REASON: &str = "sigterm_stop";
 const SIGTERM_FALLBACK_STOP_REASON: &str = "sigterm_fallback";
+const TAIL_READ_CHUNK_BYTES: u64 = 8192;
+const MAX_TAIL_READ_BYTES: u64 = 1024 * 1024;
 
 #[derive(Debug, Error)]
 pub enum HostServerError {
@@ -1036,7 +1038,8 @@ fn build_events_response(
     include_follow: bool,
 ) -> Result<SessionEventsResponse, ControlErrorBody> {
     let inspected = resolve_session(paths, &request.selector)?;
-    let events = read_event_lines(&inspected.paths.events_jsonl).map_err(control_core_error)?;
+    let events = read_event_lines(&inspected.paths.events_jsonl, request.tail)
+        .map_err(control_core_error)?;
     Ok(SessionEventsResponse {
         schema_version: M1_PROTOCOL_VERSION,
         protocol_version: M1_PROTOCOL_VERSION,
@@ -2360,8 +2363,9 @@ fn read_session_log_lines(
             read_log_lines(&inspected.paths.pty_log, tail, LogStream::Pty).map_err(control_io_error)
         }
         millrace_sessions_core::state::SpawnMode::Pipe => {
-            let events =
-                read_event_lines(&inspected.paths.events_jsonl).map_err(control_core_error)?;
+            let event_tail = tail.map(|tail| tail.saturating_mul(8).max(tail));
+            let events = read_event_lines(&inspected.paths.events_jsonl, event_tail)
+                .map_err(control_core_error)?;
             let mut lines = log_lines_from_output_events(events);
             apply_tail(&mut lines, tail);
             Ok(lines)
@@ -2374,18 +2378,30 @@ fn read_log_lines(
     tail: Option<usize>,
     stream: LogStream,
 ) -> std::io::Result<Vec<LogLine>> {
-    let raw = match fs::read(path) {
-        Ok(raw) => raw,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
-        Err(error) => return Err(error),
+    let raw_lines = match tail {
+        Some(tail) => match read_tail_lines(path, tail) {
+            Ok(lines) => lines,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+            Err(error) => return Err(error),
+        },
+        None => {
+            let raw = match fs::read(path) {
+                Ok(raw) => raw,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+                Err(error) => return Err(error),
+            };
+            String::from_utf8_lossy(&raw)
+                .lines()
+                .map(|line| line.trim_end_matches('\r').to_string())
+                .collect::<Vec<_>>()
+        }
     };
-    let text = String::from_utf8_lossy(&raw);
-    let mut lines = text
-        .lines()
+    let mut lines = raw_lines
+        .into_iter()
         .map(|line| LogLine {
             stream,
             timestamp: None,
-            line: line.trim_end_matches('\r').to_string(),
+            line,
         })
         .collect::<Vec<_>>();
     apply_tail(&mut lines, tail);
@@ -2489,14 +2505,79 @@ fn log_stream_from_event(event: &SessionEvent) -> Option<LogStream> {
     }
 }
 
-fn read_event_lines(path: &std::path::Path) -> MillmuxResult<Vec<SessionEvent>> {
-    match read_events(path) {
-        Ok(events) => Ok(events),
-        Err(MillmuxError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
-            Ok(Vec::new())
+fn read_event_lines(
+    path: &std::path::Path,
+    tail: Option<usize>,
+) -> MillmuxResult<Vec<SessionEvent>> {
+    match tail {
+        Some(tail) => {
+            let lines = match read_tail_lines(path, tail) {
+                Ok(lines) => lines,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+                Err(error) => return Err(MillmuxError::Io(error)),
+            };
+            lines
+                .into_iter()
+                .filter(|line| !line.trim().is_empty())
+                .map(|line| serde_json::from_str::<SessionEvent>(&line).map_err(MillmuxError::Json))
+                .collect()
         }
-        Err(error) => Err(error),
+        None => match read_events(path) {
+            Ok(events) => Ok(events),
+            Err(MillmuxError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
+                Ok(Vec::new())
+            }
+            Err(error) => Err(error),
+        },
     }
+}
+
+fn read_tail_lines(path: &std::path::Path, tail: usize) -> std::io::Result<Vec<String>> {
+    if tail == 0 {
+        return Ok(Vec::new());
+    }
+
+    let mut file = fs::File::open(path)?;
+    let mut offset = file.metadata()?.len();
+    let mut bytes_read = 0_u64;
+    let mut chunks = Vec::new();
+    let mut newline_count = 0_usize;
+
+    while offset > 0 && newline_count <= tail && bytes_read < MAX_TAIL_READ_BYTES {
+        let remaining_budget = MAX_TAIL_READ_BYTES - bytes_read;
+        let chunk_size = TAIL_READ_CHUNK_BYTES.min(offset).min(remaining_budget);
+        if chunk_size == 0 {
+            break;
+        }
+        offset -= chunk_size;
+        file.seek(SeekFrom::Start(offset))?;
+        let mut chunk = vec![0; chunk_size as usize];
+        file.read_exact(&mut chunk)?;
+        newline_count += chunk.iter().filter(|byte| **byte == b'\n').count();
+        chunks.push(chunk);
+        bytes_read += chunk_size;
+    }
+
+    let truncated_start = offset > 0;
+    let mut raw = Vec::with_capacity(bytes_read as usize);
+    for chunk in chunks.into_iter().rev() {
+        raw.extend(chunk);
+    }
+    if truncated_start {
+        if let Some(first_newline) = raw.iter().position(|byte| *byte == b'\n') {
+            raw.drain(..=first_newline);
+        } else {
+            raw.clear();
+        }
+    }
+    let mut lines = String::from_utf8_lossy(&raw)
+        .lines()
+        .map(|line| line.trim_end_matches('\r').to_string())
+        .collect::<Vec<_>>();
+    if lines.len() > tail {
+        lines = lines.split_off(lines.len() - tail);
+    }
+    Ok(lines)
 }
 
 fn stream_setup(kind: StreamKind, read_only: bool, input_owner: bool) -> StreamSetup {

@@ -711,6 +711,8 @@ pub struct SessionLogsRequest {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionEventsRequest {
     pub selector: SessionSelector,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tail: Option<usize>,
     #[serde(default, skip_serializing_if = "is_false")]
     pub follow: bool,
 }

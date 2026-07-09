@@ -332,6 +332,45 @@ pub fn render_context_list(result: &UiContextListResponse) -> String {
     lines
 }
 
+pub fn render_context_export(result: &Value) -> String {
+    let ui_id = result
+        .pointer("/ui/ui_id")
+        .and_then(Value::as_str)
+        .unwrap_or("-");
+    let mode = result
+        .pointer("/ui/mode")
+        .and_then(Value::as_str)
+        .unwrap_or("-");
+    let workspace = result
+        .pointer("/workspace/path")
+        .and_then(Value::as_str)
+        .unwrap_or("-");
+    let session_count = result
+        .get("sessions")
+        .and_then(Value::as_array)
+        .map(Vec::len)
+        .unwrap_or_default();
+    let attention_count = result
+        .get("open_attention_items")
+        .and_then(Value::as_array)
+        .map(Vec::len)
+        .unwrap_or_default();
+    let mut output = format!(
+        "context export ui={} mode={} workspace={} sessions={} open_attention={}\n",
+        ui_id, mode, workspace, session_count, attention_count
+    );
+    if let Some(context_path) = result.pointer("/ui/context_path").and_then(Value::as_str) {
+        push_field(&mut output, "context", context_path);
+    }
+    if let Some(source_session) = result
+        .pointer("/handoff/source_session_id")
+        .and_then(Value::as_str)
+    {
+        push_field(&mut output, "source_session", source_session);
+    }
+    output
+}
+
 pub fn render_pane_list(result: &UiContextGetResponse) -> String {
     let mut output = String::new();
     for pane in &result.context.panes {

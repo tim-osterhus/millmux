@@ -170,7 +170,7 @@ do not keep stale owner values.
 | `millmux session list --json` | Grouped alias for session list; other grouped session subcommands cover start, attach, status, inspect, screen, logs, events, send, resize, stop, kill, and delete. |
 | `millmux agent start -- ...` | Start a `millrace_agent` session; `agent list`, `shell list`, and `daemon list` are role-filtered aliases. |
 | `millmux pane list --json` | Read panes from persisted UI context records. |
-| `millmux input send --session <id-or-name> --text ...` | Send text to exactly one session through the v0.4 input API. |
+| `millmux input send <id-or-name> --text ...` | Send text to exactly one session through the v0.4 input API. |
 | `millmux input send --ui <ui-id> --pane <pane-id> --text ...` | Send text to a pane target; pane targets require focus by default. |
 | `millmux events-subscribe <session> --json` | Subscribe to a v0.4 event stream with ack, event, heartbeat, lag, error, and closed frames. |
 | `millmux scrollback show <session> --json` | Grouped alias for structured screen text. |
@@ -189,7 +189,7 @@ do not keep stale owner values.
 | `millmux kill <session>` | Force a process down and record the kill. |
 | `millmux delete <session>` | Archive or purge stopped session artifacts. |
 | `millmux context --json` | Read the current UI context. |
-| `millmux context export --json` | Export the same current UI context through the v0.4 command taxonomy. |
+| `millmux context export --json` | Export a bounded handoff bundle with UI context, sessions, attention, logs, events, screen summaries, artifacts, and source attribution. |
 | `millmux doctor --json` | Diagnose state, socket, session, worker, and UI context health. |
 
 Commands that write session lists, status, inspect data, logs, events, or
@@ -539,7 +539,15 @@ available and forwards window-size changes as resize frames. Legacy
 
 ## Evidence
 
-The repository includes dogfood notes for the core release path:
+The current v0.4 dogfood and release-readiness notes are:
+
+- `docs/v0.4-dogfood.md`: Batch 5 WSL/Linux dogfood run for one Millrace daemon,
+  two agent-role sessions, attention, input delivery, cockpit detach/reopen,
+  context export, and artifact evidence.
+- `docs/v0.4-release-qa.md`: v0.4 release gate matrix, platform evidence status,
+  reduced-evidence language for macOS, and residual risks.
+
+Older repository evidence remains useful historical context:
 
 - `docs/m1-dogfood.md`: release-binary daemon launch, detached survival,
   duplicate handling, input send, graceful stop, preserved records, and doctor.

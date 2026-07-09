@@ -3,6 +3,7 @@ mod client;
 mod cockpit;
 mod commands;
 mod console;
+mod context_export;
 mod launch_env;
 mod output;
 
@@ -506,11 +507,11 @@ async fn run() -> Result<(), MillmuxCliError> {
             let client = ready_client().await?;
             match args.command {
                 Some(ContextCommand::Export(export)) => {
-                    let result = client.ui_context_get(&export.get_request()?).await?;
+                    let result = context_export::build_context_export(&client, &export).await?;
                     write_stdout(if export.json {
                         output::render_json(&result)?
                     } else {
-                        output::render_context(&result)
+                        output::render_context_export(&result)
                     })?;
                 }
                 None if args.list => {
