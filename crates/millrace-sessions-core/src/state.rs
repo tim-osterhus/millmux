@@ -239,9 +239,17 @@ pub struct UiContext {
     pub ui_id: UiId,
     pub mode: UiMode,
     pub active_pane_id: Option<PaneId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selected_session_id: Option<SessionId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub focused_session_id: Option<SessionId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub focused_pane_kind: Option<String>,
     pub active_daemon_session_id: Option<SessionId>,
     pub active_workspace: Option<WorkspaceIdentity>,
     pub agent_session_id: Option<SessionId>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub managed_session_ids: Vec<SessionId>,
     pub managed_daemon_session_ids: Vec<SessionId>,
     pub monitor_profile: MonitorProfile,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]

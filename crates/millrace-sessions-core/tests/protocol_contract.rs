@@ -1104,9 +1104,13 @@ fn ui_context_matches_m2a_jsonl_contract() {
         ui_id,
         mode: UiMode::DaemonConsole,
         active_pane_id: Some(pane_id),
+        selected_session_id: Some(daemon_id),
+        focused_session_id: Some(daemon_id),
+        focused_pane_kind: Some("daemon_monitor".to_string()),
         active_daemon_session_id: Some(daemon_id),
         active_workspace: None,
         agent_session_id: None,
+        managed_session_ids: vec![daemon_id],
         managed_daemon_session_ids: vec![daemon_id],
         monitor_profile: MonitorProfile::Basic,
         daemon_health: vec![UiDaemonHealth {
@@ -1151,9 +1155,15 @@ fn ui_context_matches_m2a_jsonl_contract() {
                     "ui_id": "018f5d8d-3e79-4a62-9bc5-51c3c7f4d5c8",
                     "mode": "daemon_console",
                     "active_pane_id": "2d14ac17-d5c9-43aa-a6f2-9414b3c16285",
+                    "selected_session_id": "818b61b1-a620-4a57-8e72-4d439d03840f",
+                    "focused_session_id": "818b61b1-a620-4a57-8e72-4d439d03840f",
+                    "focused_pane_kind": "daemon_monitor",
                     "active_daemon_session_id": "818b61b1-a620-4a57-8e72-4d439d03840f",
                     "active_workspace": null,
                     "agent_session_id": null,
+                    "managed_session_ids": [
+                        "818b61b1-a620-4a57-8e72-4d439d03840f"
+                    ],
                     "managed_daemon_session_ids": [
                         "818b61b1-a620-4a57-8e72-4d439d03840f"
                     ],

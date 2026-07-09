@@ -4,6 +4,8 @@ use millrace_sessions_core::ids::{PaneId, SessionId};
 
 use crate::terminal::TerminalSnapshot;
 
+pub const COCKPIT_SESSION_LIST_HEIGHT: u16 = 7;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PaneKind {
     AgentTerminal,
@@ -151,6 +153,24 @@ impl Pane {
             focused: false,
         }
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkspaceSessionRow {
+    pub session_id: SessionId,
+    pub role: String,
+    pub name: String,
+    pub location: String,
+    pub worktree: String,
+    pub branch: String,
+    pub process_state: String,
+    pub liveness: String,
+    pub unread: String,
+    pub attention: String,
+    pub selected: bool,
+    pub focused: bool,
+    pub status_summary: String,
+    pub source_summary: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -570,6 +590,7 @@ impl Default for HelpOverlay {
                 ("Esc", "close search / scroll"),
                 ("Ctrl-] d", "detach"),
                 ("Ctrl-] p", "command palette"),
+                ("Ctrl-] l", "session switcher"),
                 ("Ctrl-] ?", "help"),
             ],
         }

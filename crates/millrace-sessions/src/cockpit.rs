@@ -26,14 +26,16 @@ use millrace_sessions_core::{
         AttachFrameType, AttachInitialReplay, AttachReplayMode, AttachStreamEncoding,
         AttachStreamFrame, ControlErrorCode, SessionAttachRequest, SessionListRequest,
         SessionLogsRequest, SessionSelector, SessionStartRequest, TerminalDimensions,
-        UiContextSetRequest, M2_ATTACH_PROTOCOL_VERSION,
+        UiContextGetRequest, UiContextSetRequest, M2_ATTACH_PROTOCOL_VERSION,
     },
-    state::{MonitorProfile, ProcessState, SessionRole, SpawnMode, UiEvent, UiEventKind},
+    state::{
+        MonitorProfile, ProcessState, SessionRole, SpawnMode, UiContext, UiEvent, UiEventKind,
+    },
 };
 use millrace_sessions_tui::{
     renderer::{render_app, render_to_string},
     AgentCockpitLayout, AgentTerminalPane, AppModel, KeyAction, TerminalEmulator,
-    TerminalSearchDirection,
+    TerminalSearchDirection, WorkspaceSessionSelection,
 };
 use ratatui::{backend::CrosstermBackend, Terminal};
 use thiserror::Error;
@@ -120,6 +122,7 @@ async fn build_cockpit_app(
     ui_id: UiId,
 ) -> Result<AppModel, CockpitError> {
     let workspace = args.workspace.canonicalize()?;
+    let prior_context = load_prior_ui_context(client, ui_id).await?;
     let requested_monitor = args.requested_monitor_profile();
     let mut daemons = discover_daemons(client).await?;
     let has_active_workspace_daemon = daemons.iter().any(|session| {
@@ -190,7 +193,7 @@ async fn build_cockpit_app(
     let layout = args
         .layout
         .unwrap_or_else(|| AgentCockpitLayout::default_for_size(SNAPSHOT_WIDTH));
-    Ok(AppModel::agent_cockpit(
+    let mut app = AppModel::agent_cockpit(
         ui_id,
         agent,
         daemons,
@@ -199,7 +202,28 @@ async fn build_cockpit_app(
         AgentTerminalPane::new(16, 72, true, false),
         layout,
         monitor_profile,
-    ))
+    );
+    app.replace_workspace_sessions(discover_workspace_sessions(client, &workspace).await?);
+    if let Some(context) = prior_context.as_ref() {
+        app.restore_ui_context_selection(context);
+    }
+    Ok(app)
+}
+
+async fn load_prior_ui_context(
+    client: &SessionControlClient,
+    ui_id: UiId,
+) -> Result<Option<UiContext>, CockpitError> {
+    match client
+        .ui_context_get(&UiContextGetRequest { ui_id: Some(ui_id) })
+        .await
+    {
+        Ok(response) => Ok(Some(response.context)),
+        Err(ClientError::Control(error)) if error.code == ControlErrorCode::UiContextNotFound => {
+            Ok(None)
+        }
+        Err(error) => Err(error.into()),
+    }
 }
 
 async fn discover_daemons(
@@ -213,6 +237,38 @@ async fn discover_daemons(
         })
         .await?
         .sessions)
+}
+
+async fn discover_workspace_sessions(
+    client: &SessionControlClient,
+    workspace: &Path,
+) -> Result<Vec<millrace_sessions_core::protocol::SessionSummary>, CockpitError> {
+    let sessions = client
+        .list(&SessionListRequest {
+            role: None,
+            workspace: None,
+            include_archived: false,
+        })
+        .await?
+        .sessions
+        .into_iter()
+        .filter(|session| session_scoped_to_workspace(session, workspace))
+        .collect();
+    Ok(sessions)
+}
+
+fn session_scoped_to_workspace(
+    session: &millrace_sessions_core::protocol::SessionSummary,
+    workspace: &Path,
+) -> bool {
+    if workspace_matches(session, workspace) {
+        return true;
+    }
+    session
+        .cwd
+        .canonicalize()
+        .ok()
+        .is_some_and(|cwd| cwd == workspace || cwd.starts_with(workspace))
 }
 
 fn workspace_matches(
@@ -476,6 +532,16 @@ async fn refresh_daemon_sessions(
     client: &SessionControlClient,
     app: &mut AppModel,
 ) -> Result<(), CockpitError> {
+    if let Some(workspace) = app
+        .active_workspace
+        .as_ref()
+        .map(|identity| identity.canonical_path.clone())
+    {
+        let sessions = discover_workspace_sessions(client, &workspace).await?;
+        app.replace_workspace_sessions(sessions);
+        return Ok(());
+    }
+
     let mut daemons = discover_daemons(client).await?;
     if let Some(workspace) = app
         .active_workspace
@@ -492,7 +558,7 @@ async fn run_interactive_cockpit(
     client: SessionControlClient,
     mut app: AppModel,
 ) -> Result<(), CockpitError> {
-    let Some(agent_session_id) = app.agent_session_id else {
+    let Some(mut attached_session_id) = app.active_attach_session_id() else {
         return Err(CockpitError::NoAgentFound);
     };
     let mut terminal = TerminalSession::enter()?;
@@ -501,7 +567,7 @@ async fn run_interactive_cockpit(
         .agent_terminal_size_for(size.width, size.height)
         .unwrap_or((16, 72));
     let mut emulator = TerminalEmulator::new(rows, cols, TERMINAL_SCROLLBACK);
-    let mut attach = open_agent_attach(&client, agent_session_id, rows, cols).await?;
+    let mut attach = open_agent_attach(&client, attached_session_id, rows, cols).await?;
     apply_agent_input_ownership(&mut app, attach.read_only);
     sync_agent_terminal_to_interactive_size(&mut app, &mut emulator, rows, cols);
     sync_agent_attach_size(&mut attach, rows, cols).await?;
@@ -542,7 +608,7 @@ async fn run_interactive_cockpit(
             }
             Ok(Ok(None)) => {
                 app.set_host_reconnecting(1, "agent attach stream closed");
-                match reopen_agent_attach(&client, agent_session_id, last_size, &mut app).await {
+                match reopen_agent_attach(&client, attached_session_id, last_size, &mut app).await {
                     Ok(new_attach) => {
                         attach = new_attach;
                         app.set_host_connected();
@@ -557,7 +623,7 @@ async fn run_interactive_cockpit(
             }
             Ok(Err(error)) => {
                 app.set_host_reconnecting(1, error.to_string());
-                match reopen_agent_attach(&client, agent_session_id, last_size, &mut app).await {
+                match reopen_agent_attach(&client, attached_session_id, last_size, &mut app).await {
                     Ok(new_attach) => {
                         attach = new_attach;
                         app.set_host_connected();
@@ -579,9 +645,13 @@ async fn run_interactive_cockpit(
                     let should_exit = handle_cockpit_key(
                         &client,
                         &mut app,
-                        &mut attach,
                         &mut terminal,
-                        &mut emulator,
+                        CockpitAttachState {
+                            attach: &mut attach,
+                            emulator: &mut emulator,
+                            attached_session_id: &mut attached_session_id,
+                            terminal_size: last_size,
+                        },
                         event,
                     )
                     .await?;
@@ -757,6 +827,26 @@ async fn sync_agent_attach_size(
     Ok(())
 }
 
+async fn switch_agent_attach(
+    client: &SessionControlClient,
+    app: &mut AppModel,
+    attach: &mut OpenedAgentAttach,
+    emulator: &mut TerminalEmulator,
+    session_id: SessionId,
+    terminal_size: (u16, u16),
+) -> Result<(), CockpitError> {
+    let (rows, cols) = terminal_size;
+    let mut next_attach = open_agent_attach(client, session_id, rows, cols).await?;
+    sync_agent_attach_size(&mut next_attach, rows, cols).await?;
+    let _ = attach.writer.write_frame(&AttachStreamFrame::Close).await;
+    *emulator = TerminalEmulator::new(rows, cols, TERMINAL_SCROLLBACK);
+    app.reset_agent_terminal(rows, cols, !next_attach.read_only, next_attach.read_only);
+    apply_agent_input_ownership(app, next_attach.read_only);
+    *attach = next_attach;
+    app.set_host_connected();
+    Ok(())
+}
+
 fn sync_agent_terminal_to_interactive_size(
     app: &mut AppModel,
     emulator: &mut TerminalEmulator,
@@ -848,17 +938,68 @@ fn apply_agent_attach_frame(
     true
 }
 
+struct CockpitAttachState<'a> {
+    attach: &'a mut OpenedAgentAttach,
+    emulator: &'a mut TerminalEmulator,
+    attached_session_id: &'a mut SessionId,
+    terminal_size: (u16, u16),
+}
+
 async fn handle_cockpit_key(
     client: &SessionControlClient,
     app: &mut AppModel,
-    attach: &mut OpenedAgentAttach,
     terminal: &mut TerminalSession,
-    emulator: &mut TerminalEmulator,
+    attach_state: CockpitAttachState<'_>,
     event: KeyEvent,
 ) -> Result<bool, CockpitError> {
     if app.daemon_switcher.open {
         let previous_daemon = app.active_daemon_session_id;
-        handle_daemon_switcher_key(app, event);
+        if let Some(session_id) = handle_daemon_switcher_key(app, event) {
+            match app.workspace_session_selection(session_id) {
+                WorkspaceSessionSelection::AttachSelected(session_id)
+                    if *attach_state.attached_session_id != session_id =>
+                {
+                    match switch_agent_attach(
+                        client,
+                        app,
+                        &mut *attach_state.attach,
+                        &mut *attach_state.emulator,
+                        session_id,
+                        attach_state.terminal_size,
+                    )
+                    .await
+                    {
+                        Ok(()) => {
+                            let _ = app.select_workspace_session(session_id);
+                            *attach_state.attached_session_id = session_id;
+                            record_ui_event(
+                                client,
+                                app,
+                                UiEventKind::AgentSessionBound,
+                                "agent session switched",
+                                bound_fields("agent_session_id", Some(session_id)),
+                            )
+                            .await?;
+                        }
+                        Err(error) => {
+                            app.status_message = format!("session attach failed: {error}");
+                        }
+                    }
+                }
+                WorkspaceSessionSelection::DaemonSelected(session_id) => {
+                    let _ = app.select_workspace_session(session_id);
+                }
+                WorkspaceSessionSelection::AttachSelected(session_id) => {
+                    let _ = app.select_workspace_session(session_id);
+                }
+                WorkspaceSessionSelection::NotAttachable(session_id) => {
+                    app.status_message = format!("session not attachable {session_id}");
+                }
+                WorkspaceSessionSelection::Missing => {
+                    app.status_message = "session missing".to_string();
+                }
+            }
+        }
         if app.active_daemon_session_id != previous_daemon {
             record_active_daemon_changed(client, app).await?;
         }
@@ -907,29 +1048,44 @@ async fn handle_cockpit_key(
             .await?;
         }
         KeyAction::ScrollUp if agent_was_focused => {
-            emulator.scroll_up(1);
-            app.update_agent_terminal_view(emulator.snapshot(), emulator.is_following());
+            attach_state.emulator.scroll_up(1);
+            app.update_agent_terminal_view(
+                attach_state.emulator.snapshot(),
+                attach_state.emulator.is_following(),
+            );
         }
         KeyAction::ScrollDown if agent_was_focused => {
-            emulator.scroll_down(1);
-            app.update_agent_terminal_view(emulator.snapshot(), emulator.is_following());
+            attach_state.emulator.scroll_down(1);
+            app.update_agent_terminal_view(
+                attach_state.emulator.snapshot(),
+                attach_state.emulator.is_following(),
+            );
         }
         KeyAction::PageUp if agent_was_focused => {
-            emulator.page_up(viewport_height);
-            app.update_agent_terminal_view(emulator.snapshot(), emulator.is_following());
+            attach_state.emulator.page_up(viewport_height);
+            app.update_agent_terminal_view(
+                attach_state.emulator.snapshot(),
+                attach_state.emulator.is_following(),
+            );
         }
         KeyAction::PageDown if agent_was_focused => {
-            emulator.page_down(viewport_height);
-            app.update_agent_terminal_view(emulator.snapshot(), emulator.is_following());
+            attach_state.emulator.page_down(viewport_height);
+            app.update_agent_terminal_view(
+                attach_state.emulator.snapshot(),
+                attach_state.emulator.is_following(),
+            );
         }
         KeyAction::JumpTop if agent_was_focused => {
-            emulator.jump_top();
-            app.update_agent_terminal_view(emulator.snapshot(), emulator.is_following());
+            attach_state.emulator.jump_top();
+            app.update_agent_terminal_view(
+                attach_state.emulator.snapshot(),
+                attach_state.emulator.is_following(),
+            );
         }
         KeyAction::SearchInput(_) | KeyAction::SearchBackspace if agent_was_focused => {
             sync_agent_search_from_emulator(
                 app,
-                emulator,
+                &mut *attach_state.emulator,
                 TerminalSearchDirection::First,
                 "search",
             );
@@ -937,7 +1093,7 @@ async fn handle_cockpit_key(
         KeyAction::NextSearch if agent_was_focused => {
             sync_agent_search_from_emulator(
                 app,
-                emulator,
+                &mut *attach_state.emulator,
                 TerminalSearchDirection::Next,
                 "search next",
             );
@@ -945,7 +1101,7 @@ async fn handle_cockpit_key(
         KeyAction::PreviousSearch if agent_was_focused => {
             sync_agent_search_from_emulator(
                 app,
-                emulator,
+                &mut *attach_state.emulator,
                 TerminalSearchDirection::Previous,
                 "search previous",
             );
@@ -953,8 +1109,11 @@ async fn handle_cockpit_key(
         KeyAction::Escape if search_was_active => {}
         KeyAction::ExitScrollMode | KeyAction::JumpBottom | KeyAction::Escape => {
             if agent_was_focused {
-                emulator.jump_bottom();
-                app.update_agent_terminal_view(emulator.snapshot(), emulator.is_following());
+                attach_state.emulator.jump_bottom();
+                app.update_agent_terminal_view(
+                    attach_state.emulator.snapshot(),
+                    attach_state.emulator.is_following(),
+                );
             }
             record_ui_event(
                 client,
@@ -967,7 +1126,8 @@ async fn handle_cockpit_key(
         }
         KeyAction::Input(event) => {
             if let Some(text) = cockpit_key_input_text(app, event) {
-                attach
+                attach_state
+                    .attach
                     .writer
                     .write_frame(&AttachStreamFrame::Input { text })
                     .await?;
@@ -1054,19 +1214,22 @@ async fn handle_cockpit_paste(
     Ok(())
 }
 
-fn handle_daemon_switcher_key(app: &mut AppModel, event: KeyEvent) {
+fn handle_daemon_switcher_key(app: &mut AppModel, event: KeyEvent) -> Option<SessionId> {
     match event.code {
-        KeyCode::Esc => app.close_daemon_switcher(),
-        KeyCode::Enter => {
-            let _ = app.activate_daemon_switcher_selection();
+        KeyCode::Esc => {
+            app.close_daemon_switcher();
+            None
         }
+        KeyCode::Enter => app.activate_session_switcher_selection(),
         KeyCode::Up | KeyCode::Char('k') => {
             let _ = app.move_daemon_switcher_selection(-1);
+            None
         }
         KeyCode::Down | KeyCode::Char('j') | KeyCode::Tab => {
             let _ = app.move_daemon_switcher_selection(1);
+            None
         }
-        _ => {}
+        _ => None,
     }
 }
 

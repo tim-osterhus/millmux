@@ -1,4 +1,7 @@
-use std::path::{Path, PathBuf};
+use std::{
+    path::{Path, PathBuf},
+    process::Command,
+};
 
 use serde::{Deserialize, Serialize};
 
@@ -43,9 +46,44 @@ impl WorkspaceIdentity {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GitWorktreeIdentity {
+    pub root: PathBuf,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub branch: Option<String>,
+}
+
+impl GitWorktreeIdentity {
+    pub fn discover(path: impl AsRef<Path>) -> Option<Self> {
+        let path = path.as_ref();
+        let root = run_git(path, &["rev-parse", "--show-toplevel"])?;
+        let branch = run_git(path, &["branch", "--show-current"]);
+        Some(Self {
+            root: PathBuf::from(root),
+            branch,
+        })
+    }
+}
+
+fn run_git(path: &Path, args: &[&str]) -> Option<String> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(path)
+        .args(args)
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let text = String::from_utf8(output.stdout).ok()?;
+    let value = text.trim();
+    (!value.is_empty()).then(|| value.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
 
     #[test]
     fn workspace_rejects_missing_path() {
@@ -66,6 +104,32 @@ mod tests {
         {
             assert!(identity.unix_device.is_some());
             assert!(identity.unix_inode.is_some());
+        }
+    }
+
+    #[test]
+    fn git_worktree_discovery_returns_none_outside_git() {
+        let temp = tempfile::tempdir().unwrap();
+        assert_eq!(GitWorktreeIdentity::discover(temp.path()), None);
+    }
+
+    #[test]
+    fn git_worktree_discovery_finds_root_and_branch() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::write(temp.path().join("file.txt"), "hello").unwrap();
+        if Command::new("git")
+            .arg("-C")
+            .arg(temp.path())
+            .arg("init")
+            .arg("-b")
+            .arg("main")
+            .output()
+            .map(|output| output.status.success())
+            .unwrap_or(false)
+        {
+            let info = GitWorktreeIdentity::discover(temp.path()).unwrap();
+            assert_eq!(info.root, temp.path());
+            assert_eq!(info.branch.as_deref(), Some("main"));
         }
     }
 }

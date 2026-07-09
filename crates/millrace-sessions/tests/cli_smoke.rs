@@ -702,6 +702,20 @@ exit 1
         &side_workspace,
         "printf 'side daemon ready\\n'; sleep 5",
     );
+    let shell_output = millmux_command(&host)
+        .args(["start", "--json", "--name", "cwd-shell", "--role", "shell"])
+        .args(["--cwd"])
+        .arg(&workspace)
+        .args(["--", "sh", "-c", "printf 'cwd shell ready\\n'; sleep 5"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let shell_value: Value = serde_json::from_slice(&shell_output).expect("shell start json");
+    let shell_session_id = shell_value["session"]["session_id"]
+        .as_str()
+        .expect("shell session id");
 
     let output = millmux_command(&host)
         .env("PATH", &path_env)
@@ -727,6 +741,7 @@ exit 1
     let text = String::from_utf8_lossy(&output);
     assert!(text.contains("Agent Terminal"), "{text}");
     assert!(text.contains("Daemon Monitor"), "{text}");
+    assert!(text.contains("cwd-shell"), "{text}");
     assert!(text.contains("agent:"), "{text}");
     assert!(text.contains("workspace:"), "{text}");
     assert!(text.contains("context:context.json"), "{text}");
@@ -744,16 +759,63 @@ exit 1
         .clone();
     let context: Value = serde_json::from_slice(&context_output).expect("context json");
     assert_eq!(context["context"]["mode"], "agent_cockpit");
-    assert!(context["context"]["agent_session_id"].as_str().is_some());
-    assert!(context["context"]["active_daemon_session_id"]
+    let agent_session_id = context["context"]["agent_session_id"]
         .as_str()
-        .is_some());
+        .expect("agent session id");
+    let active_daemon_session_id = context["context"]["active_daemon_session_id"]
+        .as_str()
+        .expect("active daemon session id");
+    assert_eq!(
+        context["context"]["selected_session_id"].as_str(),
+        Some(agent_session_id)
+    );
+    assert_eq!(
+        context["context"]["focused_session_id"].as_str(),
+        Some(agent_session_id)
+    );
+    assert_eq!(
+        context["context"]["focused_pane_kind"].as_str(),
+        Some("agent_terminal")
+    );
     assert_eq!(context["context"]["monitor_profile"], "raw");
+    let managed_sessions = context["context"]["managed_session_ids"]
+        .as_array()
+        .expect("managed workspace session list");
+    assert!(
+        managed_sessions
+            .iter()
+            .any(|value| value.as_str() == Some(agent_session_id)),
+        "{managed_sessions:?}"
+    );
+    assert!(
+        managed_sessions
+            .iter()
+            .any(|value| value.as_str() == Some(active_daemon_session_id)),
+        "{managed_sessions:?}"
+    );
+    assert!(
+        managed_sessions
+            .iter()
+            .any(|value| value.as_str() == Some(shell_session_id)),
+        "{managed_sessions:?}"
+    );
+    assert!(
+        !managed_sessions
+            .iter()
+            .any(|value| value.as_str() == Some(side_session_id.as_str())),
+        "{managed_sessions:?}"
+    );
     let managed = context["context"]["managed_daemon_session_ids"]
         .as_array()
         .expect("managed daemon list");
     assert!(
         managed
+            .iter()
+            .any(|value| value.as_str() == Some(active_daemon_session_id)),
+        "{managed:?}"
+    );
+    assert!(
+        !managed
             .iter()
             .any(|value| value.as_str() == Some(side_session_id.as_str())),
         "{managed:?}"

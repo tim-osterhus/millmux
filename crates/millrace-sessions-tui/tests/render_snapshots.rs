@@ -155,14 +155,14 @@ fn agent_cockpit_right_layout_snapshot() {
 
     let snapshot = snapshot_text(&app, 120, 12);
     insta::assert_snapshot!(snapshot, @r###"
-Agent Terminal | owned main live cur=1,2 | selected                     Daemon Monitor | mon=basic | follow=live
-Millracer operator ready                                                daemon ready
->                                                                       daemon idle
-
-
-
-
-
+Sessions | count=2
+  millrace_daemon daemon st=running att=millrace_idle live=w:unknown c:unknown unread=unavailable cwd=/tmp/daemon git=un
+  millmux_session millrace_runtime=idle terminal_screen=preview operator=unavailable inferred=unavailable
+> agent agent st=running att=millrace_idle live=w:unknown c:unknown unread=unavailable cwd=/tmp/agent git=unavailable@~a
+  millmux_session millrace_runtime=unavailable terminal_screen=preview operator=unavailable inferred=unavailable
+Agent Terminal | owned live cur=1,2 | selected                    Daemon Monitor | mon=basic | follow=live
+Millracer operator ready                                          daemon ready
+>                                                                 daemon idle
 
 
 
@@ -176,17 +176,17 @@ fn agent_cockpit_bottom_layout_snapshot() {
 
     let snapshot = snapshot_text(&app, 80, 12);
     insta::assert_snapshot!(snapshot, @r###"
-Agent Terminal | owned main live cur=1,2 | selected
+Sessions | count=2
+  millrace_daemon daemon st=running att=millrace_idle live=w:unknown c:unknown u
+  millmux_session millrace_runtime=idle terminal_screen=preview operator=unav~
+> agent agent st=running att=millrace_idle live=w:unknown c:unknown unread=unava
+  millmux_session millrace_runtime=unavailable terminal_screen=preview operat~
+Agent Terminal | owned live cur=1,2 | selected
 Millracer operator ready
 >
 
-
-
-
 Daemon Monitor | mon=basic | follow=live
-daemon ready
 daemon idle
-
  mode=AgentCockpit monitor=Basic host=host connected input=ready view=live statu
 "###);
 }
@@ -352,7 +352,7 @@ fn agent_cockpit_keeps_agent_current_while_daemon_output_refreshes() {
     let rendered = snapshot_text(&app, 120, 12);
 
     assert!(
-        rendered.contains("Agent Terminal | owned main live"),
+        rendered.contains("Agent Terminal | owned live"),
         "{rendered}"
     );
     assert!(

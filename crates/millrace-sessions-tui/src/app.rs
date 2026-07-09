@@ -5,9 +5,10 @@ use millrace_sessions_core::{
     ids::{PaneId, SessionId, UiId},
     protocol::SessionSummary,
     state::{
-        MonitorProfile, ProcessState, UiContext, UiDaemonHealth, UiDaemonRecoveryAction, UiMode,
+        AttentionState, LivenessState, MonitorProfile, ProcessState, SessionRole, UiContext,
+        UiDaemonHealth, UiDaemonRecoveryAction, UiMode,
     },
-    workspace::WorkspaceIdentity,
+    workspace::{GitWorktreeIdentity, WorkspaceIdentity},
 };
 use time::OffsetDateTime;
 
@@ -16,6 +17,7 @@ use crate::{
     pane::{
         AgentCockpitLayout, AgentTerminalPane, CommandOutput, CommandPalette, ConfirmationPrompt,
         DaemonConsoleLayout, DaemonSwitcherOverlay, HelpOverlay, LineLogPane, Pane, PaneKind,
+        WorkspaceSessionRow, COCKPIT_SESSION_LIST_HEIGHT,
     },
     terminal::TerminalSnapshot,
 };
@@ -26,14 +28,18 @@ pub struct AppModel {
     pub mode: UiMode,
     pub monitor_profile: MonitorProfile,
     pub panes: Vec<Pane>,
+    pub workspace_sessions: Vec<SessionSummary>,
+    pub workspace_worktrees: BTreeMap<SessionId, Option<GitWorktreeIdentity>>,
     pub daemon_sessions: Vec<SessionSummary>,
     pub daemon_logs: BTreeMap<SessionId, LineLogPane>,
     pub console_layout: DaemonConsoleLayout,
     pub cockpit_layout: AgentCockpitLayout,
     pub active_pane_id: Option<PaneId>,
+    pub selected_session_id: Option<SessionId>,
     pub active_daemon_session_id: Option<SessionId>,
     pub active_workspace: Option<WorkspaceIdentity>,
     pub agent_session_id: Option<SessionId>,
+    pub managed_session_ids: Vec<SessionId>,
     pub agent_terminal: Option<AgentTerminalPane>,
     pub managed_daemon_session_ids: Vec<SessionId>,
     pub line_log: LineLogPane,
@@ -52,6 +58,14 @@ pub struct AppModel {
     pub status_message: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorkspaceSessionSelection {
+    Missing,
+    DaemonSelected(SessionId),
+    AttachSelected(SessionId),
+    NotAttachable(SessionId),
+}
+
 impl AppModel {
     pub fn daemon_console_fixture(
         ui_id: UiId,
@@ -68,14 +82,18 @@ impl AppModel {
             mode: UiMode::DaemonConsole,
             monitor_profile: MonitorProfile::Auto,
             panes: vec![pane, Pane::command_output()],
+            workspace_sessions: Vec::new(),
+            workspace_worktrees: BTreeMap::new(),
             daemon_sessions: Vec::new(),
             daemon_logs,
             console_layout: DaemonConsoleLayout::Single,
             cockpit_layout: AgentCockpitLayout::Right,
             active_pane_id,
+            selected_session_id: Some(daemon_session_id),
             active_daemon_session_id: Some(daemon_session_id),
             active_workspace: None,
             agent_session_id: None,
+            managed_session_ids: vec![daemon_session_id],
             agent_terminal: None,
             managed_daemon_session_ids: vec![daemon_session_id],
             line_log,
@@ -110,6 +128,7 @@ impl AppModel {
                     .any(|session| session.session_id == *session_id)
             })
             .or_else(|| sessions.first().map(|session| session.session_id));
+        let sessions = sort_workspace_sessions(sessions);
         let panes = panes_for_layout(layout, &sessions, selected);
         let active_pane_id = panes.iter().find(|pane| pane.focused).map(|pane| pane.id);
         let active_session = selected.and_then(|session_id| {
@@ -135,14 +154,18 @@ impl AppModel {
             mode: UiMode::DaemonConsole,
             monitor_profile,
             panes,
+            workspace_worktrees: worktrees_for_sessions(&sessions),
+            workspace_sessions: sessions.clone(),
             daemon_sessions: sessions.clone(),
             daemon_logs,
             console_layout: layout,
             cockpit_layout: AgentCockpitLayout::Right,
             active_pane_id,
+            selected_session_id: selected,
             active_daemon_session_id: selected,
             active_workspace: active_session.and_then(|session| session.workspace.clone()),
             agent_session_id: None,
+            managed_session_ids: sessions.iter().map(|session| session.session_id).collect(),
             agent_terminal: None,
             managed_daemon_session_ids: sessions.iter().map(|session| session.session_id).collect(),
             line_log,
@@ -185,6 +208,9 @@ impl AppModel {
                 .iter()
                 .find(|session| session.session_id == session_id)
         });
+        let mut workspace_sessions = daemon_sessions.clone();
+        upsert_session(&mut workspace_sessions, agent_session.clone());
+        let workspace_sessions = sort_workspace_sessions(workspace_sessions);
         let mut agent_pane = Pane::agent_terminal("Agent Terminal", Some(agent_session.session_id));
         agent_pane.focused = true;
         let mut daemon_pane = Pane::daemon_monitor("Daemon Monitor", selected);
@@ -205,14 +231,24 @@ impl AppModel {
             mode: UiMode::AgentCockpit,
             monitor_profile,
             panes: vec![agent_pane, daemon_pane, Pane::command_output()],
+            workspace_worktrees: worktrees_for_sessions(&workspace_sessions),
+            workspace_sessions,
             daemon_sessions: daemon_sessions.clone(),
             daemon_logs,
             console_layout: DaemonConsoleLayout::Single,
             cockpit_layout: layout,
             active_pane_id,
+            selected_session_id: Some(agent_session.session_id),
             active_daemon_session_id: selected,
-            active_workspace: daemon.and_then(|session| session.workspace.clone()),
+            active_workspace: daemon
+                .and_then(|session| session.workspace.clone())
+                .or_else(|| agent_session.workspace.clone()),
             agent_session_id: Some(agent_session.session_id),
+            managed_session_ids: daemon_sessions
+                .iter()
+                .map(|session| session.session_id)
+                .chain(std::iter::once(agent_session.session_id))
+                .collect(),
             agent_terminal: Some(agent_terminal),
             managed_daemon_session_ids: daemon_sessions
                 .iter()
@@ -304,6 +340,7 @@ impl AppModel {
                 self.select_daemon(session_id);
             }
         }
+        self.update_selected_session_from_focus();
     }
 
     pub fn focused_pane_kind(&self) -> Option<PaneKind> {
@@ -316,6 +353,42 @@ impl AppModel {
 
     pub fn focused_agent_terminal(&self) -> bool {
         self.focused_pane_kind() == Some(PaneKind::AgentTerminal)
+    }
+
+    pub fn focused_pane_kind_label(&self) -> Option<&'static str> {
+        Some(match self.focused_pane_kind()? {
+            PaneKind::AgentTerminal => "agent_terminal",
+            PaneKind::DaemonMonitor => "daemon_monitor",
+            PaneKind::DaemonList => "daemon_list",
+            PaneKind::CommandOutput => "command_output",
+            PaneKind::StatusBar => "status_bar",
+            PaneKind::HelpOverlay => "help_overlay",
+            PaneKind::CommandPalette => "command_palette",
+        })
+    }
+
+    pub fn focused_session_id(&self) -> Option<SessionId> {
+        match self.focused_pane_kind()? {
+            PaneKind::AgentTerminal => self.agent_session_id,
+            PaneKind::DaemonMonitor => self.active_daemon_session_id,
+            _ => None,
+        }
+    }
+
+    pub fn active_attach_session_id(&self) -> Option<SessionId> {
+        self.agent_session_id
+    }
+
+    pub fn focus_pane_kind(&mut self, kind: PaneKind) -> bool {
+        let Some(index) = self.panes.iter().position(|pane| pane.kind == kind) else {
+            return false;
+        };
+        for (pane_index, pane) in self.panes.iter_mut().enumerate() {
+            pane.focused = pane_index == index;
+        }
+        self.active_pane_id = Some(self.panes[index].id);
+        self.update_selected_session_from_focus();
+        true
     }
 
     pub fn update_agent_terminal(&mut self, snapshot: TerminalSnapshot) {
@@ -331,6 +404,16 @@ impl AppModel {
                 self.agent_terminal = Some(terminal);
             }
         }
+    }
+
+    pub fn reset_agent_terminal(
+        &mut self,
+        rows: u16,
+        cols: u16,
+        input_owner: bool,
+        read_only: bool,
+    ) {
+        self.agent_terminal = Some(AgentTerminalPane::new(rows, cols, input_owner, read_only));
     }
 
     pub fn set_agent_terminal_following(&mut self, follow: bool) {
@@ -530,18 +613,20 @@ impl AppModel {
             return None;
         }
         let body_height = height.saturating_sub(1).max(1);
+        let (width, body_height) =
+            cockpit_content_size(width, body_height, self.workspace_sessions.len());
         let (pane_width, pane_height) = match self.cockpit_layout {
             AgentCockpitLayout::Right => {
-                if width >= 100 {
-                    (width.saturating_mul(60) / 100, body_height)
+                if width >= 64 {
+                    (width.saturating_mul(55) / 100, body_height)
                 } else {
                     (width, body_height.saturating_mul(60) / 100)
                 }
             }
             AgentCockpitLayout::Bottom => (width, body_height.saturating_mul(60) / 100),
             AgentCockpitLayout::Wide => {
-                if width >= 100 {
-                    (width.saturating_mul(70) / 100, body_height)
+                if width >= 64 {
+                    (width.saturating_mul(65) / 100, body_height)
                 } else {
                     (width, body_height.saturating_mul(65) / 100)
                 }
@@ -613,9 +698,84 @@ impl AppModel {
         true
     }
 
+    pub fn select_workspace_session(&mut self, session_id: SessionId) -> WorkspaceSessionSelection {
+        let selection = self.workspace_session_selection(session_id);
+        if !matches!(
+            selection,
+            WorkspaceSessionSelection::DaemonSelected(_)
+                | WorkspaceSessionSelection::AttachSelected(_)
+        ) {
+            match selection {
+                WorkspaceSessionSelection::Missing => {
+                    self.status_message = "session missing".to_string();
+                }
+                WorkspaceSessionSelection::NotAttachable(_) => {
+                    self.status_message = "session not attachable".to_string();
+                }
+                _ => {}
+            }
+            return selection;
+        }
+
+        let Some(session) = self
+            .workspace_sessions
+            .iter()
+            .find(|session| session.session_id == session_id)
+            .cloned()
+        else {
+            return WorkspaceSessionSelection::Missing;
+        };
+
+        self.selected_session_id = Some(session_id);
+        if session.role == SessionRole::MillraceDaemon {
+            if self.select_daemon(session_id) {
+                self.focus_pane_kind(PaneKind::DaemonMonitor);
+                self.selected_session_id = Some(session_id);
+                self.status_message = format!(
+                    "daemon selected {}",
+                    session.name.as_deref().unwrap_or("unnamed")
+                );
+                return selection;
+            }
+            return WorkspaceSessionSelection::Missing;
+        }
+
+        self.agent_session_id = Some(session_id);
+        for pane in &mut self.panes {
+            if pane.kind == PaneKind::AgentTerminal {
+                pane.session_id = Some(session_id);
+            }
+        }
+        self.focus_pane_kind(PaneKind::AgentTerminal);
+        self.selected_session_id = Some(session_id);
+        self.status_message = format!(
+            "session selected {}",
+            session.name.as_deref().unwrap_or("unnamed")
+        );
+        selection
+    }
+
+    pub fn workspace_session_selection(&self, session_id: SessionId) -> WorkspaceSessionSelection {
+        let Some(session) = self
+            .workspace_sessions
+            .iter()
+            .find(|session| session.session_id == session_id)
+        else {
+            return WorkspaceSessionSelection::Missing;
+        };
+        if session.role == SessionRole::MillraceDaemon {
+            return WorkspaceSessionSelection::DaemonSelected(session_id);
+        }
+        if session_can_be_attached(session) {
+            WorkspaceSessionSelection::AttachSelected(session_id)
+        } else {
+            WorkspaceSessionSelection::NotAttachable(session_id)
+        }
+    }
+
     pub fn replace_daemon_sessions(&mut self, sessions: Vec<SessionSummary>) {
         let previous = self.active_daemon_session_id;
-        self.daemon_sessions = sessions;
+        self.daemon_sessions = sort_workspace_sessions(sessions);
         self.managed_daemon_session_ids = self
             .daemon_sessions
             .iter()
@@ -659,44 +819,102 @@ impl AppModel {
             daemon_status_message(&self.daemon_sessions, self.active_daemon_session_id);
     }
 
+    pub fn replace_workspace_sessions(&mut self, sessions: Vec<SessionSummary>) {
+        let existing_worktrees = self.workspace_worktrees.clone();
+        self.workspace_sessions = sort_workspace_sessions(sessions);
+        self.workspace_worktrees =
+            worktrees_for_sessions_with_cache(&self.workspace_sessions, &existing_worktrees);
+        self.managed_session_ids = self
+            .workspace_sessions
+            .iter()
+            .map(|session| session.session_id)
+            .collect();
+
+        let daemon_sessions = self
+            .workspace_sessions
+            .iter()
+            .filter(|session| session.role == SessionRole::MillraceDaemon)
+            .cloned()
+            .collect::<Vec<_>>();
+        self.replace_daemon_sessions(daemon_sessions);
+
+        if !self.session_exists(self.agent_session_id) {
+            self.agent_session_id = self
+                .workspace_sessions
+                .iter()
+                .find(|session| {
+                    session.role != SessionRole::MillraceDaemon && session.capabilities.attach
+                })
+                .map(|session| session.session_id);
+            for pane in &mut self.panes {
+                if pane.kind == PaneKind::AgentTerminal {
+                    pane.session_id = self.agent_session_id;
+                }
+            }
+        }
+
+        if !self.session_exists(self.selected_session_id) {
+            self.selected_session_id = self
+                .focused_session_id()
+                .or(self.agent_session_id)
+                .or(self.active_daemon_session_id);
+        }
+        self.update_selected_session_from_focus();
+    }
+
     pub fn open_daemon_switcher(&mut self) {
-        self.daemon_switcher
-            .open_with(self.active_daemon_session_id);
-        self.status_message = "daemon switcher".to_string();
+        self.daemon_switcher.open_with(
+            self.selected_session_id
+                .or(self.agent_session_id)
+                .or(self.active_daemon_session_id),
+        );
+        self.status_message = "session switcher".to_string();
     }
 
     pub fn close_daemon_switcher(&mut self) {
         self.daemon_switcher.close();
         self.status_message =
-            daemon_status_message(&self.daemon_sessions, self.active_daemon_session_id);
+            workspace_status_message(&self.workspace_sessions, self.selected_session_id);
     }
 
     pub fn move_daemon_switcher_selection(&mut self, delta: isize) -> bool {
-        if self.daemon_sessions.is_empty() {
+        if self.workspace_sessions.is_empty() {
             return false;
         }
         let current = self
             .daemon_switcher
             .selected_session_id
+            .or(self.selected_session_id)
+            .or(self.agent_session_id)
             .or(self.active_daemon_session_id)
             .and_then(|session_id| {
-                self.daemon_sessions
+                self.workspace_sessions
                     .iter()
                     .position(|session| session.session_id == session_id)
             })
             .unwrap_or(0);
-        let len = self.daemon_sessions.len() as isize;
+        let len = self.workspace_sessions.len() as isize;
         let next = (current as isize + delta).rem_euclid(len) as usize;
-        self.daemon_switcher.selected_session_id = Some(self.daemon_sessions[next].session_id);
+        self.daemon_switcher.selected_session_id = Some(self.workspace_sessions[next].session_id);
         true
     }
 
-    pub fn activate_daemon_switcher_selection(&mut self) -> bool {
-        let Some(session_id) = self.daemon_switcher.selected_session_id else {
-            return false;
-        };
+    pub fn activate_session_switcher_selection(&mut self) -> Option<SessionId> {
+        let session_id = self.daemon_switcher.selected_session_id?;
         self.daemon_switcher.close();
-        self.select_daemon(session_id)
+        Some(session_id)
+    }
+
+    pub fn activate_daemon_switcher_selection(&mut self) -> bool {
+        self.activate_session_switcher_selection()
+            .map(|session_id| {
+                matches!(
+                    self.select_workspace_session(session_id),
+                    WorkspaceSessionSelection::DaemonSelected(_)
+                        | WorkspaceSessionSelection::AttachSelected(_)
+                )
+            })
+            .unwrap_or(false)
     }
 
     pub fn append_live_output(&mut self, line: impl Into<String>) {
@@ -737,6 +955,91 @@ impl AppModel {
         self.daemon_sessions
             .iter()
             .find(|session| session.session_id == session_id)
+    }
+
+    pub fn workspace_session_rows(&self) -> Vec<WorkspaceSessionRow> {
+        let focused_session_id = self.focused_session_id();
+        self.workspace_sessions
+            .iter()
+            .map(|session| {
+                let worktree = self
+                    .workspace_worktrees
+                    .get(&session.session_id)
+                    .and_then(|worktree| worktree.as_ref());
+                workspace_session_row(
+                    session,
+                    worktree,
+                    self.selected_session_id == Some(session.session_id),
+                    focused_session_id == Some(session.session_id),
+                )
+            })
+            .collect()
+    }
+
+    pub fn restore_ui_context_selection(&mut self, context: &UiContext) {
+        if let Some(session_id) = context.active_daemon_session_id {
+            let _ = self.select_daemon(session_id);
+        }
+
+        if let Some(session_id) = context.agent_session_id {
+            if matches!(
+                self.workspace_session_selection(session_id),
+                WorkspaceSessionSelection::AttachSelected(_)
+            ) {
+                self.agent_session_id = Some(session_id);
+                for pane in &mut self.panes {
+                    if pane.kind == PaneKind::AgentTerminal {
+                        pane.session_id = Some(session_id);
+                    }
+                }
+            }
+        }
+
+        let selected = context
+            .selected_session_id
+            .or(context.focused_session_id)
+            .or(context.agent_session_id)
+            .or(context.active_daemon_session_id);
+        if let Some(session_id) =
+            selected.filter(|session_id| self.session_exists(Some(*session_id)))
+        {
+            self.selected_session_id = Some(session_id);
+        }
+
+        match context.focused_pane_kind.as_deref() {
+            Some("daemon_monitor") => {
+                if let Some(session_id) = context
+                    .focused_session_id
+                    .or(context.active_daemon_session_id)
+                    .filter(|session_id| self.daemon_session_exists(*session_id))
+                {
+                    let _ = self.select_daemon(session_id);
+                }
+                let _ = self.focus_pane_kind(PaneKind::DaemonMonitor);
+            }
+            Some("agent_terminal") => {
+                if let Some(session_id) = context
+                    .focused_session_id
+                    .or(context.agent_session_id)
+                    .filter(|session_id| {
+                        matches!(
+                            self.workspace_session_selection(*session_id),
+                            WorkspaceSessionSelection::AttachSelected(_)
+                        )
+                    })
+                {
+                    self.agent_session_id = Some(session_id);
+                    for pane in &mut self.panes {
+                        if pane.kind == PaneKind::AgentTerminal {
+                            pane.session_id = Some(session_id);
+                        }
+                    }
+                    let _ = self.focus_pane_kind(PaneKind::AgentTerminal);
+                    self.selected_session_id = Some(session_id);
+                }
+            }
+            _ => {}
+        }
     }
 
     pub fn command_target_label(&self) -> String {
@@ -799,9 +1102,13 @@ impl AppModel {
             ui_id: self.ui_id,
             mode: self.mode.clone(),
             active_pane_id: self.active_pane_id,
+            selected_session_id: self.selected_session_id,
+            focused_session_id: self.focused_session_id(),
+            focused_pane_kind: self.focused_pane_kind_label().map(str::to_string),
             active_daemon_session_id: self.active_daemon_session_id,
             active_workspace: self.active_workspace.clone(),
             agent_session_id: self.agent_session_id,
+            managed_session_ids: self.managed_session_ids.clone(),
             managed_daemon_session_ids: self.managed_daemon_session_ids.clone(),
             monitor_profile: self.monitor_profile.clone(),
             daemon_health: self
@@ -972,6 +1279,34 @@ impl AppModel {
         let session_id = self.active_daemon_session_id?;
         self.daemon_logs.get_mut(&session_id)
     }
+
+    fn session_exists(&self, session_id: Option<SessionId>) -> bool {
+        session_id.is_some_and(|session_id| {
+            self.workspace_sessions
+                .iter()
+                .any(|session| session.session_id == session_id)
+        })
+    }
+
+    fn daemon_session_exists(&self, session_id: SessionId) -> bool {
+        self.daemon_sessions
+            .iter()
+            .any(|session| session.session_id == session_id)
+    }
+
+    fn update_selected_session_from_focus(&mut self) {
+        if let Some(session_id) = self.focused_session_id() {
+            self.selected_session_id = Some(session_id);
+        }
+    }
+}
+
+fn cockpit_content_size(width: u16, body_height: u16, session_count: usize) -> (u16, u16) {
+    let session_rows = session_count.clamp(1, 3) as u16;
+    let desired = 1 + session_rows.saturating_mul(2);
+    let max_height = COCKPIT_SESSION_LIST_HEIGHT.min(body_height.saturating_sub(2));
+    let list_height = desired.min(max_height).max(1);
+    (width, body_height.saturating_sub(list_height))
 }
 
 fn panes_for_layout(
@@ -1036,6 +1371,177 @@ fn visible_sessions(
     visible
 }
 
+fn sort_workspace_sessions(mut sessions: Vec<SessionSummary>) -> Vec<SessionSummary> {
+    sessions.sort_by_key(|session| session_role_rank(&session.role));
+    sessions
+}
+
+fn upsert_session(sessions: &mut Vec<SessionSummary>, session: SessionSummary) {
+    if let Some(index) = sessions
+        .iter()
+        .position(|candidate| candidate.session_id == session.session_id)
+    {
+        sessions[index] = session;
+    } else {
+        sessions.push(session);
+    }
+}
+
+fn session_role_rank(role: &SessionRole) -> u8 {
+    match role {
+        SessionRole::MillraceDaemon => 0,
+        SessionRole::Agent => 1,
+        SessionRole::Shell => 2,
+        SessionRole::Worker => 3,
+        SessionRole::Generic => 4,
+        SessionRole::Other(_) => 5,
+    }
+}
+
+fn session_can_be_attached(session: &SessionSummary) -> bool {
+    session.capabilities.attach
+        && matches!(
+            session.process_state,
+            ProcessState::Starting | ProcessState::Running
+        )
+}
+
+fn worktrees_for_sessions(
+    sessions: &[SessionSummary],
+) -> BTreeMap<SessionId, Option<GitWorktreeIdentity>> {
+    worktrees_for_sessions_with_cache(sessions, &BTreeMap::new())
+}
+
+fn worktrees_for_sessions_with_cache(
+    sessions: &[SessionSummary],
+    existing: &BTreeMap<SessionId, Option<GitWorktreeIdentity>>,
+) -> BTreeMap<SessionId, Option<GitWorktreeIdentity>> {
+    sessions
+        .iter()
+        .map(|session| {
+            (
+                session.session_id,
+                existing
+                    .get(&session.session_id)
+                    .cloned()
+                    .unwrap_or_else(|| discover_session_worktree(session)),
+            )
+        })
+        .collect()
+}
+
+fn discover_session_worktree(session: &SessionSummary) -> Option<GitWorktreeIdentity> {
+    let workspace_path = session
+        .workspace
+        .as_ref()
+        .map(|workspace| workspace.canonical_path.as_path())
+        .unwrap_or(session.cwd.as_path());
+    GitWorktreeIdentity::discover(workspace_path)
+        .or_else(|| GitWorktreeIdentity::discover(session.cwd.as_path()))
+}
+
+fn workspace_session_row(
+    session: &SessionSummary,
+    worktree: Option<&GitWorktreeIdentity>,
+    selected: bool,
+    focused: bool,
+) -> WorkspaceSessionRow {
+    let location = session
+        .workspace
+        .as_ref()
+        .map(|workspace| workspace.canonical_path.display().to_string())
+        .unwrap_or_else(|| session.cwd.display().to_string());
+    let (worktree, branch, inferred_source) = match worktree {
+        Some(worktree) => (
+            worktree.root.display().to_string(),
+            worktree.branch.as_deref().unwrap_or("detached").to_string(),
+            "inferred",
+        ),
+        None => (
+            "unavailable".to_string(),
+            "unavailable".to_string(),
+            "unavailable",
+        ),
+    };
+    let runtime_source = runtime_status_source(session);
+    WorkspaceSessionRow {
+        session_id: session.session_id,
+        role: session_role_label(&session.role).to_string(),
+        name: session
+            .name
+            .clone()
+            .unwrap_or_else(|| session.session_id.to_string()),
+        location,
+        worktree,
+        branch,
+        process_state: process_state_label(&session.process_state).to_string(),
+        liveness: liveness_label(session),
+        unread: "unread=unavailable".to_string(),
+        attention: attention_label_for_row(&session.attention_state).to_string(),
+        selected,
+        focused,
+        status_summary: format!(
+            "status millmux_session:{} liveness={}",
+            process_state_label(&session.process_state),
+            liveness_label(session)
+        ),
+        source_summary: format!(
+            "source millmux_session runtime={runtime_source} terminal_screen=preview operator=unavailable inferred={inferred_source}"
+        ),
+    }
+}
+
+fn session_role_label(role: &SessionRole) -> &str {
+    match role {
+        SessionRole::Shell => "shell",
+        SessionRole::MillraceDaemon => "millrace_daemon",
+        SessionRole::Agent => "agent",
+        SessionRole::Generic => "generic",
+        SessionRole::Worker => "worker",
+        SessionRole::Other(value) => value.as_str(),
+    }
+}
+
+fn liveness_label(session: &SessionSummary) -> String {
+    format!(
+        "worker:{} child:{}",
+        liveness_state_label(session.liveness.worker),
+        liveness_state_label(session.liveness.child)
+    )
+}
+
+fn liveness_state_label(state: LivenessState) -> &'static str {
+    match state {
+        LivenessState::Unknown => "unknown",
+        LivenessState::Alive => "alive",
+        LivenessState::Dead => "dead",
+        LivenessState::Indeterminate => "indeterminate",
+    }
+}
+
+fn attention_label_for_row(state: &AttentionState) -> &'static str {
+    match state {
+        AttentionState::Unknown => "unknown",
+        AttentionState::Active => "active",
+        AttentionState::Idle => "idle",
+        AttentionState::NeedsAttention => "needs_attention",
+        AttentionState::MillraceIdle => "millrace_idle",
+        AttentionState::MillraceBusy => "millrace_busy",
+    }
+}
+
+fn runtime_status_source(session: &SessionSummary) -> &'static str {
+    if session.role == SessionRole::MillraceDaemon {
+        match session.attention_state {
+            AttentionState::MillraceIdle => "millrace_runtime:idle",
+            AttentionState::MillraceBusy => "millrace_runtime:busy",
+            _ => "unavailable",
+        }
+    } else {
+        "unavailable"
+    }
+}
+
 fn find_session(sessions: &[SessionSummary], session_id: SessionId) -> Option<&SessionSummary> {
     sessions
         .iter()
@@ -1083,6 +1589,23 @@ fn daemon_status_message(sessions: &[SessionSummary], selected: Option<SessionId
     } else {
         format!("degraded daemons={degraded_count}")
     }
+}
+
+fn workspace_status_message(sessions: &[SessionSummary], selected: Option<SessionId>) -> String {
+    if sessions.is_empty() {
+        return "no workspace sessions".to_string();
+    }
+    let selected = selected
+        .and_then(|session_id| find_session(sessions, session_id))
+        .map(|session| {
+            format!(
+                "{} {}",
+                session_role_label(&session.role),
+                session.name.as_deref().unwrap_or("unnamed")
+            )
+        })
+        .unwrap_or_else(|| "no session selected".to_string());
+    format!("session switcher closed selected={selected}")
 }
 
 fn daemon_health_from_summary(session: &SessionSummary) -> UiDaemonHealth {
@@ -1294,6 +1817,131 @@ mod tests {
             context.daemon_health[0].process_state,
             ProcessState::Running
         );
+        assert_eq!(context.selected_session_id, Some(agent_id));
+        assert_eq!(context.focused_session_id, Some(agent_id));
+        assert_eq!(context.focused_pane_kind.as_deref(), Some("agent_terminal"));
+        assert!(context.managed_session_ids.contains(&agent_id));
+        assert!(context.managed_session_ids.contains(&daemon_id));
+    }
+
+    #[test]
+    fn agent_cockpit_workspace_rows_preserve_source_attribution() {
+        let mut daemon = summary("daemon");
+        daemon.attention_state = AttentionState::MillraceBusy;
+        let daemon_id = daemon.session_id;
+        let mut agent = summary("agent");
+        agent.role = SessionRole::Agent;
+        let agent_id = agent.session_id;
+        let app = AppModel::agent_cockpit(
+            UiId::new(),
+            agent,
+            vec![daemon],
+            Some(daemon_id),
+            BTreeMap::new(),
+            AgentTerminalPane::new(10, 40, true, false),
+            AgentCockpitLayout::Right,
+            MonitorProfile::Basic,
+        );
+
+        let rows = app.workspace_session_rows();
+        assert_eq!(rows.len(), 2);
+        let daemon = rows.iter().find(|row| row.session_id == daemon_id).unwrap();
+        assert_eq!(daemon.role, "millrace_daemon");
+        assert!(daemon.status_summary.contains("millmux_session:running"));
+        assert!(daemon.source_summary.contains("millmux_session"));
+        assert!(daemon.source_summary.contains("millrace_runtime:busy"));
+        assert!(daemon.source_summary.contains("terminal_screen=preview"));
+        assert!(daemon.source_summary.contains("operator=unavailable"));
+        assert!(daemon.source_summary.contains("inferred=unavailable"));
+        let agent = rows.iter().find(|row| row.session_id == agent_id).unwrap();
+        assert!(agent.selected);
+        assert!(agent.focused);
+    }
+
+    #[test]
+    fn agent_cockpit_can_select_shell_session_as_attach_target() {
+        let daemon = summary("daemon");
+        let daemon_id = daemon.session_id;
+        let mut agent = summary("agent");
+        agent.role = SessionRole::Agent;
+        let mut shell = summary("shell");
+        shell.role = SessionRole::Shell;
+        shell.argv = vec!["bash".to_string()];
+        let shell_id = shell.session_id;
+        let mut app = AppModel::agent_cockpit(
+            UiId::new(),
+            agent.clone(),
+            vec![daemon.clone()],
+            Some(daemon_id),
+            BTreeMap::new(),
+            AgentTerminalPane::new(10, 40, true, false),
+            AgentCockpitLayout::Right,
+            MonitorProfile::Basic,
+        );
+        app.replace_workspace_sessions(vec![daemon, agent, shell]);
+
+        let selection = app.select_workspace_session(shell_id);
+
+        assert_eq!(
+            selection,
+            WorkspaceSessionSelection::AttachSelected(shell_id)
+        );
+        assert_eq!(app.agent_session_id, Some(shell_id));
+        assert!(app.focused_agent_terminal());
+        let context = app.ui_context();
+        assert_eq!(context.selected_session_id, Some(shell_id));
+        assert_eq!(context.focused_session_id, Some(shell_id));
+        assert_eq!(context.focused_pane_kind.as_deref(), Some("agent_terminal"));
+        assert_eq!(context.active_daemon_session_id, Some(daemon_id));
+        assert_eq!(context.managed_daemon_session_ids, vec![daemon_id]);
+        assert!(context.managed_session_ids.contains(&shell_id));
+    }
+
+    #[test]
+    fn agent_cockpit_restores_prior_context_selection_and_focus() {
+        let daemon = summary("daemon");
+        let daemon_id = daemon.session_id;
+        let mut first_agent = summary("agent-one");
+        first_agent.role = SessionRole::Agent;
+        let mut second_agent = summary("agent-two");
+        second_agent.role = SessionRole::Agent;
+        let second_agent_id = second_agent.session_id;
+        let mut app = AppModel::agent_cockpit(
+            UiId::new(),
+            first_agent.clone(),
+            vec![daemon.clone()],
+            Some(daemon_id),
+            BTreeMap::new(),
+            AgentTerminalPane::new(10, 40, true, false),
+            AgentCockpitLayout::Right,
+            MonitorProfile::Basic,
+        );
+        app.replace_workspace_sessions(vec![daemon, first_agent, second_agent]);
+        let context = UiContext {
+            schema_version: 1,
+            ui_id: app.ui_id,
+            mode: UiMode::AgentCockpit,
+            active_pane_id: app.active_pane_id,
+            selected_session_id: Some(second_agent_id),
+            focused_session_id: Some(second_agent_id),
+            focused_pane_kind: Some("agent_terminal".to_string()),
+            active_daemon_session_id: Some(daemon_id),
+            active_workspace: app.active_workspace.clone(),
+            agent_session_id: Some(second_agent_id),
+            managed_session_ids: vec![daemon_id, second_agent_id],
+            managed_daemon_session_ids: vec![daemon_id],
+            monitor_profile: MonitorProfile::Basic,
+            daemon_health: Vec::new(),
+            updated_at: OffsetDateTime::now_utc(),
+        };
+
+        app.restore_ui_context_selection(&context);
+
+        assert_eq!(app.agent_session_id, Some(second_agent_id));
+        assert_eq!(app.selected_session_id, Some(second_agent_id));
+        assert_eq!(app.focused_session_id(), Some(second_agent_id));
+        assert!(app.focused_agent_terminal());
+        assert_eq!(app.active_daemon_session_id, Some(daemon_id));
     }
 
     #[test]
@@ -1402,9 +2050,9 @@ mod tests {
             MonitorProfile::Basic,
         );
 
-        assert_eq!(app.agent_terminal_size_for(120, 30), Some((28, 84)));
-        assert!(app.resize_agent_terminal(28, 84));
-        assert!(!app.resize_agent_terminal(28, 84));
+        assert_eq!(app.agent_terminal_size_for(120, 30), Some((23, 78)));
+        assert!(app.resize_agent_terminal(23, 78));
+        assert!(!app.resize_agent_terminal(23, 78));
     }
 
     #[test]
@@ -1529,6 +2177,7 @@ mod tests {
 
         app.open_daemon_switcher();
         assert!(app.daemon_switcher.open);
+        assert!(app.move_daemon_switcher_selection(1));
         assert!(app.move_daemon_switcher_selection(1));
         assert!(app.activate_daemon_switcher_selection());
 

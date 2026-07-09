@@ -11,7 +11,10 @@ use ratatui::{
 
 use crate::{
     app::{AppModel, HostConnectionState},
-    pane::{AgentCockpitLayout, CommandOutputState, DaemonConsoleLayout, PaneKind},
+    pane::{
+        AgentCockpitLayout, CommandOutputState, DaemonConsoleLayout, PaneKind,
+        COCKPIT_SESSION_LIST_HEIGHT,
+    },
     terminal::{TerminalCell, TerminalColor},
 };
 
@@ -93,13 +96,15 @@ fn render_console(frame: &mut ratatui::Frame<'_>, area: Rect, app: &AppModel) {
 }
 
 fn render_cockpit(frame: &mut ratatui::Frame<'_>, area: Rect, app: &AppModel) {
+    let (session_area, content_area) = cockpit_session_list_split(area, app);
+    render_workspace_session_list(frame, session_area, app);
     match app.cockpit_layout {
         AgentCockpitLayout::Right => {
-            if area.width >= 100 {
+            if content_area.width >= 64 {
                 let chunks = Layout::default()
                     .direction(Direction::Horizontal)
-                    .constraints([Constraint::Percentage(60), Constraint::Percentage(40)])
-                    .split(area);
+                    .constraints([Constraint::Percentage(55), Constraint::Percentage(45)])
+                    .split(content_area);
                 render_agent_terminal(frame, chunks[0], app);
                 render_log(
                     frame,
@@ -110,16 +115,16 @@ fn render_cockpit(frame: &mut ratatui::Frame<'_>, area: Rect, app: &AppModel) {
                     pane_focused(app, PaneKind::DaemonMonitor),
                 );
             } else {
-                render_cockpit_bottom(frame, area, app, 60);
+                render_cockpit_bottom(frame, content_area, app, 60);
             }
         }
-        AgentCockpitLayout::Bottom => render_cockpit_bottom(frame, area, app, 60),
+        AgentCockpitLayout::Bottom => render_cockpit_bottom(frame, content_area, app, 60),
         AgentCockpitLayout::Wide => {
-            if area.width >= 100 {
+            if content_area.width >= 64 {
                 let chunks = Layout::default()
                     .direction(Direction::Horizontal)
-                    .constraints([Constraint::Percentage(70), Constraint::Percentage(30)])
-                    .split(area);
+                    .constraints([Constraint::Percentage(65), Constraint::Percentage(35)])
+                    .split(content_area);
                 render_agent_terminal(frame, chunks[0], app);
                 render_log(
                     frame,
@@ -130,21 +135,35 @@ fn render_cockpit(frame: &mut ratatui::Frame<'_>, area: Rect, app: &AppModel) {
                     pane_focused(app, PaneKind::DaemonMonitor),
                 );
             } else {
-                render_cockpit_bottom(frame, area, app, 65);
+                render_cockpit_bottom(frame, content_area, app, 65);
             }
         }
         AgentCockpitLayout::Focus => match app.focused_pane_kind() {
             Some(PaneKind::DaemonMonitor) => render_log(
                 frame,
-                area,
+                content_area,
                 app,
                 app.active_daemon_session_id,
                 "Daemon Monitor",
                 true,
             ),
-            _ => render_agent_terminal(frame, area, app),
+            _ => render_agent_terminal(frame, content_area, app),
         },
     }
+}
+
+fn cockpit_session_list_split(area: Rect, app: &AppModel) -> (Rect, Rect) {
+    let session_rows = app.workspace_sessions.len().clamp(1, 3) as u16;
+    let desired = 1 + session_rows.saturating_mul(2);
+    let list_height = desired
+        .min(COCKPIT_SESSION_LIST_HEIGHT)
+        .min(area.height.saturating_sub(2))
+        .max(1);
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(list_height), Constraint::Min(1)])
+        .split(area);
+    (chunks[0], chunks[1])
 }
 
 fn render_cockpit_bottom(
@@ -183,9 +202,9 @@ fn render_agent_terminal(frame: &mut ratatui::Frame<'_>, area: Rect, app: &AppMo
         "read-only"
     };
     let screen = if terminal.snapshot.alternate_screen {
-        "alt"
+        " alt"
     } else {
-        "main"
+        ""
     };
     let view = if app.search_mode && focused {
         "search"
@@ -198,7 +217,7 @@ fn render_agent_terminal(frame: &mut ratatui::Frame<'_>, area: Rect, app: &AppMo
     };
     let mut lines = vec![Line::from(vec![Span::styled(
         format!(
-            "Agent Terminal | {input} {screen} {view} cur={},{}{}",
+            "Agent Terminal | {input} {view}{screen} cur={},{}{}",
             terminal.snapshot.cursor_row,
             terminal.snapshot.cursor_col,
             focus_suffix(focused)
@@ -356,6 +375,78 @@ fn render_daemon_list(frame: &mut ratatui::Frame<'_>, area: Rect, app: &AppModel
         lines.push(Line::from(format!("  {}", compact_path(&workspace, 30))));
     }
     frame.render_widget(Paragraph::new(lines), area);
+}
+
+fn render_workspace_session_list(frame: &mut ratatui::Frame<'_>, area: Rect, app: &AppModel) {
+    let rows = app.workspace_session_rows();
+    let mut lines = vec![Line::from(vec![Span::styled(
+        format!("Sessions | count={}", rows.len()),
+        Style::default()
+            .fg(Color::Green)
+            .add_modifier(Modifier::BOLD),
+    )])];
+    if rows.is_empty() {
+        lines.push(Line::from("no workspace sessions"));
+    }
+
+    let width = area.width.saturating_sub(2).max(16) as usize;
+    for row in rows {
+        let marker = if row.focused {
+            ">"
+        } else if row.selected {
+            "*"
+        } else {
+            " "
+        };
+        let compact_liveness = row
+            .liveness
+            .replace("worker:", "w:")
+            .replace(" child:", " c:");
+        let path_width = if width >= 96 { 28 } else { 16 };
+        lines.push(Line::from(format!(
+            "{marker} {} {} st={} att={} live={} {} cwd={} git={}@{}",
+            row.role,
+            compact_text(&row.name, 14),
+            row.process_state,
+            row.attention,
+            compact_liveness,
+            row.unread,
+            compact_path(&row.location, path_width),
+            compact_path(&row.worktree, 16),
+            compact_text(&row.branch, 10)
+        )));
+        lines.push(Line::from(format!(
+            "  {}",
+            truncate_text(&status_source_line(&row), width.saturating_sub(2))
+        )));
+    }
+    frame.render_widget(Paragraph::new(lines), area);
+}
+
+fn status_source_line(row: &crate::pane::WorkspaceSessionRow) -> String {
+    format!(
+        "millmux_session millrace_runtime={} terminal_screen=preview operator=unavailable inferred={}",
+        runtime_source_value(&row.source_summary),
+        inferred_source_value(&row.source_summary)
+    )
+}
+
+fn runtime_source_value(source: &str) -> &'static str {
+    if source.contains("millrace_runtime:busy") {
+        "busy"
+    } else if source.contains("millrace_runtime:idle") {
+        "idle"
+    } else {
+        "unavailable"
+    }
+}
+
+fn inferred_source_value(source: &str) -> &'static str {
+    if source.contains("inferred=inferred") {
+        "inferred"
+    } else {
+        "unavailable"
+    }
 }
 
 fn render_log(
@@ -519,33 +610,43 @@ fn render_help(frame: &mut ratatui::Frame<'_>, area: Rect, app: &AppModel) {
 fn render_daemon_switcher(frame: &mut ratatui::Frame<'_>, area: Rect, app: &AppModel) {
     frame.render_widget(Clear, area);
     let mut lines = vec![Line::from(vec![Span::styled(
-        "Daemon Switcher",
+        "Session Switcher",
         Style::default()
             .fg(Color::Green)
             .add_modifier(Modifier::BOLD),
     )])];
-    if app.daemon_sessions.is_empty() {
-        lines.push(Line::from("no managed daemons"));
+    let rows = app.workspace_session_rows();
+    if rows.is_empty() {
+        lines.push(Line::from("no workspace sessions"));
     }
-    for session in &app.daemon_sessions {
-        let marker = if Some(session.session_id) == app.daemon_switcher.selected_session_id {
+    for row in rows {
+        let marker = if Some(row.session_id) == app.daemon_switcher.selected_session_id {
             ">"
-        } else if Some(session.session_id) == app.active_daemon_session_id {
+        } else if row.selected {
             "*"
         } else {
             " "
         };
-        let name = session.name.as_deref().unwrap_or("-");
-        let workspace = session
-            .workspace
-            .as_ref()
-            .map(|workspace| workspace.canonical_path.display().to_string())
-            .unwrap_or_else(|| session.cwd.display().to_string());
+        let compact_liveness = row
+            .liveness
+            .replace("worker:", "w:")
+            .replace(" child:", " c:");
         lines.push(Line::from(format!(
-            "{marker} {name} {:?} monitor={}",
-            session.process_state, session.monitor_profile
+            "{marker} {} {} st={} att={} live={} {} cwd={} git={}@{}",
+            row.role,
+            compact_text(&row.name, 14),
+            row.process_state,
+            row.attention,
+            compact_liveness,
+            row.unread,
+            compact_path(&row.location, 20),
+            compact_path(&row.worktree, 16),
+            compact_text(&row.branch, 10)
         )));
-        lines.push(Line::from(format!("  {}", compact_path(&workspace, 58))));
+        lines.push(Line::from(format!(
+            "  {}",
+            truncate_text(&status_source_line(&row), 66)
+        )));
     }
     frame.render_widget(Paragraph::new(lines), area);
 }
@@ -710,6 +811,16 @@ fn compact_text(value: &str, width: usize) -> String {
         .rev()
         .collect::<String>();
     format!("~{tail}")
+}
+
+fn truncate_text(value: &str, width: usize) -> String {
+    let value = value.replace('\n', " ");
+    if value.chars().count() <= width {
+        return value;
+    }
+    let keep = width.saturating_sub(1);
+    let head = value.chars().take(keep).collect::<String>();
+    format!("{head}~")
 }
 
 fn centered(area: Rect, width: u16, height: u16) -> Rect {

@@ -1052,9 +1052,16 @@ fn referenced_session_ids(context: &UiContext) -> BTreeSet<SessionId> {
     if let Some(session_id) = context.active_daemon_session_id {
         ids.insert(session_id);
     }
+    if let Some(session_id) = context.selected_session_id {
+        ids.insert(session_id);
+    }
+    if let Some(session_id) = context.focused_session_id {
+        ids.insert(session_id);
+    }
     if let Some(session_id) = context.agent_session_id {
         ids.insert(session_id);
     }
+    ids.extend(context.managed_session_ids.iter().copied());
     ids.extend(context.managed_daemon_session_ids.iter().copied());
     ids
 }
