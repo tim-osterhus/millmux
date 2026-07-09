@@ -9,6 +9,7 @@ pub mod pane;
 pub mod renderer;
 pub mod shell;
 pub mod terminal;
+pub mod width;
 
 pub use app::{AppModel, HostConnectionState};
 pub use keymap::{KeyAction, PrefixKeymap};
@@ -19,5 +20,6 @@ pub use pane::{
 };
 pub use shell::{ShellExit, TuiShell, UiContextSink};
 pub use terminal::{
-    TerminalCell, TerminalColor, TerminalEmulator, TerminalSnapshot, TerminalStyle,
+    TerminalCell, TerminalColor, TerminalEmulator, TerminalSearchDirection, TerminalSearchMatch,
+    TerminalSnapshot, TerminalStyle,
 };

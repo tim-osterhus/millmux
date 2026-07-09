@@ -33,5 +33,7 @@ time = { version = "0.3", features = ["formatting", "macros", "parsing", "serde"
 tokio = { version = "1.38", features = ["fs", "io-util", "macros", "net", "process", "rt-multi-thread", "signal", "sync", "time"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+unicode-segmentation = "1.13"
+unicode-width = "0.2"
 uuid = { version = "1.8", features = ["serde", "v4"] }
 vt100 = "0.16.2"

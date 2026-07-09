@@ -298,6 +298,8 @@ pub enum UiEventKind {
     CommandFailed,
     ScrollModeEntered,
     ScrollModeExited,
+    InputAccepted,
+    InputRejected,
     RawInputModeEntered,
     RawInputModeExited,
 }

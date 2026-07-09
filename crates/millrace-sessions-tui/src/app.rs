@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 
-use crossterm::event::KeyEvent;
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use millrace_sessions_core::{
     ids::{PaneId, SessionId, UiId},
     protocol::SessionSummary,
@@ -40,6 +40,9 @@ pub struct AppModel {
     pub keymap: PrefixKeymap,
     pub prefix_pending: bool,
     pub scroll_mode: bool,
+    pub search_mode: bool,
+    pub search_query: String,
+    pub copy_buffer: Option<String>,
     pub command_palette: CommandPalette,
     pub daemon_switcher: DaemonSwitcherOverlay,
     pub confirmation: Option<ConfirmationPrompt>,
@@ -79,6 +82,9 @@ impl AppModel {
             keymap: PrefixKeymap::default(),
             prefix_pending: false,
             scroll_mode: false,
+            search_mode: false,
+            search_query: String::new(),
+            copy_buffer: None,
             command_palette: CommandPalette::default_commands(),
             daemon_switcher: DaemonSwitcherOverlay::default(),
             confirmation: None,
@@ -143,6 +149,9 @@ impl AppModel {
             keymap: PrefixKeymap::default(),
             prefix_pending: false,
             scroll_mode: false,
+            search_mode: false,
+            search_query: String::new(),
+            copy_buffer: None,
             command_palette,
             daemon_switcher: DaemonSwitcherOverlay::default(),
             confirmation: None,
@@ -213,6 +222,9 @@ impl AppModel {
             keymap: PrefixKeymap::default(),
             prefix_pending: false,
             scroll_mode: false,
+            search_mode: false,
+            search_query: String::new(),
+            copy_buffer: None,
             command_palette: CommandPalette::default_commands(),
             daemon_switcher: DaemonSwitcherOverlay::default(),
             confirmation: None,
@@ -239,6 +251,12 @@ impl AppModel {
             return KeyAction::Prefix;
         }
 
+        if self.search_mode {
+            let action = self.search_key_action(event);
+            self.apply_action(&action, viewport_height);
+            return action;
+        }
+
         if self.scroll_mode {
             if let Some(action) = self.keymap.scroll_action(event) {
                 self.apply_action(&action, viewport_height);
@@ -256,6 +274,8 @@ impl AppModel {
 
     pub fn exit_scroll_mode(&mut self) {
         self.scroll_mode = false;
+        self.search_mode = false;
+        self.search_query.clear();
         if self.focused_agent_terminal() {
             self.set_agent_terminal_following(true);
         } else {
@@ -347,6 +367,148 @@ impl AppModel {
         self.agent_terminal
             .as_ref()
             .map_or(true, AgentTerminalPane::is_following)
+    }
+
+    pub fn begin_search_mode(&mut self) {
+        self.scroll_mode = true;
+        self.search_mode = true;
+        self.search_query.clear();
+        self.status_message = "search:".to_string();
+    }
+
+    pub fn copy_buffer_text(&self) -> Option<&str> {
+        self.copy_buffer.as_deref()
+    }
+
+    pub fn refresh_agent_search_from_snapshot(&mut self, label: &str) {
+        if self.search_query.is_empty() {
+            self.status_message = "search:".to_string();
+            return;
+        }
+        let query = self.search_query.clone();
+        let found = self
+            .agent_terminal
+            .as_mut()
+            .and_then(|terminal| terminal.search(query.clone()));
+        self.status_message = match found {
+            Some(found) => format!("{label}: {} line {}", query, found.index + 1),
+            None => format!("{label}: {} not found", query),
+        };
+    }
+
+    pub fn set_agent_search_not_found(&mut self, label: &str) {
+        if self.search_query.is_empty() {
+            self.status_message = "search:".to_string();
+        } else {
+            self.status_message = format!("{label}: {} not found", self.search_query);
+        }
+    }
+
+    fn search_key_action(&self, event: KeyEvent) -> KeyAction {
+        let mut modifiers = event.modifiers;
+        if matches!(event.code, KeyCode::Char(_)) {
+            modifiers.remove(KeyModifiers::SHIFT);
+        }
+
+        match event.code {
+            KeyCode::Esc => KeyAction::Escape,
+            KeyCode::Enter if modifiers.is_empty() => KeyAction::CopySearchMatch,
+            KeyCode::Backspace if modifiers.is_empty() => KeyAction::SearchBackspace,
+            KeyCode::Down if modifiers.is_empty() => KeyAction::NextSearch,
+            KeyCode::Up if modifiers.is_empty() => KeyAction::PreviousSearch,
+            KeyCode::Char(value) if modifiers.is_empty() => KeyAction::SearchInput(value),
+            _ => KeyAction::Ignored,
+        }
+    }
+
+    fn push_search_input(&mut self, value: char) {
+        self.search_query.push(value);
+        self.search_active_view();
+    }
+
+    fn pop_search_input(&mut self) {
+        self.search_query.pop();
+        self.search_active_view();
+    }
+
+    fn search_active_view(&mut self) {
+        if self.search_query.is_empty() {
+            self.status_message = "search:".to_string();
+            return;
+        }
+
+        let query = self.search_query.clone();
+        let found = if self.focused_agent_terminal() {
+            self.agent_terminal
+                .as_mut()
+                .and_then(|terminal| terminal.search(query.clone()))
+        } else {
+            let result = self.line_log.search(query.clone());
+            if let Some(log) = self.active_daemon_log_mut() {
+                let _ = log.search(query.clone());
+            }
+            result
+        };
+        self.status_message = match found {
+            Some(found) => format!("search: {} line {}", query, found.index + 1),
+            None => format!("search: {} not found", query),
+        };
+    }
+
+    fn next_search_match(&mut self) {
+        let found = if self.focused_agent_terminal() {
+            self.agent_terminal
+                .as_mut()
+                .and_then(AgentTerminalPane::next_match)
+        } else {
+            let result = self.line_log.next_match();
+            if let Some(log) = self.active_daemon_log_mut() {
+                let _ = log.next_match();
+            }
+            result
+        };
+        self.status_message = match found {
+            Some(found) => format!("search next: line {}", found.index + 1),
+            None => "search next: no match".to_string(),
+        };
+    }
+
+    fn previous_search_match(&mut self) {
+        let found = if self.focused_agent_terminal() {
+            self.agent_terminal
+                .as_mut()
+                .and_then(AgentTerminalPane::previous_match)
+        } else {
+            let result = self.line_log.previous_match();
+            if let Some(log) = self.active_daemon_log_mut() {
+                let _ = log.previous_match();
+            }
+            result
+        };
+        self.status_message = match found {
+            Some(found) => format!("search previous: line {}", found.index + 1),
+            None => "search previous: no match".to_string(),
+        };
+    }
+
+    fn copy_current_search_match(&mut self) {
+        let found = if self.focused_agent_terminal() {
+            self.agent_terminal
+                .as_ref()
+                .and_then(AgentTerminalPane::current_match)
+        } else {
+            self.line_log.current_match()
+        };
+        match found {
+            Some(found) => {
+                self.copy_buffer = Some(found.line);
+                self.search_mode = false;
+                self.status_message = "copied search match".to_string();
+            }
+            None => {
+                self.status_message = "copy: no search match".to_string();
+            }
+        }
     }
 
     pub fn resize_agent_terminal(&mut self, rows: u16, cols: u16) -> bool {
@@ -652,7 +814,9 @@ impl AppModel {
     }
 
     pub fn active_view_label(&self) -> &'static str {
-        if self.scroll_mode {
+        if self.search_mode {
+            "search"
+        } else if self.scroll_mode {
             "scroll"
         } else if self.focused_agent_terminal() {
             if self.agent_terminal_is_following() {
@@ -689,13 +853,25 @@ impl AppModel {
             KeyAction::JumpBottom => {
                 self.jump_active_view_bottom();
                 self.scroll_mode = false;
+                self.search_mode = false;
+                self.search_query.clear();
             }
-            KeyAction::Escape => self.exit_scroll_mode(),
+            KeyAction::BeginSearch => self.begin_search_mode(),
+            KeyAction::SearchInput(value) => self.push_search_input(*value),
+            KeyAction::SearchBackspace => self.pop_search_input(),
+            KeyAction::NextSearch => self.next_search_match(),
+            KeyAction::PreviousSearch => self.previous_search_match(),
+            KeyAction::CopySearchMatch => self.copy_current_search_match(),
+            KeyAction::Escape => {
+                if self.search_mode {
+                    self.search_mode = false;
+                    self.status_message = "search closed".to_string();
+                } else {
+                    self.exit_scroll_mode();
+                }
+            }
             KeyAction::Detach
             | KeyAction::CloseRequested
-            | KeyAction::BeginSearch
-            | KeyAction::NextSearch
-            | KeyAction::PreviousSearch
             | KeyAction::Prefix
             | KeyAction::Input(_)
             | KeyAction::Ignored => {}
@@ -1273,6 +1449,60 @@ mod tests {
             KeyAction::JumpBottom
         );
         assert!(app.agent_terminal.as_ref().unwrap().is_following());
+    }
+
+    #[test]
+    fn agent_cockpit_search_mode_captures_input_and_copies_exact_match() {
+        let daemon = summary("daemon");
+        let mut agent = summary("agent");
+        agent.role = SessionRole::Agent;
+        let mut terminal = crate::terminal::TerminalEmulator::new(4, 40, 20);
+        terminal.process_text("alpha\r\n>Hey can you see\r\nomega\r\n");
+        let mut app = AppModel::agent_cockpit(
+            UiId::new(),
+            agent,
+            vec![daemon],
+            None,
+            BTreeMap::new(),
+            AgentTerminalPane::with_snapshot(terminal.snapshot(), true, false),
+            AgentCockpitLayout::Right,
+            MonitorProfile::Basic,
+        );
+
+        assert_eq!(
+            app.handle_key(KeyEvent::new(KeyCode::Char(']'), KeyModifiers::CONTROL), 4),
+            KeyAction::Prefix
+        );
+        assert_eq!(
+            app.handle_key(KeyEvent::new(KeyCode::Char('['), KeyModifiers::NONE), 4),
+            KeyAction::EnterScrollMode
+        );
+        assert_eq!(
+            app.handle_key(KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE), 4),
+            KeyAction::BeginSearch
+        );
+        for value in "can you".chars() {
+            assert_eq!(
+                app.handle_key(KeyEvent::new(KeyCode::Char(value), KeyModifiers::NONE), 4),
+                KeyAction::SearchInput(value)
+            );
+        }
+
+        assert_eq!(app.active_view_label(), "search");
+        assert!(
+            app.status_message.contains("line"),
+            "{}",
+            app.status_message
+        );
+        assert_eq!(
+            app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), 4),
+            KeyAction::CopySearchMatch
+        );
+        assert_eq!(
+            app.copy_buffer_text().map(str::trim_end),
+            Some(">Hey can you see")
+        );
+        assert!(!app.search_mode);
     }
 
     #[test]

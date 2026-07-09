@@ -1,3 +1,20 @@
+use crate::width::{cell_symbol_width, normalize_cell_symbol};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TerminalSearchDirection {
+    First,
+    Next,
+    Previous,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TerminalSearchMatch {
+    pub scrollback: usize,
+    pub row: usize,
+    pub query: String,
+    pub line: String,
+}
+
 pub struct TerminalEmulator {
     parser: vt100::Parser,
     scrollback_len: usize,
@@ -70,19 +87,20 @@ impl TerminalEmulator {
                     line.push(TerminalCell::blank());
                     continue;
                 };
-                line.push(TerminalCell {
-                    symbol: cell.contents().to_string(),
-                    fg: TerminalColor::from_vt100(cell.fgcolor()),
-                    bg: TerminalColor::from_vt100(cell.bgcolor()),
-                    style: TerminalStyle {
+                line.push(TerminalCell::from_raw_symbol(
+                    cell.contents(),
+                    TerminalColor::from_vt100(cell.fgcolor()),
+                    TerminalColor::from_vt100(cell.bgcolor()),
+                    TerminalStyle {
                         bold: cell.bold(),
                         dim: cell.dim(),
                         italic: cell.italic(),
                         underline: cell.underline(),
                         inverse: cell.inverse(),
                     },
-                });
+                ));
             }
+            normalize_row_cells(&mut line);
             cells.push(line);
         }
 
@@ -98,6 +116,53 @@ impl TerminalEmulator {
 
     pub fn scrollback_len(&self) -> usize {
         self.scrollback_len
+    }
+
+    pub fn search_scrollback(
+        &mut self,
+        query: &str,
+        direction: TerminalSearchDirection,
+    ) -> Option<TerminalSearchMatch> {
+        if query.is_empty() {
+            return None;
+        }
+
+        let original = self.parser.screen().scrollback();
+        let max = self.max_scrollback();
+        let offsets = search_offsets(original, max, direction);
+        for offset in offsets {
+            self.parser.screen_mut().set_scrollback(offset);
+            if let Some(found) = self.search_visible_rows(query, offset) {
+                return Some(found);
+            }
+        }
+
+        self.parser.screen_mut().set_scrollback(original);
+        None
+    }
+
+    fn max_scrollback(&mut self) -> usize {
+        let original = self.parser.screen().scrollback();
+        self.parser.screen_mut().set_scrollback(usize::MAX);
+        let max = self.parser.screen().scrollback();
+        self.parser.screen_mut().set_scrollback(original);
+        max
+    }
+
+    fn search_visible_rows(&self, query: &str, scrollback: usize) -> Option<TerminalSearchMatch> {
+        let snapshot = self.snapshot();
+        snapshot
+            .plain_lines()
+            .into_iter()
+            .enumerate()
+            .find_map(|(row, line)| {
+                line.contains(query).then(|| TerminalSearchMatch {
+                    scrollback,
+                    row,
+                    query: query.to_string(),
+                    line: snapshot.line_text(row).unwrap_or_default(),
+                })
+            })
     }
 }
 
@@ -134,14 +199,12 @@ impl TerminalSnapshot {
     pub fn plain_lines(&self) -> Vec<String> {
         self.cells
             .iter()
-            .map(|row| {
-                row.iter()
-                    .map(|cell| cell.symbol.as_str())
-                    .collect::<String>()
-                    .trim_end()
-                    .to_string()
-            })
+            .map(|row| row_text(row).trim_end().to_string())
             .collect()
+    }
+
+    pub fn line_text(&self, row: usize) -> Option<String> {
+        self.cells.get(row).map(|row| row_text(row))
     }
 
     pub fn contains_text(&self, needle: &str) -> bool {
@@ -158,18 +221,124 @@ impl Default for TerminalSnapshot {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TerminalCell {
     pub symbol: String,
+    pub width: u8,
+    pub continuation: bool,
     pub fg: TerminalColor,
     pub bg: TerminalColor,
     pub style: TerminalStyle,
 }
 
 impl TerminalCell {
+    pub fn new(
+        symbol: impl AsRef<str>,
+        fg: TerminalColor,
+        bg: TerminalColor,
+        style: TerminalStyle,
+    ) -> Self {
+        let symbol = normalize_cell_symbol(symbol.as_ref());
+        Self {
+            width: cell_symbol_width(&symbol) as u8,
+            continuation: false,
+            symbol,
+            fg,
+            bg,
+            style,
+        }
+    }
+
     pub fn blank() -> Self {
         Self {
             symbol: " ".to_string(),
+            width: 1,
+            continuation: false,
             fg: TerminalColor::Default,
             bg: TerminalColor::Default,
             style: TerminalStyle::default(),
+        }
+    }
+
+    pub fn display_symbol(&self) -> &str {
+        if self.symbol.is_empty() && !self.continuation {
+            " "
+        } else {
+            self.symbol.as_str()
+        }
+    }
+
+    fn from_raw_symbol(
+        symbol: &str,
+        fg: TerminalColor,
+        bg: TerminalColor,
+        style: TerminalStyle,
+    ) -> Self {
+        Self {
+            symbol: symbol.to_string(),
+            width: cell_symbol_width(symbol) as u8,
+            continuation: false,
+            fg,
+            bg,
+            style,
+        }
+    }
+
+    fn mark_continuation(&mut self) {
+        self.symbol.clear();
+        self.width = 0;
+        self.continuation = true;
+    }
+
+    fn normalize_blank(&mut self) {
+        if self.symbol.is_empty() && !self.continuation {
+            self.symbol = " ".to_string();
+            self.width = 1;
+        }
+    }
+}
+
+fn normalize_row_cells(row: &mut [TerminalCell]) {
+    let len = row.len();
+    for index in 0..len {
+        let width = usize::from(row[index].width);
+        if width <= 1 {
+            continue;
+        }
+        for cell in row
+            .iter_mut()
+            .take((index + width).min(len))
+            .skip(index + 1)
+        {
+            if cell.symbol.is_empty() {
+                cell.mark_continuation();
+            }
+        }
+    }
+    for cell in row {
+        cell.normalize_blank();
+    }
+}
+
+fn row_text(row: &[TerminalCell]) -> String {
+    row.iter()
+        .filter(|cell| !cell.continuation)
+        .map(TerminalCell::display_symbol)
+        .collect()
+}
+
+fn search_offsets(current: usize, max: usize, direction: TerminalSearchDirection) -> Vec<usize> {
+    match direction {
+        TerminalSearchDirection::First => (0..=max).collect(),
+        TerminalSearchDirection::Next => {
+            let mut offsets = Vec::new();
+            if current < max {
+                offsets.extend(current + 1..=max);
+            }
+            offsets.extend(0..=current.min(max));
+            offsets
+        }
+        TerminalSearchDirection::Previous => {
+            let mut offsets = (0..current.min(max)).rev().collect::<Vec<_>>();
+            offsets.extend((current.min(max)..=max).rev());
+            offsets
         }
     }
 }
@@ -275,5 +444,55 @@ mod tests {
 
         assert!(terminal.is_following());
         assert!(terminal.snapshot().contains_text("line-7"));
+    }
+
+    #[test]
+    fn terminal_search_walks_scrollback_history_and_moves_view_to_match() {
+        let mut terminal = TerminalEmulator::new(4, 32, 20);
+        for index in 0..10 {
+            terminal.process_text(&format!("history line {index}\r\n"));
+        }
+
+        assert!(!terminal.snapshot().contains_text("history line 2"));
+        let found = terminal
+            .search_scrollback("history line 2", TerminalSearchDirection::First)
+            .expect("history match");
+
+        assert_eq!(found.query, "history line 2");
+        assert!(found.scrollback > 0);
+        assert!(terminal.is_scrolled());
+        assert!(terminal.snapshot().contains_text("history line 2"));
+    }
+
+    #[test]
+    fn terminal_snapshot_preserves_blank_and_internal_space_cells() {
+        let mut terminal = TerminalEmulator::new(3, 24, 20);
+        terminal.process_text(">Hey can you see");
+
+        let snapshot = terminal.snapshot();
+        let line = snapshot.line_text(0).expect("line exists");
+
+        assert!(line.starts_with(">Hey can you see"), "{line:?}");
+        assert_eq!(snapshot.cells[0][4].display_symbol(), " ");
+        assert_eq!(snapshot.cells[0][8].display_symbol(), " ");
+        assert_eq!(snapshot.cells[0][12].display_symbol(), " ");
+        assert_eq!(snapshot.cells[1][0].display_symbol(), " ");
+        assert_eq!(snapshot.cells[1][0].width, 1);
+    }
+
+    #[test]
+    fn terminal_snapshot_marks_wide_continuation_cells() {
+        let mut terminal = TerminalEmulator::new(2, 12, 20);
+        terminal.process_text("A界B");
+
+        let snapshot = terminal.snapshot();
+        let row = &snapshot.cells[0];
+
+        assert_eq!(row[0].display_symbol(), "A");
+        assert_eq!(row[1].display_symbol(), "界");
+        assert_eq!(row[1].width, 2);
+        assert!(row[2].continuation);
+        assert_eq!(row[3].display_symbol(), "B");
+        assert_eq!(snapshot.plain_lines()[0], "A界B");
     }
 }

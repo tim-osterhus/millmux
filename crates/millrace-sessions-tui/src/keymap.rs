@@ -19,6 +19,9 @@ pub enum KeyAction {
     JumpTop,
     JumpBottom,
     BeginSearch,
+    SearchInput(char),
+    SearchBackspace,
+    CopySearchMatch,
     NextSearch,
     PreviousSearch,
     Escape,
@@ -77,6 +80,10 @@ impl PrefixKeymap {
                 (KeyChord::plain(KeyCode::End), KeyAction::JumpBottom),
                 (KeyChord::plain(KeyCode::Char('G')), KeyAction::JumpBottom),
                 (KeyChord::plain(KeyCode::Char('/')), KeyAction::BeginSearch),
+                (
+                    KeyChord::plain(KeyCode::Char('y')),
+                    KeyAction::CopySearchMatch,
+                ),
                 (KeyChord::plain(KeyCode::Char('n')), KeyAction::NextSearch),
                 (
                     KeyChord::plain(KeyCode::Char('N')),

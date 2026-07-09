@@ -159,6 +159,7 @@ pub struct AgentTerminalPane {
     pub input_owner: bool,
     pub read_only: bool,
     pub follow: bool,
+    pub active_search: Option<ActiveSearch>,
     pub initializing: bool,
     pub rows: u16,
     pub cols: u16,
@@ -171,6 +172,7 @@ impl AgentTerminalPane {
             input_owner,
             read_only,
             follow: true,
+            active_search: None,
             initializing: true,
             rows: rows.max(1),
             cols: cols.max(1),
@@ -185,6 +187,7 @@ impl AgentTerminalPane {
             input_owner,
             read_only,
             follow: true,
+            active_search: None,
             initializing: false,
         }
     }
@@ -221,6 +224,72 @@ impl AgentTerminalPane {
 
     pub fn is_scrolled(&self) -> bool {
         !self.follow
+    }
+
+    pub fn search(&mut self, query: impl Into<String>) -> Option<SearchMatch> {
+        let query = query.into();
+        if query.is_empty() {
+            self.active_search = None;
+            return None;
+        }
+
+        let lines = self.snapshot.plain_lines();
+        let Some(found) = lines.iter().position(|line| line.contains(query.as_str())) else {
+            self.active_search = None;
+            return None;
+        };
+        self.active_search = Some(ActiveSearch {
+            query: query.clone(),
+            current_index: found,
+        });
+        Some(self.search_match(found, query))
+    }
+
+    pub fn next_match(&mut self) -> Option<SearchMatch> {
+        let search = self.active_search.clone()?;
+        let lines = self.snapshot.plain_lines();
+        let len = lines.len();
+        for step in 1..=len {
+            let index = (search.current_index + step) % len;
+            if lines[index].contains(search.query.as_str()) {
+                self.active_search = Some(ActiveSearch {
+                    query: search.query.clone(),
+                    current_index: index,
+                });
+                return Some(self.search_match(index, search.query));
+            }
+        }
+        None
+    }
+
+    pub fn previous_match(&mut self) -> Option<SearchMatch> {
+        let search = self.active_search.clone()?;
+        let lines = self.snapshot.plain_lines();
+        let len = lines.len();
+        for step in 1..=len {
+            let index = (search.current_index + len - step) % len;
+            if lines[index].contains(search.query.as_str()) {
+                self.active_search = Some(ActiveSearch {
+                    query: search.query.clone(),
+                    current_index: index,
+                });
+                return Some(self.search_match(index, search.query));
+            }
+        }
+        None
+    }
+
+    pub fn current_match(&self) -> Option<SearchMatch> {
+        let search = self.active_search.clone()?;
+        Some(self.search_match(search.current_index, search.query))
+    }
+
+    fn search_match(&self, index: usize, query: String) -> SearchMatch {
+        SearchMatch {
+            index,
+            query,
+            line: self.snapshot.line_text(index).unwrap_or_default(),
+        }
     }
 }
 
@@ -333,10 +402,14 @@ impl LineLogPane {
             return None;
         }
 
-        let found = self
+        let Some(found) = self
             .lines
             .iter()
-            .position(|line| line.contains(query.as_str()))?;
+            .position(|line| line.contains(query.as_str()))
+        else {
+            self.active_search = None;
+            return None;
+        };
         self.active_search = Some(ActiveSearch {
             query: query.clone(),
             current_index: found,
@@ -374,6 +447,11 @@ impl LineLogPane {
             }
         }
         None
+    }
+
+    pub fn current_match(&self) -> Option<SearchMatch> {
+        let search = self.active_search.clone()?;
+        Some(self.search_match(search.current_index, search.query))
     }
 
     pub fn is_following(&self) -> bool {
@@ -431,7 +509,7 @@ impl Default for LineLogPane {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct ActiveSearch {
+pub struct ActiveSearch {
     query: String,
     current_index: usize,
 }
@@ -486,6 +564,10 @@ impl Default for HelpOverlay {
                 ("Ctrl-] Tab", "switch focus"),
                 ("Ctrl-] [", "scroll mode"),
                 ("Ctrl-] ]", "live follow"),
+                ("/", "search scrollback"),
+                ("n / N", "next / previous match"),
+                ("Enter", "copy match"),
+                ("Esc", "close search / scroll"),
                 ("Ctrl-] d", "detach"),
                 ("Ctrl-] p", "command palette"),
                 ("Ctrl-] ?", "help"),
@@ -661,6 +743,23 @@ mod tests {
             DaemonConsoleLayout::Grid
         );
         assert!("unknown".parse::<DaemonConsoleLayout>().is_err());
+    }
+
+    #[test]
+    fn help_overlay_includes_search_copy_and_scrollback_keys() {
+        let help = HelpOverlay::default();
+        assert!(help
+            .entries
+            .iter()
+            .any(|(key, action)| *key == "/" && action.contains("search")));
+        assert!(help
+            .entries
+            .iter()
+            .any(|(key, action)| *key == "n / N" && action.contains("previous")));
+        assert!(help
+            .entries
+            .iter()
+            .any(|(key, action)| *key == "Enter" && action.contains("copy")));
     }
 
     #[test]

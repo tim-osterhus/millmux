@@ -33,6 +33,7 @@ use millrace_sessions_core::{
 use millrace_sessions_tui::{
     renderer::{render_app, render_to_string},
     AgentCockpitLayout, AgentTerminalPane, AppModel, KeyAction, TerminalEmulator,
+    TerminalSearchDirection,
 };
 use ratatui::{backend::CrosstermBackend, Terminal};
 use thiserror::Error;
@@ -61,6 +62,7 @@ const AGENT_SESSION_ID_ENV: &str = "MILLMUX_AGENT_SESSION_ID";
 const MILLRACE_WORKSPACE_ENV: &str = "MILLRACE_WORKSPACE";
 const BRACKETED_PASTE_BEGIN: &str = "\x1b[200~";
 const BRACKETED_PASTE_END: &str = "\x1b[201~";
+pub const MAX_COCKPIT_PASTE_BYTES: usize = 64 * 1024;
 
 pub async fn run_cockpit(args: CockpitArgs) -> Result<(), CockpitError> {
     let client = SessionControlClient::new()?;
@@ -589,7 +591,7 @@ async fn run_interactive_cockpit(
                     }
                 }
                 Event::Paste(text) => {
-                    handle_cockpit_paste(&app, &mut attach, text).await?;
+                    handle_cockpit_paste(&client, &mut app, &mut attach, text).await?;
                     redraw.mark_dirty();
                 }
                 Event::Resize(width, height) => {
@@ -865,6 +867,7 @@ async fn handle_cockpit_key(
 
     let previous_daemon = app.active_daemon_session_id;
     let agent_was_focused = app.focused_agent_terminal();
+    let search_was_active = app.search_mode;
     let viewport_height = terminal
         .terminal
         .size()
@@ -923,6 +926,31 @@ async fn handle_cockpit_key(
             emulator.jump_top();
             app.update_agent_terminal_view(emulator.snapshot(), emulator.is_following());
         }
+        KeyAction::SearchInput(_) | KeyAction::SearchBackspace if agent_was_focused => {
+            sync_agent_search_from_emulator(
+                app,
+                emulator,
+                TerminalSearchDirection::First,
+                "search",
+            );
+        }
+        KeyAction::NextSearch if agent_was_focused => {
+            sync_agent_search_from_emulator(
+                app,
+                emulator,
+                TerminalSearchDirection::Next,
+                "search next",
+            );
+        }
+        KeyAction::PreviousSearch if agent_was_focused => {
+            sync_agent_search_from_emulator(
+                app,
+                emulator,
+                TerminalSearchDirection::Previous,
+                "search previous",
+            );
+        }
+        KeyAction::Escape if search_was_active => {}
         KeyAction::ExitScrollMode | KeyAction::JumpBottom | KeyAction::Escape => {
             if agent_was_focused {
                 emulator.jump_bottom();
@@ -953,16 +981,75 @@ async fn handle_cockpit_key(
     Ok(false)
 }
 
+fn sync_agent_search_from_emulator(
+    app: &mut AppModel,
+    emulator: &mut TerminalEmulator,
+    direction: TerminalSearchDirection,
+    label: &str,
+) {
+    if app.search_query.is_empty() {
+        return;
+    }
+
+    if emulator
+        .search_scrollback(app.search_query.as_str(), direction)
+        .is_some()
+    {
+        app.update_agent_terminal_view(emulator.snapshot(), emulator.is_following());
+        app.refresh_agent_search_from_snapshot(label);
+    } else {
+        app.set_agent_search_not_found(label);
+    }
+}
+
 async fn handle_cockpit_paste(
-    app: &AppModel,
+    client: &SessionControlClient,
+    app: &mut AppModel,
     attach: &mut OpenedAgentAttach,
     text: String,
 ) -> Result<(), CockpitError> {
-    if let Some(text) = cockpit_paste_input_text(app, &text) {
-        attach
-            .writer
-            .write_frame(&AttachStreamFrame::Input { text })
+    match cockpit_paste_decision(app, &text) {
+        CockpitPasteDecision::Accepted {
+            text,
+            byte_count,
+            bracketed,
+        } => {
+            attach
+                .writer
+                .write_frame(&AttachStreamFrame::Input { text })
+                .await?;
+            app.status_message = "paste sent".to_string();
+            record_ui_event(
+                client,
+                app,
+                UiEventKind::InputAccepted,
+                "agent paste accepted",
+                input_audit_fields(app, "paste", byte_count, true, None, bracketed),
+            )
             .await?;
+        }
+        CockpitPasteDecision::Rejected {
+            reason,
+            byte_count,
+            bracketed,
+        } => {
+            app.status_message = format!("paste rejected: {}", reason.as_str());
+            record_ui_event(
+                client,
+                app,
+                UiEventKind::InputRejected,
+                "agent paste rejected",
+                input_audit_fields(
+                    app,
+                    "paste",
+                    byte_count,
+                    false,
+                    Some(reason.as_str()),
+                    bracketed,
+                ),
+            )
+            .await?;
+        }
     }
     Ok(())
 }
@@ -1096,8 +1183,80 @@ fn cockpit_key_input_text(app: &AppModel, event: KeyEvent) -> Option<String> {
         .flatten()
 }
 
+#[cfg(test)]
 fn cockpit_paste_input_text(app: &AppModel, text: &str) -> Option<String> {
-    cockpit_accepts_agent_text_input(app).then(|| paste_event_to_text(text))
+    match cockpit_paste_decision(app, text) {
+        CockpitPasteDecision::Accepted { text, .. } => Some(text),
+        CockpitPasteDecision::Rejected { .. } => None,
+    }
+}
+
+fn cockpit_paste_decision(app: &AppModel, text: &str) -> CockpitPasteDecision {
+    let byte_count = text.len();
+    let bracketed = paste_event_is_bracketed_or_multiline(text);
+    if byte_count > MAX_COCKPIT_PASTE_BYTES {
+        return CockpitPasteDecision::Rejected {
+            reason: CockpitPasteRejectReason::TooLarge,
+            byte_count,
+            bracketed,
+        };
+    }
+    if cockpit_overlay_accepts_input(app) {
+        return CockpitPasteDecision::Rejected {
+            reason: CockpitPasteRejectReason::OverlayActive,
+            byte_count,
+            bracketed,
+        };
+    }
+    if !app.focused_agent_terminal() {
+        return CockpitPasteDecision::Rejected {
+            reason: CockpitPasteRejectReason::AgentUnfocused,
+            byte_count,
+            bracketed,
+        };
+    }
+    if !app.agent_terminal_can_accept_input() {
+        return CockpitPasteDecision::Rejected {
+            reason: CockpitPasteRejectReason::ReadOnly,
+            byte_count,
+            bracketed,
+        };
+    }
+
+    CockpitPasteDecision::Accepted {
+        text: paste_event_to_text(text),
+        byte_count,
+        bracketed,
+    }
+}
+
+fn input_audit_fields(
+    app: &AppModel,
+    input_kind: &str,
+    byte_count: usize,
+    accepted: bool,
+    reason: Option<&str>,
+    bracketed: bool,
+) -> BTreeMap<String, String> {
+    let mut fields = BTreeMap::from([
+        ("sender_client".to_string(), "cockpit".to_string()),
+        ("sender_ui_id".to_string(), app.ui_id.to_string()),
+        ("target".to_string(), "agent_terminal".to_string()),
+        ("input_kind".to_string(), input_kind.to_string()),
+        ("byte_count".to_string(), byte_count.to_string()),
+        ("accepted".to_string(), accepted.to_string()),
+        ("bracketed".to_string(), bracketed.to_string()),
+    ]);
+    if let Some(session_id) = app.agent_session_id {
+        fields.insert("target_session_id".to_string(), session_id.to_string());
+    }
+    if let Some(pane_id) = app.active_pane_id {
+        fields.insert("target_pane_id".to_string(), pane_id.to_string());
+    }
+    if let Some(reason) = reason {
+        fields.insert("reason".to_string(), reason.to_string());
+    }
+    fields
 }
 
 fn key_event_to_text(event: KeyEvent) -> Option<String> {
@@ -1138,6 +1297,43 @@ fn paste_event_to_text(text: &str) -> String {
 
 fn is_bracketed_paste(text: &str) -> bool {
     text.starts_with(BRACKETED_PASTE_BEGIN) && text.ends_with(BRACKETED_PASTE_END)
+}
+
+fn paste_event_is_bracketed_or_multiline(text: &str) -> bool {
+    is_bracketed_paste(text) || text.contains('\n') || text.contains('\r')
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum CockpitPasteDecision {
+    Accepted {
+        text: String,
+        byte_count: usize,
+        bracketed: bool,
+    },
+    Rejected {
+        reason: CockpitPasteRejectReason,
+        byte_count: usize,
+        bracketed: bool,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CockpitPasteRejectReason {
+    OverlayActive,
+    AgentUnfocused,
+    ReadOnly,
+    TooLarge,
+}
+
+impl CockpitPasteRejectReason {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::OverlayActive => "overlay_active",
+            Self::AgentUnfocused => "agent_unfocused",
+            Self::ReadOnly => "read_only",
+            Self::TooLarge => "too_large",
+        }
+    }
 }
 
 fn f_key_sequence(value: u8) -> Option<&'static str> {
@@ -1481,6 +1677,117 @@ mod tests {
             cockpit_key_input_text(&app, key(KeyCode::Char('x'), KeyModifiers::NONE)),
             None
         );
+    }
+
+    #[test]
+    fn cockpit_paste_decision_reports_rejection_reasons_and_size() {
+        let mut app = cockpit_input_app(true, false);
+        let accepted = cockpit_paste_decision(&app, "first\nsecond");
+        assert_eq!(
+            accepted,
+            CockpitPasteDecision::Accepted {
+                text: "\x1b[200~first\nsecond\x1b[201~".to_string(),
+                byte_count: "first\nsecond".len(),
+                bracketed: true,
+            }
+        );
+
+        app.set_agent_input_read_only();
+        assert_eq!(
+            cockpit_paste_decision(&app, "blocked"),
+            CockpitPasteDecision::Rejected {
+                reason: CockpitPasteRejectReason::ReadOnly,
+                byte_count: "blocked".len(),
+                bracketed: false,
+            }
+        );
+
+        let oversized = "x".repeat(MAX_COCKPIT_PASTE_BYTES + 1);
+        assert_eq!(
+            cockpit_paste_decision(&cockpit_input_app(true, false), &oversized),
+            CockpitPasteDecision::Rejected {
+                reason: CockpitPasteRejectReason::TooLarge,
+                byte_count: oversized.len(),
+                bracketed: false,
+            }
+        );
+    }
+
+    #[test]
+    fn cockpit_paste_audit_fields_include_sender_target_result_and_reason() {
+        let app = cockpit_input_app(true, false);
+        let fields = input_audit_fields(
+            &app,
+            "paste",
+            12,
+            false,
+            Some(CockpitPasteRejectReason::OverlayActive.as_str()),
+            true,
+        );
+
+        assert_eq!(
+            fields.get("sender_client").map(String::as_str),
+            Some("cockpit")
+        );
+        assert_eq!(fields.get("sender_ui_id"), Some(&app.ui_id.to_string()));
+        assert_eq!(
+            fields.get("target").map(String::as_str),
+            Some("agent_terminal")
+        );
+        let expected_session_id = app.agent_session_id.map(|id| id.to_string());
+        assert_eq!(
+            fields.get("target_session_id"),
+            expected_session_id.as_ref()
+        );
+        assert_eq!(fields.get("input_kind").map(String::as_str), Some("paste"));
+        assert_eq!(fields.get("byte_count").map(String::as_str), Some("12"));
+        assert_eq!(fields.get("accepted").map(String::as_str), Some("false"));
+        assert_eq!(fields.get("bracketed").map(String::as_str), Some("true"));
+        assert_eq!(
+            fields.get("reason").map(String::as_str),
+            Some("overlay_active")
+        );
+    }
+
+    #[test]
+    fn cockpit_agent_search_sync_searches_scrollback_history_for_copy() {
+        let mut app = cockpit_input_app(true, false);
+        let mut emulator = TerminalEmulator::new(4, 40, 20);
+        for index in 0..10 {
+            emulator.process_text(&format!("history line {index}\r\n"));
+        }
+        app.update_agent_terminal_view(emulator.snapshot(), emulator.is_following());
+
+        assert!(!app
+            .agent_terminal
+            .as_ref()
+            .unwrap()
+            .snapshot
+            .contains_text("history line 2"));
+
+        app.begin_search_mode();
+        app.search_query = "history line 2".to_string();
+        sync_agent_search_from_emulator(
+            &mut app,
+            &mut emulator,
+            TerminalSearchDirection::First,
+            "search",
+        );
+
+        assert!(app
+            .agent_terminal
+            .as_ref()
+            .unwrap()
+            .snapshot
+            .contains_text("history line 2"));
+        assert_eq!(
+            app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE), 4),
+            KeyAction::CopySearchMatch
+        );
+        assert!(app
+            .copy_buffer_text()
+            .expect("copied")
+            .starts_with("history line 2"));
     }
 
     #[test]

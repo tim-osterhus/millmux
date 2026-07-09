@@ -268,6 +268,18 @@ fn agent_cockpit_internal_scroll_renders_scrolled_agent_history() {
 }
 
 #[test]
+fn agent_cockpit_render_preserves_visible_prompt_spaces() {
+    let mut terminal = TerminalEmulator::new(4, 72, 20);
+    terminal.process_text(">Hey can you see");
+    let app = cockpit_app_with_terminal(AgentCockpitLayout::Focus, terminal);
+
+    let rendered = render_to_string(&app, 80, 8);
+
+    assert!(rendered.contains(">Hey can you see"), "{rendered}");
+    assert!(!rendered.contains(">Heycanyousee"), "{rendered}");
+}
+
+#[test]
 fn agent_cockpit_full_screen_fixture_renders_current_answer_without_old_frames() {
     let mut terminal = TerminalEmulator::new(10, 72, 200);
     terminal.process(

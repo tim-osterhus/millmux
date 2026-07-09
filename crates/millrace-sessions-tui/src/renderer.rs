@@ -66,7 +66,7 @@ fn render_body(frame: &mut ratatui::Frame<'_>, area: Rect, app: &AppModel) {
         render_daemon_switcher(frame, centered(area, 72, 12), app);
     }
     if app.help_overlay.open {
-        render_help(frame, centered(area, 54, 9), app);
+        render_help(frame, centered(area, 64, 13), app);
     }
     if app.confirmation.is_some() {
         render_confirmation(frame, centered(area, 58, 6), app);
@@ -187,7 +187,9 @@ fn render_agent_terminal(frame: &mut ratatui::Frame<'_>, area: Rect, app: &AppMo
     } else {
         "main"
     };
-    let view = if app.scroll_mode && focused {
+    let view = if app.search_mode && focused {
+        "search"
+    } else if app.scroll_mode && focused {
         "scroll"
     } else if terminal.is_following() {
         "live"
@@ -668,7 +670,7 @@ fn cell_span(cell: &TerminalCell) -> Span<'_> {
     if cell.style.inverse {
         style = style.add_modifier(Modifier::REVERSED);
     }
-    Span::styled(cell.symbol.clone(), style)
+    Span::styled(cell.display_symbol().to_string(), style)
 }
 
 fn to_ratatui_color(color: TerminalColor) -> Color {

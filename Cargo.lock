@@ -703,6 +703,8 @@ dependencies = [
  "serde_json",
  "thiserror",
  "time",
+ "unicode-segmentation",
+ "unicode-width 0.2.2",
  "vt100",
 ]
 
