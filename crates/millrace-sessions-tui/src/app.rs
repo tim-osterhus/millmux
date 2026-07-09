@@ -320,7 +320,10 @@ impl AppModel {
         self.search_mode = false;
         self.search_query.clear();
         match self.active_view_kind() {
-            Some(UiPaneViewKind::SessionTerminal) => self.set_agent_terminal_following(true),
+            Some(UiPaneViewKind::SessionTerminal) if self.active_terminal_is_attached() => {
+                self.set_agent_terminal_following(true)
+            }
+            Some(UiPaneViewKind::SessionTerminal) => {}
             Some(UiPaneViewKind::DaemonMonitor) => self.jump_active_log_bottom(),
             Some(UiPaneViewKind::SessionList | UiPaneViewKind::CommandOutput) | None => {}
         }
@@ -594,10 +597,14 @@ impl AppModel {
 
         let query = self.search_query.clone();
         let found = match self.active_view_kind() {
-            Some(UiPaneViewKind::SessionTerminal) => self
+            Some(UiPaneViewKind::SessionTerminal) if self.active_terminal_is_attached() => self
                 .agent_terminal
                 .as_mut()
                 .and_then(|terminal| terminal.search(query.clone())),
+            Some(UiPaneViewKind::SessionTerminal) => {
+                self.status_message = "search: terminal not attached".to_string();
+                return;
+            }
             Some(UiPaneViewKind::DaemonMonitor) => {
                 let result = self.line_log.search(query.clone());
                 if let Some(log) = self.active_daemon_log_mut() {
@@ -618,10 +625,11 @@ impl AppModel {
 
     fn next_search_match(&mut self) {
         let found = match self.active_view_kind() {
-            Some(UiPaneViewKind::SessionTerminal) => self
+            Some(UiPaneViewKind::SessionTerminal) if self.active_terminal_is_attached() => self
                 .agent_terminal
                 .as_mut()
                 .and_then(AgentTerminalPane::next_match),
+            Some(UiPaneViewKind::SessionTerminal) => None,
             Some(UiPaneViewKind::DaemonMonitor) => {
                 let result = self.line_log.next_match();
                 if let Some(log) = self.active_daemon_log_mut() {
@@ -639,10 +647,11 @@ impl AppModel {
 
     fn previous_search_match(&mut self) {
         let found = match self.active_view_kind() {
-            Some(UiPaneViewKind::SessionTerminal) => self
+            Some(UiPaneViewKind::SessionTerminal) if self.active_terminal_is_attached() => self
                 .agent_terminal
                 .as_mut()
                 .and_then(AgentTerminalPane::previous_match),
+            Some(UiPaneViewKind::SessionTerminal) => None,
             Some(UiPaneViewKind::DaemonMonitor) => {
                 let result = self.line_log.previous_match();
                 if let Some(log) = self.active_daemon_log_mut() {
@@ -660,10 +669,11 @@ impl AppModel {
 
     fn copy_current_search_match(&mut self) {
         let found = match self.active_view_kind() {
-            Some(UiPaneViewKind::SessionTerminal) => self
+            Some(UiPaneViewKind::SessionTerminal) if self.active_terminal_is_attached() => self
                 .agent_terminal
                 .as_ref()
                 .and_then(AgentTerminalPane::current_match),
+            Some(UiPaneViewKind::SessionTerminal) => None,
             Some(UiPaneViewKind::DaemonMonitor) => self.line_log.current_match(),
             Some(UiPaneViewKind::SessionList | UiPaneViewKind::CommandOutput) | None => None,
         };
@@ -766,6 +776,7 @@ impl AppModel {
                 }
             }
         }
+        self.refresh_pane_staleness();
         self.command_palette.target = self.command_target_label();
         self.status_message =
             daemon_status_message(&self.daemon_sessions, self.active_daemon_session_id);
@@ -911,6 +922,7 @@ impl AppModel {
             self.active_workspace = None;
         }
 
+        self.refresh_pane_staleness();
         self.command_palette.target = self.command_target_label();
         self.status_message =
             daemon_status_message(&self.daemon_sessions, self.active_daemon_session_id);
@@ -959,6 +971,7 @@ impl AppModel {
                 .or(self.agent_session_id)
                 .or(self.active_daemon_session_id);
         }
+        self.refresh_pane_staleness();
         self.update_selected_session_from_focus();
     }
 
@@ -1103,18 +1116,6 @@ impl AppModel {
             return true;
         }
 
-        match view.kind {
-            UiPaneViewKind::SessionTerminal => {
-                self.agent_session_id = view.session_id;
-                self.selected_session_id = view.session_id;
-            }
-            UiPaneViewKind::DaemonMonitor => {
-                if let Some(session_id) = view.session_id {
-                    let _ = self.select_daemon(session_id);
-                }
-            }
-            UiPaneViewKind::SessionList | UiPaneViewKind::CommandOutput => {}
-        }
         if Some(pane_id) == self.active_pane_id {
             self.update_selected_session_from_focus();
         }
@@ -1525,7 +1526,12 @@ impl AppModel {
 
     fn scroll_active_view_up(&mut self, viewport_height: u16, lines: usize) {
         match self.active_view_kind() {
-            Some(UiPaneViewKind::SessionTerminal) => self.set_agent_terminal_following(false),
+            Some(UiPaneViewKind::SessionTerminal) if self.active_terminal_is_attached() => {
+                self.set_agent_terminal_following(false)
+            }
+            Some(UiPaneViewKind::SessionTerminal) => {
+                self.status_message = "terminal not attached".to_string();
+            }
             Some(UiPaneViewKind::DaemonMonitor) => {
                 self.scroll_active_log_up(viewport_height, lines)
             }
@@ -1537,7 +1543,12 @@ impl AppModel {
 
     fn scroll_active_view_down(&mut self, lines: usize) {
         match self.active_view_kind() {
-            Some(UiPaneViewKind::SessionTerminal) => self.set_agent_terminal_following(false),
+            Some(UiPaneViewKind::SessionTerminal) if self.active_terminal_is_attached() => {
+                self.set_agent_terminal_following(false)
+            }
+            Some(UiPaneViewKind::SessionTerminal) => {
+                self.status_message = "terminal not attached".to_string();
+            }
             Some(UiPaneViewKind::DaemonMonitor) => self.scroll_active_log_down(lines),
             Some(UiPaneViewKind::SessionList | UiPaneViewKind::CommandOutput) | None => {
                 self.status_message = "scroll unavailable for view".to_string();
@@ -1547,7 +1558,12 @@ impl AppModel {
 
     fn page_active_view_up(&mut self, viewport_height: u16) {
         match self.active_view_kind() {
-            Some(UiPaneViewKind::SessionTerminal) => self.set_agent_terminal_following(false),
+            Some(UiPaneViewKind::SessionTerminal) if self.active_terminal_is_attached() => {
+                self.set_agent_terminal_following(false)
+            }
+            Some(UiPaneViewKind::SessionTerminal) => {
+                self.status_message = "terminal not attached".to_string();
+            }
             Some(UiPaneViewKind::DaemonMonitor) => self.page_active_log_up(viewport_height),
             Some(UiPaneViewKind::SessionList | UiPaneViewKind::CommandOutput) | None => {
                 self.status_message = "scroll unavailable for view".to_string();
@@ -1557,7 +1573,12 @@ impl AppModel {
 
     fn page_active_view_down(&mut self, viewport_height: u16) {
         match self.active_view_kind() {
-            Some(UiPaneViewKind::SessionTerminal) => self.set_agent_terminal_following(false),
+            Some(UiPaneViewKind::SessionTerminal) if self.active_terminal_is_attached() => {
+                self.set_agent_terminal_following(false)
+            }
+            Some(UiPaneViewKind::SessionTerminal) => {
+                self.status_message = "terminal not attached".to_string();
+            }
             Some(UiPaneViewKind::DaemonMonitor) => self.page_active_log_down(viewport_height),
             Some(UiPaneViewKind::SessionList | UiPaneViewKind::CommandOutput) | None => {
                 self.status_message = "scroll unavailable for view".to_string();
@@ -1567,7 +1588,12 @@ impl AppModel {
 
     fn jump_active_view_top(&mut self, viewport_height: u16) {
         match self.active_view_kind() {
-            Some(UiPaneViewKind::SessionTerminal) => self.set_agent_terminal_following(false),
+            Some(UiPaneViewKind::SessionTerminal) if self.active_terminal_is_attached() => {
+                self.set_agent_terminal_following(false)
+            }
+            Some(UiPaneViewKind::SessionTerminal) => {
+                self.status_message = "terminal not attached".to_string();
+            }
             Some(UiPaneViewKind::DaemonMonitor) => self.jump_active_log_top(viewport_height),
             Some(UiPaneViewKind::SessionList | UiPaneViewKind::CommandOutput) | None => {
                 self.status_message = "scroll unavailable for view".to_string();
@@ -1577,7 +1603,12 @@ impl AppModel {
 
     fn jump_active_view_bottom(&mut self) {
         match self.active_view_kind() {
-            Some(UiPaneViewKind::SessionTerminal) => self.set_agent_terminal_following(true),
+            Some(UiPaneViewKind::SessionTerminal) if self.active_terminal_is_attached() => {
+                self.set_agent_terminal_following(true)
+            }
+            Some(UiPaneViewKind::SessionTerminal) => {
+                self.status_message = "terminal not attached".to_string();
+            }
             Some(UiPaneViewKind::DaemonMonitor) => self.jump_active_log_bottom(),
             Some(UiPaneViewKind::SessionList | UiPaneViewKind::CommandOutput) | None => {
                 self.status_message = "scroll unavailable for view".to_string();
@@ -1630,6 +1661,31 @@ impl AppModel {
     fn active_daemon_log_mut(&mut self) -> Option<&mut LineLogPane> {
         let session_id = self.active_daemon_session_id?;
         self.daemon_logs.get_mut(&session_id)
+    }
+
+    fn active_terminal_is_attached(&self) -> bool {
+        self.active_pane().is_some_and(|pane| {
+            !pane.stale
+                && pane.view.kind == UiPaneViewKind::SessionTerminal
+                && pane.view.session_id == self.agent_session_id
+        })
+    }
+
+    fn refresh_pane_staleness(&mut self) {
+        let mut active_became_stale = false;
+        for index in 0..self.panes.len() {
+            let view = self.panes[index].view.clone();
+            let stale = self.pane_view_is_stale(&view);
+            self.panes[index].stale = stale;
+            if stale {
+                self.panes[index].focused = false;
+                active_became_stale |= self.active_pane_id == Some(self.panes[index].id);
+            }
+        }
+        if active_became_stale {
+            self.status_message = "stale pane recovered; focus moved".to_string();
+            self.focus_safe_fallback();
+        }
     }
 
     fn session_exists(&self, session_id: Option<SessionId>) -> bool {
@@ -2836,8 +2892,170 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(ids_before, ids_after);
         assert!(ids_after.contains(&agent_id));
-        assert_eq!(app.agent_session_id, Some(shell_id));
+        assert_eq!(app.agent_session_id, Some(agent_id));
+        assert_eq!(app.selected_session_id, Some(shell_id));
         assert_eq!(app.focused_attach_session_id(), Some(shell_id));
+        assert!(!app.active_terminal_is_attached());
+    }
+
+    #[test]
+    fn agent_cockpit_refresh_marks_missing_terminal_pane_stale() {
+        let daemon = summary("daemon");
+        let daemon_id = daemon.session_id;
+        let mut agent = summary("agent");
+        agent.role = SessionRole::Agent;
+        let agent_id = agent.session_id;
+        let mut shell = summary("shell");
+        shell.role = SessionRole::Shell;
+        let shell_id = shell.session_id;
+        let mut app = AppModel::agent_cockpit(
+            UiId::new(),
+            agent.clone(),
+            vec![daemon.clone()],
+            Some(daemon_id),
+            BTreeMap::new(),
+            AgentTerminalPane::new(10, 40, true, false),
+            AgentCockpitLayout::Right,
+            MonitorProfile::Basic,
+        );
+        app.replace_workspace_sessions(vec![daemon.clone(), agent.clone(), shell]);
+        let agent_pane_id = app.active_pane_id.expect("active pane");
+        let shell_pane_id = app
+            .split_pane_with_view(
+                agent_pane_id,
+                UiPaneView::new(UiPaneViewKind::SessionTerminal, Some(shell_id)),
+            )
+            .expect("shell pane");
+        assert!(app.focus_pane_id(shell_pane_id));
+
+        app.replace_workspace_sessions(vec![daemon, agent]);
+
+        assert!(app
+            .panes
+            .iter()
+            .any(|pane| pane.id == shell_pane_id && pane.stale));
+        assert_ne!(app.active_pane_id, Some(shell_pane_id));
+        assert_eq!(app.focused_attach_session_id(), Some(agent_id));
+    }
+
+    #[test]
+    fn agent_cockpit_direct_daemon_refresh_marks_missing_monitor_pane_stale() {
+        let first_daemon = summary("daemon-one");
+        let first_daemon_id = first_daemon.session_id;
+        let second_daemon = summary("daemon-two");
+        let second_daemon_id = second_daemon.session_id;
+        let mut agent = summary("agent");
+        agent.role = SessionRole::Agent;
+        let mut app = AppModel::agent_cockpit(
+            UiId::new(),
+            agent,
+            vec![first_daemon.clone(), second_daemon.clone()],
+            Some(first_daemon_id),
+            BTreeMap::new(),
+            AgentTerminalPane::new(10, 40, true, false),
+            AgentCockpitLayout::Right,
+            MonitorProfile::Basic,
+        );
+        let agent_pane_id = app.active_pane_id.expect("active pane");
+        let second_monitor_pane_id = app
+            .split_pane_with_view(
+                agent_pane_id,
+                UiPaneView::new(UiPaneViewKind::DaemonMonitor, Some(second_daemon_id)),
+            )
+            .expect("second monitor pane");
+        assert!(app.focus_pane_id(second_monitor_pane_id));
+
+        app.replace_daemon_sessions(vec![first_daemon]);
+
+        assert!(app
+            .panes
+            .iter()
+            .any(|pane| pane.id == second_monitor_pane_id && pane.stale));
+        assert_ne!(app.active_pane_id, Some(second_monitor_pane_id));
+        assert!(app
+            .active_pane()
+            .is_some_and(|pane| !pane.stale && pane.view.session_id != Some(second_daemon_id)));
+    }
+
+    #[test]
+    fn agent_cockpit_mismatched_terminal_view_does_not_mutate_attached_terminal_state() {
+        let daemon = summary("daemon");
+        let daemon_id = daemon.session_id;
+        let mut agent = summary("agent");
+        agent.role = SessionRole::Agent;
+        let mut shell = summary("shell");
+        shell.role = SessionRole::Shell;
+        let shell_id = shell.session_id;
+        let mut app = AppModel::agent_cockpit(
+            UiId::new(),
+            agent.clone(),
+            vec![daemon.clone()],
+            Some(daemon_id),
+            BTreeMap::new(),
+            AgentTerminalPane::new(10, 40, true, false),
+            AgentCockpitLayout::Right,
+            MonitorProfile::Basic,
+        );
+        app.replace_workspace_sessions(vec![daemon, agent, shell]);
+        let pane_id = app.active_pane_id.expect("active pane");
+        assert!(app.assign_pane_view(
+            pane_id,
+            UiPaneView::new(UiPaneViewKind::SessionTerminal, Some(shell_id))
+        ));
+        assert!(app.agent_terminal_is_following());
+
+        app.enter_scroll_mode();
+        assert_eq!(
+            app.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE), 2),
+            KeyAction::ScrollUp
+        );
+
+        assert!(app.agent_terminal_is_following());
+        assert_eq!(app.status_message, "terminal not attached");
+
+        app.begin_search_mode();
+        assert_eq!(
+            app.handle_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE), 2),
+            KeyAction::SearchInput('x')
+        );
+        assert_eq!(app.status_message, "search: terminal not attached");
+        assert!(app
+            .agent_terminal
+            .as_ref()
+            .and_then(AgentTerminalPane::current_match)
+            .is_none());
+    }
+
+    #[test]
+    fn agent_cockpit_mismatched_terminal_exit_scroll_does_not_resume_attached_terminal() {
+        let daemon = summary("daemon");
+        let daemon_id = daemon.session_id;
+        let mut agent = summary("agent");
+        agent.role = SessionRole::Agent;
+        let mut shell = summary("shell");
+        shell.role = SessionRole::Shell;
+        let shell_id = shell.session_id;
+        let mut app = AppModel::agent_cockpit(
+            UiId::new(),
+            agent.clone(),
+            vec![daemon.clone()],
+            Some(daemon_id),
+            BTreeMap::new(),
+            AgentTerminalPane::new(10, 40, true, false),
+            AgentCockpitLayout::Right,
+            MonitorProfile::Basic,
+        );
+        app.replace_workspace_sessions(vec![daemon, agent, shell]);
+        app.set_agent_terminal_following(false);
+        let pane_id = app.active_pane_id.expect("active pane");
+        assert!(app.assign_pane_view(
+            pane_id,
+            UiPaneView::new(UiPaneViewKind::SessionTerminal, Some(shell_id))
+        ));
+
+        app.exit_scroll_mode();
+
+        assert!(!app.agent_terminal_is_following());
     }
 
     #[test]
