@@ -209,6 +209,8 @@ impl Pane {
             view: self.view.clone(),
             focused: self.focused,
             stale: self.stale,
+            read_only: false,
+            overlay_active: false,
         }
     }
 }

@@ -12,14 +12,17 @@ use std::{
 };
 
 use clap::Parser;
-use commands::{AttentionCommand, Cli, CliCommand};
+use commands::{
+    ApiCommand, AttentionCommand, Cli, CliCommand, ContextCommand, InputCommand, PaneCommand,
+    RoleCommand, ScrollbackCommand, SessionCommand, WorkspaceCommand,
+};
 use millrace_sessions_core::ids::SessionId;
 use millrace_sessions_core::paths::state_paths;
 use millrace_sessions_core::protocol::{
     EventStreamFrame, LogStreamFrame, SessionInspectRequest, SessionInspectResponse,
     SessionListRequest, SessionListResponse, SessionSelector, SessionSummary,
 };
-use millrace_sessions_core::state::ProcessState;
+use millrace_sessions_core::state::{ProcessState, SessionRole};
 use thiserror::Error;
 
 #[tokio::main]
@@ -41,6 +44,238 @@ async fn run() -> Result<(), MillmuxCliError> {
     }
 
     match cli.command {
+        CliCommand::Workspace(args) => match args.command {
+            WorkspaceCommand::Sessions(args) => {
+                let client = ready_client().await?;
+                let result = client.list(&args.request()).await?;
+                write_stdout(if args.json {
+                    output::render_json(&result)?
+                } else {
+                    output::render_list(&result)
+                })?;
+            }
+        },
+        CliCommand::Session(args) => match args.command {
+            SessionCommand::Start(args) => {
+                let client = ready_client().await?;
+                let result = client.start(&args.request()?).await?;
+                write_stdout(if args.json {
+                    output::render_json(&result)?
+                } else {
+                    output::render_start(&result)
+                })?;
+            }
+            SessionCommand::Attach(args) => {
+                let client = ready_client().await?;
+                attach::run_attach(&client, &args.request()?).await?;
+            }
+            SessionCommand::List(args) => {
+                let client = ready_client().await?;
+                let mut result = client.list(&args.request()).await?;
+                if !args.all {
+                    retain_active_sessions(&mut result);
+                }
+                write_stdout(if args.json {
+                    output::render_json(&result)?
+                } else {
+                    output::render_list(&result)
+                })?;
+            }
+            SessionCommand::Status(args) => {
+                let client = ready_client().await?;
+                if let Some(selector) = args.selector.optional()? {
+                    let result = inspect_preferred_status_session(&client, selector).await?;
+                    write_stdout(if args.json {
+                        output::render_json(&result)?
+                    } else {
+                        output::render_session_status(&result)
+                    })?;
+                } else {
+                    let result = client.host_status().await?;
+                    write_stdout(if args.json {
+                        output::render_json(&result)?
+                    } else {
+                        output::render_host_status(&result)
+                    })?;
+                }
+            }
+            SessionCommand::Inspect(args) => {
+                let client = ready_client().await?;
+                let result = client.inspect(&args.request()?).await?;
+                write_stdout(if args.json {
+                    output::render_json(&result)?
+                } else {
+                    output::render_inspect(&result)
+                })?;
+            }
+            SessionCommand::Screen(args) => {
+                let client = ready_client().await?;
+                let result = client.screen(&args.request()?).await?;
+                write_stdout(if args.json {
+                    output::render_json(&result)?
+                } else {
+                    output::render_screen(&result)
+                })?;
+            }
+            SessionCommand::Logs(args) => {
+                let client = ready_client().await?;
+                let result = client.logs(&args.request()?).await?;
+                write_stdout(if args.json {
+                    output::render_json(&result)?
+                } else {
+                    output::render_logs(&result)
+                })?;
+            }
+            SessionCommand::Events(args) => {
+                let client = ready_client().await?;
+                let result = client.events(&args.request()?).await?;
+                write_stdout(if args.json {
+                    output::render_json(&result)?
+                } else {
+                    output::render_events(&result)
+                })?;
+            }
+            SessionCommand::Send(args) => {
+                let client = ready_client().await?;
+                let result = client.send(&args.request()?).await?;
+                write_stdout(if args.json {
+                    output::render_json(&result)?
+                } else {
+                    output::render_send(&result)
+                })?;
+            }
+            SessionCommand::Resize(args) => {
+                let client = ready_client().await?;
+                let result = client.resize(&args.request()?).await?;
+                write_stdout(if args.json {
+                    output::render_json(&result)?
+                } else {
+                    output::render_resize(&result)
+                })?;
+            }
+            SessionCommand::Stop(args) => {
+                let client = ready_client().await?;
+                let result = client.stop(&args.request()?).await?;
+                write_stdout(if args.json {
+                    output::render_json(&result)?
+                } else {
+                    output::render_stop(&result)
+                })?;
+            }
+            SessionCommand::Kill(args) => {
+                let client = ready_client().await?;
+                let result = client.kill(&args.request()?).await?;
+                write_stdout(if args.json {
+                    output::render_json(&result)?
+                } else {
+                    output::render_kill(&result)
+                })?;
+            }
+            SessionCommand::Delete(args) => {
+                let client = ready_client().await?;
+                let result = client.delete(&args.request()?).await?;
+                write_stdout(if args.json {
+                    output::render_json(&result)?
+                } else {
+                    output::render_delete(&result)
+                })?;
+            }
+        },
+        CliCommand::Agent(args) => {
+            run_role_command(args, millrace_sessions_core::state::SessionRole::Agent).await?;
+        }
+        CliCommand::Shell(args) => {
+            run_role_command(args, millrace_sessions_core::state::SessionRole::Shell).await?;
+        }
+        CliCommand::Daemon(args) => {
+            run_role_command(
+                args,
+                millrace_sessions_core::state::SessionRole::MillraceDaemon,
+            )
+            .await?;
+        }
+        CliCommand::Pane(args) => match args.command {
+            PaneCommand::List(args) => {
+                let client = ready_client().await?;
+                let result = client.ui_context_get(&args.request()?).await?;
+                write_stdout(if args.json {
+                    output::render_json(&result)?
+                } else {
+                    output::render_pane_list(&result)
+                })?;
+            }
+        },
+        CliCommand::Input(args) => match args.command {
+            InputCommand::Send(args) => {
+                let client = ready_client().await?;
+                let result = client.input_send(&args.request()?).await?;
+                write_stdout(if args.json {
+                    output::render_json(&result)?
+                } else {
+                    output::render_input_send(&result)
+                })?;
+            }
+        },
+        CliCommand::Scrollback(args) => match args.command {
+            ScrollbackCommand::Show(args) => {
+                let client = ready_client().await?;
+                let result = client.screen(&args.request()?).await?;
+                write_stdout(if args.json {
+                    output::render_json(&result)?
+                } else {
+                    output::render_screen(&result)
+                })?;
+            }
+        },
+        CliCommand::EventsSubscribe(args) => {
+            let client = ready_client().await?;
+            let (result, mut reader) = client.events_subscribe(&args.request()?).await?.split();
+            write_stdout(if args.json {
+                output::render_json(&result)?
+            } else {
+                output::render_event_subscribe(&result)
+            })?;
+            while let Some(frame) = reader.next_frame().await? {
+                let closed = matches!(frame, EventStreamFrame::Closed);
+                write_stdout(if args.json {
+                    output::render_json(&frame)?
+                } else {
+                    output::render_event_stream_frame(&frame)
+                })?;
+                if closed {
+                    break;
+                }
+            }
+        }
+        CliCommand::Api(args) => match args.command {
+            ApiCommand::Capabilities(args) => {
+                let client = ready_client().await?;
+                let result = client.api_capabilities().await?;
+                write_stdout(if args.json {
+                    output::render_json(&result)?
+                } else {
+                    output::render_api_capabilities(&result)
+                })?;
+            }
+            ApiCommand::Identify(args) => {
+                let client = ready_client().await?;
+                let result = client.api_identify().await?;
+                write_stdout(if args.json {
+                    output::render_json(&result)?
+                } else {
+                    output::render_api_identify(&result)
+                })?;
+            }
+        },
+        CliCommand::Identify(args) => {
+            let client = ready_client().await?;
+            let result = client.api_identify().await?;
+            write_stdout(if args.json {
+                output::render_json(&result)?
+            } else {
+                output::render_api_identify(&result)
+            })?;
+        }
         CliCommand::Doctor(args) => {
             let request = args.request()?;
             let result = match client::SessionControlClient::new() {
@@ -269,20 +504,31 @@ async fn run() -> Result<(), MillmuxCliError> {
         }
         CliCommand::Context(args) => {
             let client = ready_client().await?;
-            if args.list {
-                let result = client.ui_context_list(&args.list_request()).await?;
-                write_stdout(if args.json {
-                    output::render_json(&result)?
-                } else {
-                    output::render_context_list(&result)
-                })?;
-            } else {
-                let result = client.ui_context_get(&args.get_request()?).await?;
-                write_stdout(if args.json {
-                    output::render_json(&result)?
-                } else {
-                    output::render_context(&result)
-                })?;
+            match args.command {
+                Some(ContextCommand::Export(export)) => {
+                    let result = client.ui_context_get(&export.get_request()?).await?;
+                    write_stdout(if export.json {
+                        output::render_json(&result)?
+                    } else {
+                        output::render_context(&result)
+                    })?;
+                }
+                None if args.list => {
+                    let result = client.ui_context_list(&args.list_request()).await?;
+                    write_stdout(if args.json {
+                        output::render_json(&result)?
+                    } else {
+                        output::render_context_list(&result)
+                    })?;
+                }
+                None => {
+                    let result = client.ui_context_get(&args.get_request()?).await?;
+                    write_stdout(if args.json {
+                        output::render_json(&result)?
+                    } else {
+                        output::render_context(&result)
+                    })?;
+                }
             }
         }
         CliCommand::Console(args) => {
@@ -320,7 +566,7 @@ async fn inspect_preferred_status_session(
         _ => selector,
     };
 
-    Ok(client.inspect(&SessionInspectRequest { selector }).await?)
+    Ok(client.status(&SessionInspectRequest { selector }).await?)
 }
 
 fn preferred_session_id(sessions: &[SessionSummary]) -> Option<SessionId> {
@@ -350,6 +596,34 @@ async fn ready_client() -> Result<client::SessionControlClient, MillmuxCliError>
     let client = client::SessionControlClient::new()?;
     client.ensure_host_ready().await?;
     Ok(client)
+}
+
+async fn run_role_command(
+    args: commands::RoleCommandArgs,
+    role: SessionRole,
+) -> Result<(), MillmuxCliError> {
+    match args.command {
+        RoleCommand::Start(args) => {
+            let client = ready_client().await?;
+            let request = commands::request_with_role(&args, role)?;
+            let result = client.start(&request).await?;
+            write_stdout(if args.json {
+                output::render_json(&result)?
+            } else {
+                output::render_start(&result)
+            })?;
+        }
+        RoleCommand::List(args) => {
+            let client = ready_client().await?;
+            let result = client.list(&args.request(role)).await?;
+            write_stdout(if args.json {
+                output::render_json(&result)?
+            } else {
+                output::render_list(&result)
+            })?;
+        }
+    }
+    Ok(())
 }
 
 fn write_stdout(output: String) -> Result<(), io::Error> {

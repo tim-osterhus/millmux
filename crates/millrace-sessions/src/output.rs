@@ -1,11 +1,12 @@
 use millrace_sessions_core::{
     protocol::{
-        AttentionListResponse, AttentionMutationResponse, DoctorResponse, EventStreamFrame,
-        HostStatusResponse, LogLine, LogStream, LogStreamFrame, ScreenFrame, SessionDeleteResponse,
-        SessionEventsResponse, SessionInspectResponse, SessionKillResponse, SessionListResponse,
-        SessionLogsResponse, SessionResizeResponse, SessionScreenResponse, SessionSendResponse,
-        SessionStartResponse, SessionStopResponse, SessionSummary, UiContextGetResponse,
-        UiContextListResponse,
+        ApiCapabilitiesResponse, ApiIdentifyResponse, AttentionListResponse,
+        AttentionMutationResponse, DoctorResponse, EventStreamFrame, EventSubscribeResponse,
+        HostStatusResponse, InputSendResponse, LogLine, LogStream, LogStreamFrame, ScreenFrame,
+        SessionDeleteResponse, SessionEventsResponse, SessionInspectResponse, SessionKillResponse,
+        SessionListResponse, SessionLogsResponse, SessionResizeResponse, SessionScreenResponse,
+        SessionSendResponse, SessionStartResponse, SessionStopResponse, SessionSummary,
+        UiContextGetResponse, UiContextListResponse,
     },
     state::{AttentionItem, AttentionState, ProcessState, SessionRole},
 };
@@ -126,6 +127,17 @@ pub fn render_events(result: &SessionEventsResponse) -> String {
     output
 }
 
+pub fn render_event_subscribe(result: &EventSubscribeResponse) -> String {
+    format!(
+        "events subscribed session={} cursor={} replay_limit={} queue_limit={} heartbeat_ms={}\n",
+        result.session_id,
+        result.cursor,
+        result.replay_limit,
+        result.subscriber_queue_limit,
+        result.heartbeat_ms
+    )
+}
+
 pub fn render_screen(result: &SessionScreenResponse) -> String {
     match &result.frame {
         ScreenFrame::ScreenSnapshot { snapshot } => {
@@ -170,8 +182,27 @@ pub fn render_log_line_text(line: &LogLine) -> String {
 
 pub fn render_event_stream_frame(frame: &EventStreamFrame) -> String {
     let mut output = String::new();
-    if let EventStreamFrame::Event { event } = frame {
-        push_event_line(&mut output, event);
+    match frame {
+        EventStreamFrame::Event { event, .. } => push_event_line(&mut output, event),
+        EventStreamFrame::Ack { cursor, .. } => {
+            output.push_str(&format!("events subscribed cursor={cursor}\n"));
+        }
+        EventStreamFrame::Heartbeat { cursor } => {
+            output.push_str(&format!("events heartbeat cursor={cursor}\n"));
+        }
+        EventStreamFrame::StreamLagged {
+            dropped_events,
+            cursor,
+            ..
+        } => {
+            output.push_str(&format!(
+                "events lagged dropped_events={dropped_events} cursor={cursor}\n"
+            ));
+        }
+        EventStreamFrame::Error { error } => {
+            output.push_str(&format!("events error {}\n", error));
+        }
+        EventStreamFrame::Closed => {}
     }
     output
 }
@@ -180,6 +211,13 @@ pub fn render_send(result: &SessionSendResponse) -> String {
     format!(
         "sent {} bytes to {}\n",
         result.bytes_sent, result.session_id
+    )
+}
+
+pub fn render_input_send(result: &InputSendResponse) -> String {
+    format!(
+        "sent {} bytes to {} routed_via_focus={}\n",
+        result.bytes_sent, result.session_id, result.routed_via_focus
     )
 }
 
@@ -292,6 +330,56 @@ pub fn render_context_list(result: &UiContextListResponse) -> String {
         ));
     }
     lines
+}
+
+pub fn render_pane_list(result: &UiContextGetResponse) -> String {
+    let mut output = String::new();
+    for pane in &result.context.panes {
+        output.push_str(&format!(
+            "{} title={} kind={} session={} focused={} stale={}\n",
+            pane.id,
+            pane.title,
+            json_string(&pane.view.kind),
+            pane.view
+                .session_id
+                .map(|session_id| session_id.to_string())
+                .unwrap_or_else(|| "-".to_string()),
+            pane.focused,
+            pane.stale
+        ));
+    }
+    if output.is_empty() {
+        output.push_str("no panes\n");
+    }
+    output
+}
+
+pub fn render_api_capabilities(result: &ApiCapabilitiesResponse) -> String {
+    let mut output = format!("millmux api {} stable capabilities\n", result.api_version);
+    for capability in &result.stable {
+        output.push_str(&format!(
+            "{} available={} methods={}\n",
+            capability.name,
+            capability.available,
+            capability.methods.join(",")
+        ));
+    }
+    for capability in &result.experimental {
+        output.push_str(&format!(
+            "{} experimental available={} reason={}\n",
+            capability.name,
+            capability.available,
+            capability.unavailable_reason.as_deref().unwrap_or("-")
+        ));
+    }
+    output
+}
+
+pub fn render_api_identify(result: &ApiIdentifyResponse) -> String {
+    format!(
+        "millmux api {} schema={} exposure={}\n",
+        result.api_version, result.schema, result.network_exposure
+    )
 }
 
 pub fn render_inspect(result: &SessionInspectResponse) -> String {
@@ -414,14 +502,7 @@ fn input_owner(session: &SessionSummary) -> &str {
 }
 
 fn role(value: &SessionRole) -> String {
-    match value {
-        SessionRole::Shell => "shell".to_string(),
-        SessionRole::MillraceDaemon => "millrace_daemon".to_string(),
-        SessionRole::Agent => "agent".to_string(),
-        SessionRole::Generic => "generic".to_string(),
-        SessionRole::Worker => "worker".to_string(),
-        SessionRole::Other(value) => value.clone(),
-    }
+    value.as_wire_value().to_string()
 }
 
 fn process_state(value: &ProcessState) -> String {

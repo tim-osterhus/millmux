@@ -6,7 +6,7 @@ use serde_json::Value;
 
 use crate::{
     events::SessionEvent,
-    ids::{SessionId, UiId},
+    ids::{PaneId, SessionId, UiId},
     state::{
         AttentionItem, AttentionKind, AttentionRollup, AttentionSeverity, AttentionSource,
         AttentionState, AttentionTargetType, HostMeta, MonitorProfile, ProcessState,
@@ -18,6 +18,8 @@ use crate::{
 
 pub const M1_PROTOCOL_VERSION: u32 = 1;
 pub const M2_ATTACH_PROTOCOL_VERSION: u32 = 2;
+pub const V04_API_VERSION: &str = "0.4";
+pub const V04_API_SCHEMA: &str = "millmux.api.v0.4";
 pub const SESSION_CAPABILITIES_SCHEMA_VERSION: u32 = 1;
 pub const SESSION_ARTIFACTS_SCHEMA_VERSION: u32 = 1;
 pub const SCREEN_SNAPSHOT_SCHEMA_VERSION: u32 = 1;
@@ -36,6 +38,8 @@ pub enum ControlMethod {
     SessionAttach,
     #[serde(rename = "session.list")]
     SessionList,
+    #[serde(rename = "session.status")]
+    SessionStatus,
     #[serde(rename = "session.inspect")]
     SessionInspect,
     #[serde(rename = "session.screen")]
@@ -54,6 +58,10 @@ pub enum ControlMethod {
     SessionKill,
     #[serde(rename = "session.delete")]
     SessionDelete,
+    #[serde(rename = "input.send")]
+    InputSend,
+    #[serde(rename = "events.subscribe")]
+    EventsSubscribe,
     #[serde(rename = "attention.list")]
     AttentionList,
     #[serde(rename = "attention.mark")]
@@ -70,11 +78,17 @@ pub enum ControlMethod {
     UiContextList,
     #[serde(rename = "ui.context.close")]
     UiContextClose,
+    #[serde(rename = "api.capabilities")]
+    ApiCapabilities,
+    #[serde(rename = "api.identify")]
+    ApiIdentify,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ControlRequest {
     pub id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
     pub method: ControlMethod,
     #[serde(default = "empty_params")]
     pub params: Value,
@@ -84,6 +98,7 @@ impl ControlRequest {
     pub fn new(id: impl Into<String>, method: ControlMethod) -> Self {
         Self {
             id: id.into(),
+            version: None,
             method,
             params: empty_params(),
         }
@@ -99,9 +114,30 @@ impl ControlRequest {
     {
         Ok(Self {
             id: id.into(),
+            version: None,
             method,
             params: serde_json::to_value(params)?,
         })
+    }
+
+    pub fn v04_with_params<T>(
+        id: impl Into<String>,
+        method: ControlMethod,
+        params: &T,
+    ) -> serde_json::Result<Self>
+    where
+        T: Serialize,
+    {
+        Ok(Self {
+            id: id.into(),
+            version: Some(V04_API_VERSION.to_string()),
+            method,
+            params: serde_json::to_value(params)?,
+        })
+    }
+
+    pub fn is_v04(&self) -> bool {
+        self.version.as_deref() == Some(V04_API_VERSION)
     }
 
     pub fn params_as<T>(&self) -> serde_json::Result<T>
@@ -124,6 +160,10 @@ impl ControlRequest {
 pub struct ControlResponse {
     pub id: String,
     pub ok: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub schema: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub method: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub result: Option<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -138,6 +178,26 @@ impl ControlResponse {
         Ok(Self {
             id: id.into(),
             ok: true,
+            schema: None,
+            method: None,
+            result: Some(serde_json::to_value(result)?),
+            error: None,
+        })
+    }
+
+    pub fn success_v04<T>(
+        id: impl Into<String>,
+        method: ControlMethod,
+        result: &T,
+    ) -> serde_json::Result<Self>
+    where
+        T: Serialize,
+    {
+        Ok(Self {
+            id: id.into(),
+            ok: true,
+            schema: Some(V04_API_SCHEMA.to_string()),
+            method: Some(control_method_wire_name(method)),
             result: Some(serde_json::to_value(result)?),
             error: None,
         })
@@ -147,6 +207,8 @@ impl ControlResponse {
         Self {
             id: id.into(),
             ok: true,
+            schema: None,
+            method: None,
             result: Some(empty_params()),
             error: None,
         }
@@ -156,9 +218,45 @@ impl ControlResponse {
         Self {
             id: id.into(),
             ok: false,
+            schema: None,
+            method: None,
             result: None,
             error: Some(error),
         }
+    }
+
+    pub fn failure_v04(
+        id: impl Into<String>,
+        method: ControlMethod,
+        mut error: ControlErrorBody,
+    ) -> Self {
+        if error.details.is_none() {
+            error.details = Some(empty_params());
+        }
+        Self {
+            id: id.into(),
+            ok: false,
+            schema: Some(V04_API_SCHEMA.to_string()),
+            method: Some(control_method_wire_name(method)),
+            result: None,
+            error: Some(error.with_retryable(false)),
+        }
+    }
+
+    pub fn into_v04(self, method: ControlMethod) -> Self {
+        self.into_v04_method(control_method_wire_name(method))
+    }
+
+    pub fn into_v04_method(mut self, method: impl Into<String>) -> Self {
+        self.schema = Some(V04_API_SCHEMA.to_string());
+        self.method = Some(method.into());
+        if let Some(mut error) = self.error.take() {
+            if error.details.is_none() {
+                error.details = Some(empty_params());
+            }
+            self.error = Some(error.with_retryable(false));
+        }
+        self
     }
 
     pub fn result_as<T>(&self) -> serde_json::Result<T>
@@ -177,11 +275,19 @@ impl ControlResponse {
     }
 }
 
+fn control_method_wire_name(method: ControlMethod) -> String {
+    serde_json::to_value(method)
+        .ok()
+        .and_then(|value| value.as_str().map(str::to_string))
+        .unwrap_or_else(|| "unknown".to_string())
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ControlErrorCode {
     HostUnavailable,
     InvalidRequest,
+    InvalidRole,
     UnknownMethod,
     SessionNotFound,
     SessionNotRunning,
@@ -191,6 +297,7 @@ pub enum ControlErrorCode {
     CommandNotFound,
     UnsafeDeleteRunning,
     InputOwnerConflict,
+    EventCursorExpired,
     PermissionError,
     IoError,
     WorkerUnavailable,
@@ -205,6 +312,8 @@ pub enum ControlErrorCode {
 pub struct ControlErrorBody {
     pub code: ControlErrorCode,
     pub message: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retryable: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub details: Option<Value>,
 }
@@ -214,8 +323,14 @@ impl ControlErrorBody {
         Self {
             code,
             message: message.into(),
+            retryable: None,
             details: None,
         }
+    }
+
+    pub fn with_retryable(mut self, retryable: bool) -> Self {
+        self.retryable = Some(retryable);
+        self
     }
 
     pub fn with_details(mut self, details: Value) -> Self {
@@ -601,9 +716,54 @@ pub struct SessionEventsRequest {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EventSubscribeRequest {
+    pub selector: SessionSelector,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cursor: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replay_limit: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub heartbeat_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subscriber_queue_limit: Option<usize>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionSendRequest {
     pub selector: SessionSelector,
     pub text: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InputSendRequest {
+    pub target: InputTarget,
+    pub text: String,
+    #[serde(default = "default_require_focus")]
+    pub require_focus: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner: Option<String>,
+}
+
+impl InputSendRequest {
+    pub fn session(selector: SessionSelector, text: impl Into<String>) -> Self {
+        Self {
+            target: InputTarget::Session { selector },
+            text: text.into(),
+            require_focus: false,
+            owner: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum InputTarget {
+    Session { selector: SessionSelector },
+    Pane { ui_id: UiId, pane_id: PaneId },
+}
+
+fn default_require_focus() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -713,6 +873,55 @@ pub struct HostStatusResponse {
     pub protocol_version: u32,
     pub host: Option<HostMeta>,
     pub session_count: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ApiIdentifyResponse {
+    pub schema_version: u32,
+    pub api_version: String,
+    pub schema: String,
+    pub socket_envelope: ApiEnvelopeDescription,
+    pub stable_command_groups: Vec<String>,
+    pub experimental_command_groups: Vec<String>,
+    pub network_exposure: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ApiEnvelopeDescription {
+    pub request: String,
+    pub success_response: String,
+    pub error_response: String,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ApiCapabilitiesRequest {}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ApiIdentifyRequest {}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ApiCapabilitiesResponse {
+    pub schema_version: u32,
+    pub api_version: String,
+    pub stable: Vec<ApiCapability>,
+    pub experimental: Vec<ApiCapability>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ApiCapability {
+    pub name: String,
+    pub methods: Vec<String>,
+    pub available: bool,
+    pub stability: ApiStability,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unavailable_reason: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ApiStability {
+    Stable,
+    Experimental,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -1281,11 +1490,57 @@ pub struct SessionEventsResponse {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EventSubscribeResponse {
+    pub schema_version: u32,
+    pub protocol_version: u32,
+    pub session_id: SessionId,
+    pub stream: StreamSetup,
+    pub cursor: String,
+    pub replay_limit: usize,
+    pub subscriber_queue_limit: usize,
+    pub heartbeat_ms: u64,
+    pub contract: EventSubscriptionContract,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EventSubscriptionContract {
+    pub ack_frame: String,
+    pub event_frame: String,
+    pub terminal_error_frame: String,
+    pub heartbeat_frame: String,
+    pub lag_frame: String,
+    pub cursor_expired_error: ControlErrorCode,
+}
+
+impl Default for EventSubscriptionContract {
+    fn default() -> Self {
+        Self {
+            ack_frame: "ack".to_string(),
+            event_frame: "event".to_string(),
+            terminal_error_frame: "error".to_string(),
+            heartbeat_frame: "heartbeat".to_string(),
+            lag_frame: "stream_lagged".to_string(),
+            cursor_expired_error: ControlErrorCode::EventCursorExpired,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionSendResponse {
     pub schema_version: u32,
     pub protocol_version: u32,
     pub session_id: SessionId,
     pub bytes_sent: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InputSendResponse {
+    pub schema_version: u32,
+    pub protocol_version: u32,
+    pub session_id: SessionId,
+    pub target: InputTarget,
+    pub bytes_sent: usize,
+    pub routed_via_focus: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1551,10 +1806,31 @@ impl LogStreamFrame {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum EventStreamFrame {
-    Event { event: SessionEvent },
+    Ack {
+        cursor: String,
+        replayed: usize,
+        subscriber_queue_limit: usize,
+        heartbeat_ms: u64,
+    },
+    Event {
+        cursor: String,
+        event: SessionEvent,
+    },
+    Heartbeat {
+        cursor: String,
+    },
+    StreamLagged {
+        dropped_events: u64,
+        cursor: String,
+        reason: EventStreamLagReason,
+        recover: String,
+    },
+    Error {
+        error: ControlErrorBody,
+    },
     Closed,
 }
 
@@ -1566,6 +1842,12 @@ impl EventStreamFrame {
     pub fn from_json_line(line: &str) -> serde_json::Result<Self> {
         serde_json::from_str(line)
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EventStreamLagReason {
+    SubscriberBackpressure,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -1920,6 +2202,7 @@ mod tests {
             (ControlMethod::SessionStart, "session.start"),
             (ControlMethod::SessionAttach, "session.attach"),
             (ControlMethod::SessionList, "session.list"),
+            (ControlMethod::SessionStatus, "session.status"),
             (ControlMethod::SessionInspect, "session.inspect"),
             (ControlMethod::SessionScreen, "session.screen"),
             (ControlMethod::SessionLogs, "session.logs"),
@@ -1929,6 +2212,8 @@ mod tests {
             (ControlMethod::SessionStop, "session.stop"),
             (ControlMethod::SessionKill, "session.kill"),
             (ControlMethod::SessionDelete, "session.delete"),
+            (ControlMethod::InputSend, "input.send"),
+            (ControlMethod::EventsSubscribe, "events.subscribe"),
             (ControlMethod::AttentionList, "attention.list"),
             (ControlMethod::AttentionMark, "attention.mark"),
             (ControlMethod::AttentionRead, "attention.read"),
@@ -1937,6 +2222,8 @@ mod tests {
             (ControlMethod::UiContextSet, "ui.context.set"),
             (ControlMethod::UiContextList, "ui.context.list"),
             (ControlMethod::UiContextClose, "ui.context.close"),
+            (ControlMethod::ApiCapabilities, "api.capabilities"),
+            (ControlMethod::ApiIdentify, "api.identify"),
         ];
 
         for (method, wire_name) in cases {
@@ -1956,6 +2243,7 @@ mod tests {
         let cases = [
             (ControlErrorCode::HostUnavailable, "host_unavailable"),
             (ControlErrorCode::InvalidRequest, "invalid_request"),
+            (ControlErrorCode::InvalidRole, "invalid_role"),
             (ControlErrorCode::UnknownMethod, "unknown_method"),
             (ControlErrorCode::SessionNotFound, "session_not_found"),
             (ControlErrorCode::SessionNotRunning, "session_not_running"),
@@ -1974,6 +2262,7 @@ mod tests {
                 "unsafe_delete_running",
             ),
             (ControlErrorCode::InputOwnerConflict, "input_owner_conflict"),
+            (ControlErrorCode::EventCursorExpired, "event_cursor_expired"),
             (ControlErrorCode::PermissionError, "permission_error"),
             (ControlErrorCode::IoError, "io_error"),
             (ControlErrorCode::WorkerUnavailable, "worker_unavailable"),
@@ -2060,5 +2349,130 @@ mod tests {
                 }
             })
         );
+    }
+
+    #[test]
+    fn v04_envelope_uses_version_schema_method_and_retryable_error_details() {
+        let request = ControlRequest::v04_with_params(
+            "req_v04",
+            ControlMethod::ApiCapabilities,
+            &ApiCapabilitiesRequest::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            serde_json::from_str::<Value>(&request.to_json_line().unwrap()).unwrap(),
+            json!({
+                "id": "req_v04",
+                "version": "0.4",
+                "method": "api.capabilities",
+                "params": {}
+            })
+        );
+
+        let success = ControlResponse::success_v04(
+            "req_v04",
+            ControlMethod::ApiCapabilities,
+            &json!({"ready": true}),
+        )
+        .unwrap();
+        assert_eq!(
+            serde_json::from_str::<Value>(&success.to_json_line().unwrap()).unwrap(),
+            json!({
+                "id": "req_v04",
+                "ok": true,
+                "schema": "millmux.api.v0.4",
+                "method": "api.capabilities",
+                "result": {"ready": true}
+            })
+        );
+
+        let failure = ControlResponse::failure_v04(
+            "req_v04",
+            ControlMethod::ApiCapabilities,
+            ControlErrorBody::new(ControlErrorCode::InvalidRole, "invalid role"),
+        );
+        assert_eq!(
+            serde_json::from_str::<Value>(&failure.to_json_line().unwrap()).unwrap(),
+            json!({
+                "id": "req_v04",
+                "ok": false,
+                "schema": "millmux.api.v0.4",
+                "method": "api.capabilities",
+                "error": {
+                    "code": "invalid_role",
+                    "message": "invalid role",
+                    "retryable": false,
+                    "details": {}
+                }
+            })
+        );
+    }
+
+    #[test]
+    fn event_subscription_frames_cover_ack_heartbeat_lag_error_and_close() {
+        let error = ControlErrorBody::new(ControlErrorCode::EventCursorExpired, "cursor expired")
+            .with_retryable(false);
+        let frames = [
+            EventStreamFrame::Ack {
+                cursor: "events:s:0".to_string(),
+                replayed: 0,
+                subscriber_queue_limit: 8,
+                heartbeat_ms: 100,
+            },
+            EventStreamFrame::Event {
+                cursor: "events:s:1".to_string(),
+                event: SessionEvent::new(
+                    crate::ids::SessionId::new(),
+                    crate::events::SessionEventKind::ProcessStarted,
+                ),
+            },
+            EventStreamFrame::Heartbeat {
+                cursor: "events:s:1".to_string(),
+            },
+            EventStreamFrame::StreamLagged {
+                dropped_events: 3,
+                cursor: "events:s:4".to_string(),
+                reason: EventStreamLagReason::SubscriberBackpressure,
+                recover: "resubscribe_with_latest_cursor".to_string(),
+            },
+            EventStreamFrame::Error { error },
+            EventStreamFrame::Closed,
+        ];
+
+        let types = frames
+            .iter()
+            .map(|frame| {
+                serde_json::from_str::<Value>(&frame.to_json_line().unwrap()).unwrap()["type"]
+                    .as_str()
+                    .unwrap()
+                    .to_string()
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            types,
+            vec![
+                "ack",
+                "event",
+                "heartbeat",
+                "stream_lagged",
+                "error",
+                "closed"
+            ]
+        );
+    }
+
+    #[test]
+    fn input_send_defaults_pane_focus_requirement() {
+        let request: InputSendRequest = serde_json::from_value(json!({
+            "target": {
+                "type": "session",
+                "selector": {"type": "name", "name": "agent"}
+            },
+            "text": "hello"
+        }))
+        .unwrap();
+
+        assert!(request.require_focus);
     }
 }

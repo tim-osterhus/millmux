@@ -2,16 +2,16 @@ use std::{env, path::PathBuf, str::FromStr};
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use millrace_sessions_core::{
-    ids::{SessionId, UiId},
+    ids::{PaneId, SessionId, UiId},
     paths::UI_ID_ENV,
     protocol::{
         AttachFrameType, AttachInitialReplay, AttachReplayMode, AttachStreamEncoding,
         AttentionClearRequest, AttentionListRequest, AttentionMarkRequest, AttentionReadRequest,
-        DoctorRepairMode, DoctorRequest, SessionAttachRequest, SessionDeleteRequest,
-        SessionEventsRequest, SessionInspectRequest, SessionKillRequest, SessionListRequest,
-        SessionLogsRequest, SessionResizeRequest, SessionScreenRequest, SessionSelector,
-        SessionSendRequest, SessionStartRequest, SessionStopRequest, UiContextGetRequest,
-        UiContextListRequest, M2_ATTACH_PROTOCOL_VERSION,
+        DoctorRepairMode, DoctorRequest, EventSubscribeRequest, InputSendRequest, InputTarget,
+        SessionAttachRequest, SessionDeleteRequest, SessionEventsRequest, SessionInspectRequest,
+        SessionKillRequest, SessionListRequest, SessionLogsRequest, SessionResizeRequest,
+        SessionScreenRequest, SessionSelector, SessionSendRequest, SessionStartRequest,
+        SessionStopRequest, UiContextGetRequest, UiContextListRequest, M2_ATTACH_PROTOCOL_VERSION,
     },
     state::{
         AttentionKind, AttentionSeverity, AttentionSource, AttentionTargetType, MonitorProfile,
@@ -32,6 +32,13 @@ pub struct Cli {
 
 #[derive(Debug, Subcommand)]
 pub enum CliCommand {
+    Workspace(WorkspaceArgs),
+    Session(SessionArgs),
+    Agent(RoleCommandArgs),
+    Shell(RoleCommandArgs),
+    Daemon(RoleCommandArgs),
+    Pane(PaneArgs),
+    Input(InputArgs),
     Start(StartArgs),
     Attach(AttachArgs),
     List(ListArgs),
@@ -40,12 +47,17 @@ pub enum CliCommand {
     Screen(ScreenArgs),
     Logs(LogsArgs),
     Events(EventsArgs),
+    #[command(name = "events-subscribe")]
+    EventsSubscribe(EventsSubscribeArgs),
     Send(SendArgs),
+    Scrollback(ScrollbackArgs),
     Resize(ResizeArgs),
     Stop(StopArgs),
     Kill(KillArgs),
     Delete(DeleteArgs),
     Attention(AttentionArgs),
+    Api(ApiArgs),
+    Identify(IdentifyArgs),
     Context(ContextArgs),
     Console(ConsoleArgs),
     Cockpit(CockpitArgs),
@@ -55,7 +67,14 @@ pub enum CliCommand {
 impl CliCommand {
     pub fn unsupported_name(&self) -> Option<&'static str> {
         match self {
-            Self::Start(_)
+            Self::Workspace(_)
+            | Self::Session(_)
+            | Self::Agent(_)
+            | Self::Shell(_)
+            | Self::Daemon(_)
+            | Self::Pane(_)
+            | Self::Input(_)
+            | Self::Start(_)
             | Self::List(_)
             | Self::Status(_)
             | Self::Inspect(_)
@@ -63,12 +82,16 @@ impl CliCommand {
             | Self::Attach(_)
             | Self::Logs(_)
             | Self::Events(_)
+            | Self::EventsSubscribe(_)
             | Self::Send(_)
+            | Self::Scrollback(_)
             | Self::Resize(_)
             | Self::Stop(_)
             | Self::Kill(_)
             | Self::Delete(_)
             | Self::Attention(_)
+            | Self::Api(_)
+            | Self::Identify(_)
             | Self::Context(_)
             | Self::Console(_)
             | Self::Cockpit(_)
@@ -225,6 +248,188 @@ fn accepted_attach_frame_types(
 }
 
 #[derive(Debug, Args)]
+pub struct WorkspaceArgs {
+    #[command(subcommand)]
+    pub command: WorkspaceCommand,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum WorkspaceCommand {
+    Sessions(WorkspaceSessionsArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct WorkspaceSessionsArgs {
+    #[arg(long)]
+    pub workspace: PathBuf,
+    #[arg(long)]
+    pub json: bool,
+    #[arg(long)]
+    pub include_archived: bool,
+}
+
+impl WorkspaceSessionsArgs {
+    pub fn request(&self) -> SessionListRequest {
+        SessionListRequest {
+            role: None,
+            workspace: Some(self.workspace.clone()),
+            include_archived: self.include_archived,
+        }
+    }
+}
+
+#[derive(Debug, Args)]
+pub struct SessionArgs {
+    #[command(subcommand)]
+    pub command: SessionCommand,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum SessionCommand {
+    Start(StartArgs),
+    Attach(AttachArgs),
+    List(ListArgs),
+    Status(StatusArgs),
+    Inspect(InspectArgs),
+    Screen(ScreenArgs),
+    Logs(LogsArgs),
+    Events(EventsArgs),
+    Send(SendArgs),
+    Resize(ResizeArgs),
+    Stop(StopArgs),
+    Kill(KillArgs),
+    Delete(DeleteArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct RoleCommandArgs {
+    #[command(subcommand)]
+    pub command: RoleCommand,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum RoleCommand {
+    Start(StartArgs),
+    List(RoleListArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct RoleListArgs {
+    #[arg(long)]
+    pub workspace: Option<PathBuf>,
+    #[arg(long)]
+    pub include_archived: bool,
+    #[arg(long)]
+    pub json: bool,
+}
+
+impl RoleListArgs {
+    pub fn request(&self, role: SessionRole) -> SessionListRequest {
+        SessionListRequest {
+            role: Some(role),
+            workspace: self.workspace.clone(),
+            include_archived: self.include_archived,
+        }
+    }
+}
+
+pub fn request_with_role(
+    args: &StartArgs,
+    role: SessionRole,
+) -> Result<SessionStartRequest, CommandError> {
+    let mut request = args.request()?;
+    request.role = Some(role);
+    Ok(request)
+}
+
+#[derive(Debug, Args)]
+pub struct PaneArgs {
+    #[command(subcommand)]
+    pub command: PaneCommand,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum PaneCommand {
+    List(PaneListArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct PaneListArgs {
+    #[arg(long)]
+    pub ui: Option<String>,
+    #[arg(long)]
+    pub json: bool,
+}
+
+impl PaneListArgs {
+    pub fn request(&self) -> Result<UiContextGetRequest, CommandError> {
+        Ok(UiContextGetRequest {
+            ui_id: self.ui.as_deref().map(parse_ui_id).transpose()?,
+        })
+    }
+}
+
+#[derive(Debug, Args)]
+pub struct InputArgs {
+    #[command(subcommand)]
+    pub command: InputCommand,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum InputCommand {
+    Send(InputSendArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct InputSendArgs {
+    #[command(flatten)]
+    pub selector: SelectorArgs,
+    #[arg(long)]
+    pub pane: Option<String>,
+    #[arg(long)]
+    pub ui: Option<String>,
+    #[arg(long)]
+    pub text: String,
+    #[arg(long, default_value_t = true)]
+    pub require_focus: bool,
+    #[arg(long)]
+    pub owner: Option<String>,
+    #[arg(long)]
+    pub json: bool,
+}
+
+impl InputSendArgs {
+    pub fn request(&self) -> Result<InputSendRequest, CommandError> {
+        if self.selector.selector.is_some() && self.pane.is_some() {
+            return Err(CommandError::InvalidInputTarget(
+                "use either a session selector or --ui UI --pane PANE".to_string(),
+            ));
+        }
+        let target = if let Some(pane) = &self.pane {
+            let ui = self
+                .ui
+                .as_deref()
+                .ok_or_else(|| {
+                    CommandError::InvalidInputTarget("pane targets require --ui UI".to_string())
+                })
+                .and_then(parse_ui_id)?;
+            let pane_id = parse_pane_id(pane)?;
+            InputTarget::Pane { ui_id: ui, pane_id }
+        } else {
+            InputTarget::Session {
+                selector: self.selector.required()?,
+            }
+        };
+        Ok(InputSendRequest {
+            target,
+            text: self.text.clone(),
+            require_focus: self.require_focus,
+            owner: self.owner.clone(),
+        })
+    }
+}
+
+#[derive(Debug, Args)]
 pub struct ListArgs {
     #[arg(long)]
     pub json: bool,
@@ -323,6 +528,34 @@ pub struct EventsArgs {
     pub json: bool,
 }
 
+#[derive(Debug, Args)]
+pub struct EventsSubscribeArgs {
+    #[command(flatten)]
+    pub selector: SelectorArgs,
+    #[arg(long)]
+    pub cursor: Option<String>,
+    #[arg(long)]
+    pub replay_limit: Option<usize>,
+    #[arg(long)]
+    pub heartbeat_ms: Option<u64>,
+    #[arg(long)]
+    pub subscriber_queue_limit: Option<usize>,
+    #[arg(long)]
+    pub json: bool,
+}
+
+impl EventsSubscribeArgs {
+    pub fn request(&self) -> Result<EventSubscribeRequest, CommandError> {
+        Ok(EventSubscribeRequest {
+            selector: self.selector.required()?,
+            cursor: self.cursor.clone(),
+            replay_limit: self.replay_limit,
+            heartbeat_ms: self.heartbeat_ms,
+            subscriber_queue_limit: self.subscriber_queue_limit,
+        })
+    }
+}
+
 impl EventsArgs {
     pub fn request(&self) -> Result<SessionEventsRequest, CommandError> {
         Ok(SessionEventsRequest {
@@ -333,11 +566,63 @@ impl EventsArgs {
 }
 
 #[derive(Debug, Args)]
+pub struct ScrollbackArgs {
+    #[command(subcommand)]
+    pub command: ScrollbackCommand,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum ScrollbackCommand {
+    Show(ScrollbackShowArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct ScrollbackShowArgs {
+    #[command(flatten)]
+    pub selector: SelectorArgs,
+    #[arg(long)]
+    pub json: bool,
+}
+
+impl ScrollbackShowArgs {
+    pub fn request(&self) -> Result<SessionScreenRequest, CommandError> {
+        Ok(SessionScreenRequest {
+            selector: self.selector.required()?,
+            requested_terminal_size: None,
+        })
+    }
+}
+
+#[derive(Debug, Args)]
 pub struct SendArgs {
     #[command(flatten)]
     pub selector: SelectorArgs,
     #[arg(long)]
     pub text: String,
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct ApiArgs {
+    #[command(subcommand)]
+    pub command: ApiCommand,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum ApiCommand {
+    Capabilities(ApiOutputArgs),
+    Identify(ApiOutputArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct ApiOutputArgs {
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct IdentifyArgs {
     #[arg(long)]
     pub json: bool,
 }
@@ -576,12 +861,35 @@ impl DoctorArgs {
 
 #[derive(Debug, Args)]
 pub struct ContextArgs {
+    #[command(subcommand)]
+    pub command: Option<ContextCommand>,
     #[arg(long)]
     pub json: bool,
     #[arg(long, conflicts_with = "list")]
     pub ui: Option<String>,
     #[arg(long)]
     pub list: bool,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum ContextCommand {
+    Export(ContextExportArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct ContextExportArgs {
+    #[arg(long)]
+    pub json: bool,
+    #[arg(long)]
+    pub ui: Option<String>,
+}
+
+impl ContextExportArgs {
+    pub fn get_request(&self) -> Result<UiContextGetRequest, CommandError> {
+        Ok(UiContextGetRequest {
+            ui_id: self.ui.as_deref().map(parse_ui_id).transpose()?,
+        })
+    }
 }
 
 impl ContextArgs {
@@ -740,6 +1048,10 @@ pub enum CommandError {
     MissingMillraceDaemonWorkspace,
     #[error("invalid session selector: {0}")]
     InvalidSelector(String),
+    #[error("invalid input target: {0}")]
+    InvalidInputTarget(String),
+    #[error("invalid pane id: {0}")]
+    InvalidPaneId(String),
     #[error("invalid role: {0}")]
     InvalidRole(String),
     #[error("invalid doctor repair mode: {0}")]
@@ -776,19 +1088,7 @@ fn selector_from_value(value: &str) -> SessionSelector {
 }
 
 pub fn parse_role(value: &str) -> Result<SessionRole, CommandError> {
-    let normalized = value.trim().to_ascii_lowercase().replace('-', "_");
-    if normalized.is_empty() {
-        return Err(CommandError::InvalidRole(value.to_string()));
-    }
-
-    Ok(match normalized.as_str() {
-        "shell" => SessionRole::Shell,
-        "millrace_daemon" => SessionRole::MillraceDaemon,
-        "agent" => SessionRole::Agent,
-        "generic" => SessionRole::Generic,
-        "worker" => SessionRole::Worker,
-        other => SessionRole::Other(other.to_string()),
-    })
+    SessionRole::from_cli_value(value).map_err(|_| CommandError::InvalidRole(value.to_string()))
 }
 
 fn parse_doctor_repair(value: &str) -> Result<DoctorRepairMode, CommandError> {
@@ -804,6 +1104,13 @@ fn parse_ui_id(value: &str) -> Result<UiId, CommandError> {
         .trim()
         .parse()
         .map_err(|_| CommandError::InvalidUiId(value.to_string()))
+}
+
+fn parse_pane_id(value: &str) -> Result<PaneId, CommandError> {
+    value
+        .trim()
+        .parse()
+        .map_err(|_| CommandError::InvalidPaneId(value.to_string()))
 }
 
 fn parse_monitor_profile(value: &str) -> Result<MonitorProfile, CommandError> {
@@ -936,14 +1243,14 @@ mod tests {
     #[test]
     fn commands_parse_start_argv_after_dash() {
         let cli = Cli::try_parse_from([
-            "millmux", "start", "--name", "build", "--role", "worker", "--", "cargo", "test",
+            "millmux", "start", "--name", "build", "--role", "generic", "--", "cargo", "test",
         ])
         .unwrap();
 
         match cli.command {
             CliCommand::Start(args) => {
                 assert_eq!(args.name.as_deref(), Some("build"));
-                assert_eq!(args.role, Some(SessionRole::Worker));
+                assert_eq!(args.role, Some(SessionRole::Generic));
                 assert_eq!(args.argv, ["cargo", "test"]);
             }
             other => panic!("unexpected command: {other:?}"),
@@ -1050,7 +1357,7 @@ mod tests {
             "--workspace",
             "/tmp/work",
             "--role",
-            "worker",
+            "generic",
             "--rows",
             "24",
             "--cols",
@@ -1063,7 +1370,7 @@ mod tests {
             CliCommand::Resize(args) => match args.selector.required().unwrap() {
                 SessionSelector::WorkspaceRole { workspace, role } => {
                     assert_eq!(workspace, PathBuf::from("/tmp/work"));
-                    assert_eq!(role, SessionRole::Worker);
+                    assert_eq!(role, SessionRole::Generic);
                 }
                 other => panic!("unexpected selector: {other:?}"),
             },

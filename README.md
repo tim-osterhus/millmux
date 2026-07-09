@@ -49,7 +49,7 @@ client detaches; it does not stop the hosted process.
 Inspect a long-running command:
 
 ```bash
-millmux start --name tests --role worker -- cargo test --workspace
+millmux start --name tests --role generic -- cargo test --workspace
 millmux logs tests --tail 80
 millmux status tests --json
 ```
@@ -92,6 +92,7 @@ active PTY input owner.
 | `millmux screen` | Structured one-shot screen reads for agents and scripts. | Returns `screen_snapshot` or explicit `snapshot_unavailable` metadata; text output is derived from structured state. |
 | Console | Millrace daemon monitor and control TUI. | Shows daemon context but does not become Millrace runtime truth. |
 | Agent Cockpit | Operator preview/control surface for an agent PTY beside a daemon monitor. | Text-oriented control surface, not a byte-exact terminal path. |
+| v0.4 control API | Local JSONL protocol for scripted control and cockpit support. | Uses explicit request ids, versioned envelopes, local Unix sockets, and capability discovery; no network socket is exposed. |
 | Doctor | Local state, socket, worker, child, artifact, and UI-context diagnostics. | Repairs are explicit and preserve logs by default. |
 
 ## Session Truth
@@ -165,6 +166,16 @@ do not keep stale owner values.
 | --- | --- |
 | `millmux start -- ...` | Start an explicit argv in a durable PTY session. |
 | `millmux start --spawn-mode pipe -- ...` | Start an explicit argv without a PTY; capture stdout/stderr separately. |
+| `millmux workspace sessions --json` | List sessions through the v0.4 workspace command group. |
+| `millmux session list --json` | Grouped alias for session list; other grouped session subcommands cover start, attach, status, inspect, screen, logs, events, send, resize, stop, kill, and delete. |
+| `millmux agent start -- ...` | Start a `millrace_agent` session; `agent list`, `shell list`, and `daemon list` are role-filtered aliases. |
+| `millmux pane list --json` | Read panes from persisted UI context records. |
+| `millmux input send --session <id-or-name> --text ...` | Send text to exactly one session through the v0.4 input API. |
+| `millmux input send --ui <ui-id> --pane <pane-id> --text ...` | Send text to a pane target; pane targets require focus by default. |
+| `millmux events-subscribe <session> --json` | Subscribe to a v0.4 event stream with ack, event, heartbeat, lag, error, and closed frames. |
+| `millmux scrollback show <session> --json` | Grouped alias for structured screen text. |
+| `millmux api capabilities --json` | Discover stable and experimental local control surfaces. |
+| `millmux identify --json` | Read the v0.4 API identity envelope and command-group summary. |
 | `millmux attach <session>` | Attach to a session without tying process lifetime to the attaching terminal. |
 | `millmux attach <session> --raw` | Negotiate v2 raw-byte output for byte-exact shell/TUI fidelity. |
 | `millmux send <session> --text ...` | Send input to the PTY. |
@@ -178,6 +189,7 @@ do not keep stale owner values.
 | `millmux kill <session>` | Force a process down and record the kill. |
 | `millmux delete <session>` | Archive or purge stopped session artifacts. |
 | `millmux context --json` | Read the current UI context. |
+| `millmux context export --json` | Export the same current UI context through the v0.4 command taxonomy. |
 | `millmux doctor --json` | Diagnose state, socket, session, worker, and UI context health. |
 
 Commands that write session lists, status, inspect data, logs, events, or
@@ -197,8 +209,34 @@ or a workspace/role pair:
 millmux status --workspace "$WORKSPACE" --role millrace-daemon --json
 ```
 
-Built-in roles are `shell`, `millrace-daemon`, `agent`, `generic`, and
-`worker`. Custom role strings are accepted.
+Canonical v0.4 wire roles are `shell`, `millrace_daemon`, `millrace_agent`, and
+`generic`. The CLI also accepts hyphenated aliases such as `millrace-daemon` and
+`millrace-agent`; the legacy CLI alias `agent` serializes as `millrace_agent`.
+Unknown JSON role strings, including the old public `worker` role, fail with
+`invalid_role`. Older persisted session metadata that used `worker` or custom
+roles is loaded as `generic` for compatibility.
+
+The v0.4 control API uses one local JSONL envelope:
+
+```json
+{"id":"req_...","version":"0.4","method":"domain.action","params":{}}
+```
+
+```json
+{"id":"req_...","ok":true,"schema":"millmux.api.v0.4","method":"domain.action","result":{}}
+```
+
+Errors use the same `id`, `schema`, and `method` fields and include
+`error.code`, `error.message`, `error.retryable`, and `error.details`.
+Legacy top-level CLI commands remain aliases where they already existed.
+`millmux send` keeps exact-text behavior: include `\n` yourself when the hosted
+PTY should receive Enter.
+
+For automation, prefer `millmux input send`. A session target bypasses cockpit
+focus but still requires a writable PTY and no conflicting input owner. A pane
+target routes through persisted UI context, requires the pane to be a focused
+live session-terminal by default, and rejects stale, scrollback, read-only, or
+overlay-owned panes before touching the worker.
 
 ## Console
 
@@ -212,9 +250,9 @@ millmux console --workspace "$WORKSPACE" --layout list
 millmux console --workspace "$WORKSPACE" --no-start
 ```
 
-When used with Millrace, console mode starts or reattaches a
-`role=millrace-daemon` session for the workspace. Destructive console commands
-require explicit confirmation with the selected session id.
+When used with Millrace, console mode starts or reattaches a `millrace_daemon`
+session for the workspace. Destructive console commands require explicit
+confirmation with the selected session id.
 
 ## Agent Cockpit
 
@@ -316,7 +354,7 @@ millmux start \
   -- millrace run daemon --workspace "$WORKSPACE" --monitor basic
 ```
 
-Millmux records the daemon as a `millrace-daemon` session bound to the
+Millmux records the daemon as a `millrace_daemon` session bound to the
 canonical workspace path. Duplicate active daemon sessions for the same
 workspace are refused or resolved to the matching existing session when the
 argv is identical.

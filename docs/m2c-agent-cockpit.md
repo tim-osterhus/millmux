@@ -1,7 +1,8 @@
 # M2c Agent Cockpit Notes
 
-`millmux cockpit` is the M2c TUI mode for running a `role=agent` PTY beside a
-workspace `role=millrace-daemon` monitor pane.
+`millmux cockpit` is the M2c TUI mode for running a `role=millrace_agent` PTY
+beside a workspace `role=millrace_daemon` monitor pane. The legacy CLI alias
+`agent` still maps to `millrace_agent`.
 
 Key behavior:
 

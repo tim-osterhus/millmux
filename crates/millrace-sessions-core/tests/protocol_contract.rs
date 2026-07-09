@@ -1127,6 +1127,8 @@ fn ui_context_matches_m2a_jsonl_contract() {
             },
             focused: true,
             stale: false,
+            read_only: false,
+            overlay_active: false,
         }],
         selected_session_id: Some(daemon_id),
         focused_session_id: Some(daemon_id),

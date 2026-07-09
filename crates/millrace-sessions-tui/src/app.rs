@@ -1096,6 +1096,8 @@ impl AppModel {
                 let mut context = pane.to_context();
                 context.focused = Some(pane.id) == self.active_pane_id;
                 context.view.view_mode = self.view_mode_for_pane(pane);
+                context.read_only = self.pane_is_read_only_for_external_input(pane);
+                context.overlay_active = self.overlay_owns_input();
                 context
             })
             .collect()
@@ -1378,6 +1380,19 @@ impl AppModel {
         } else {
             UiPaneViewMode::Scrollback
         }
+    }
+
+    fn pane_is_read_only_for_external_input(&self, pane: &Pane) -> bool {
+        if pane.view.kind != UiPaneViewKind::SessionTerminal {
+            return false;
+        }
+        self.agent_terminal
+            .as_ref()
+            .map_or(true, |terminal| terminal.read_only || !terminal.input_owner)
+    }
+
+    fn overlay_owns_input(&self) -> bool {
+        self.command_palette.open || self.help_overlay.open || self.confirmation.is_some()
     }
 
     pub fn command_target_label(&self) -> String {
@@ -1923,9 +1938,7 @@ fn session_role_rank(role: &SessionRole) -> u8 {
         SessionRole::MillraceDaemon => 0,
         SessionRole::Agent => 1,
         SessionRole::Shell => 2,
-        SessionRole::Worker => 3,
-        SessionRole::Generic => 4,
-        SessionRole::Other(_) => 5,
+        SessionRole::Generic | SessionRole::Worker | SessionRole::Other(_) => 3,
     }
 }
 
@@ -2041,10 +2054,8 @@ fn session_role_label(role: &SessionRole) -> &str {
     match role {
         SessionRole::Shell => "shell",
         SessionRole::MillraceDaemon => "millrace_daemon",
-        SessionRole::Agent => "agent",
-        SessionRole::Generic => "generic",
-        SessionRole::Worker => "worker",
-        SessionRole::Other(value) => value.as_str(),
+        SessionRole::Agent => "millrace_agent",
+        SessionRole::Generic | SessionRole::Worker | SessionRole::Other(_) => "generic",
     }
 }
 
@@ -2590,6 +2601,8 @@ mod tests {
                 view: UiPaneView::new(UiPaneViewKind::SessionTerminal, Some(second_agent_id)),
                 focused: true,
                 stale: false,
+                read_only: false,
+                overlay_active: false,
             }],
             selected_session_id: Some(second_agent_id),
             focused_session_id: Some(second_agent_id),
@@ -3279,6 +3292,8 @@ mod tests {
                 view: UiPaneView::new(UiPaneViewKind::SessionTerminal, Some(stale_session_id)),
                 focused: true,
                 stale: false,
+                read_only: false,
+                overlay_active: false,
             }],
             selected_session_id: Some(stale_session_id),
             focused_session_id: Some(stale_session_id),
@@ -3342,6 +3357,8 @@ mod tests {
                     view: UiPaneView::new(UiPaneViewKind::SessionTerminal, Some(agent_id)),
                     focused: false,
                     stale: false,
+                    read_only: false,
+                    overlay_active: false,
                 },
                 UiPaneContext {
                     id: shell_pane_id,
@@ -3349,6 +3366,8 @@ mod tests {
                     view: UiPaneView::new(UiPaneViewKind::SessionTerminal, Some(shell_id)),
                     focused: true,
                     stale: false,
+                    read_only: false,
+                    overlay_active: false,
                 },
                 UiPaneContext {
                     id: daemon_pane_id,
@@ -3356,6 +3375,8 @@ mod tests {
                     view: UiPaneView::new(UiPaneViewKind::DaemonMonitor, Some(second_daemon_id)),
                     focused: false,
                     stale: false,
+                    read_only: false,
+                    overlay_active: false,
                 },
             ],
             selected_session_id: Some(shell_id),
@@ -3423,6 +3444,8 @@ mod tests {
                     view: UiPaneView::new(UiPaneViewKind::SessionTerminal, Some(agent_id)),
                     focused: false,
                     stale: false,
+                    read_only: false,
+                    overlay_active: false,
                 },
                 UiPaneContext {
                     id: shell_pane_id,
@@ -3430,6 +3453,8 @@ mod tests {
                     view: UiPaneView::new(UiPaneViewKind::SessionTerminal, Some(shell_id)),
                     focused: false,
                     stale: false,
+                    read_only: false,
+                    overlay_active: false,
                 },
                 UiPaneContext {
                     id: daemon_pane_id,
@@ -3437,6 +3462,8 @@ mod tests {
                     view: UiPaneView::new(UiPaneViewKind::DaemonMonitor, Some(daemon_id)),
                     focused: true,
                     stale: false,
+                    read_only: false,
+                    overlay_active: false,
                 },
             ],
             selected_session_id: Some(daemon_id),

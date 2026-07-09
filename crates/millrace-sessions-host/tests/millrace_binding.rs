@@ -159,7 +159,7 @@ exit 0
     let daemon_start: SessionStartResponse =
         serde_json::from_value(daemon_start["result"].clone()).expect("daemon start result");
 
-    for role in ["agent", "shell", "generic", "custom_helper"] {
+    for role in ["millrace_agent", "shell", "generic"] {
         let response = start_role(
             &paths,
             role,
@@ -182,6 +182,26 @@ exit 0
             workspace.canonicalize().unwrap()
         );
     }
+
+    let invalid = request_json(
+        &paths,
+        json!({
+            "id": "start-custom_helper",
+            "method": "session.start",
+            "params": {
+                "name": "custom_helper",
+                "role": "custom_helper",
+                "workspace": workspace,
+                "cwd": workspace,
+                "argv": ["sh", "-c", "printf aux; sleep 0.2"]
+            }
+        }),
+    );
+    assert_error(
+        &invalid,
+        "start-custom_helper",
+        ControlErrorCode::InvalidRole,
+    );
 
     daemon.kill();
 }

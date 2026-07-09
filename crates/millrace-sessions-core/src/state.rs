@@ -20,15 +20,43 @@ pub enum SessionRole {
 }
 
 impl SessionRole {
-    fn as_wire_value(&self) -> &str {
+    pub fn as_wire_value(&self) -> &str {
         match self {
             Self::Shell => "shell",
             Self::MillraceDaemon => "millrace_daemon",
-            Self::Agent => "agent",
+            Self::Agent => "millrace_agent",
             Self::Generic => "generic",
-            Self::Worker => "worker",
-            Self::Other(value) => value.as_str(),
+            Self::Worker | Self::Other(_) => "generic",
         }
+    }
+
+    pub fn from_wire_value(value: &str) -> Result<Self, String> {
+        match value {
+            "shell" => Ok(Self::Shell),
+            "millrace_daemon" => Ok(Self::MillraceDaemon),
+            "millrace_agent" => Ok(Self::Agent),
+            "generic" => Ok(Self::Generic),
+            _ => Err(format!(
+                "invalid role: {value}; expected shell, millrace_daemon, millrace_agent, or generic"
+            )),
+        }
+    }
+
+    pub fn from_cli_value(value: &str) -> Result<Self, String> {
+        let normalized = value.trim().to_ascii_lowercase().replace('-', "_");
+        match normalized.as_str() {
+            "shell" => Ok(Self::Shell),
+            "millrace_daemon" => Ok(Self::MillraceDaemon),
+            "millrace_agent" | "agent" => Ok(Self::Agent),
+            "generic" => Ok(Self::Generic),
+            _ => Err(format!(
+                "invalid role: {value}; expected shell, millrace-daemon, millrace-agent, or generic"
+            )),
+        }
+    }
+
+    fn from_persisted_value(value: &str) -> Self {
+        Self::from_cli_value(value).unwrap_or(Self::Generic)
     }
 }
 
@@ -47,15 +75,16 @@ impl<'de> Deserialize<'de> for SessionRole {
         D: Deserializer<'de>,
     {
         let value = String::deserialize(deserializer)?;
-        Ok(match value.as_str() {
-            "shell" => Self::Shell,
-            "millrace_daemon" => Self::MillraceDaemon,
-            "agent" => Self::Agent,
-            "generic" => Self::Generic,
-            "worker" => Self::Worker,
-            _ => Self::Other(value),
-        })
+        Self::from_wire_value(&value).map_err(serde::de::Error::custom)
     }
+}
+
+fn deserialize_persisted_session_role<'de, D>(deserializer: D) -> Result<SessionRole, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = String::deserialize(deserializer)?;
+    Ok(SessionRole::from_persisted_value(&value))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -650,6 +679,14 @@ pub struct UiPaneContext {
     pub focused: bool,
     #[serde(default)]
     pub stale: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub read_only: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub overlay_active: bool,
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -882,6 +919,7 @@ impl<'de> Deserialize<'de> for SessionPaths {
 pub struct SessionMeta {
     pub id: SessionId,
     pub name: Option<String>,
+    #[serde(deserialize_with = "deserialize_persisted_session_role")]
     pub role: SessionRole,
     pub process_state: ProcessState,
     pub attention_state: AttentionState,
@@ -975,7 +1013,7 @@ mod tests {
         );
         assert_eq!(
             serde_json::to_string(&SessionRole::Agent).unwrap(),
-            "\"agent\""
+            "\"millrace_agent\""
         );
         assert_eq!(
             serde_json::to_string(&SessionRole::Generic).unwrap(),
@@ -1196,11 +1234,44 @@ mod tests {
     }
 
     #[test]
-    fn custom_session_roles_round_trip_as_strings() {
-        let role = SessionRole::Other("custom_role".to_string());
-        let encoded = serde_json::to_string(&role).unwrap();
-        assert_eq!(encoded, "\"custom_role\"");
-        assert_eq!(serde_json::from_str::<SessionRole>(&encoded).unwrap(), role);
+    fn session_roles_deserialize_only_canonical_wire_values() {
+        assert_eq!(
+            serde_json::from_str::<SessionRole>("\"millrace_agent\"").unwrap(),
+            SessionRole::Agent
+        );
+        assert!(serde_json::from_str::<SessionRole>("\"agent\"").is_err());
+        assert!(serde_json::from_str::<SessionRole>("\"millrace-agent\"").is_err());
+        assert!(serde_json::from_str::<SessionRole>("\"custom_role\"").is_err());
+    }
+
+    #[test]
+    fn session_meta_migrates_legacy_persisted_roles_to_generic() {
+        let mut value = json!({
+            "id": SessionId::new(),
+            "name": "legacy",
+            "role": "worker",
+            "process_state": "running",
+            "attention_state": "active",
+            "workspace": null,
+            "cwd": "/tmp",
+            "argv": ["sh"],
+            "spawn_mode": "pty",
+            "monitor_profile": "auto",
+            "env": {},
+            "created_at": "2026-05-20T00:00:00Z",
+            "updated_at": "2026-05-20T00:00:00Z"
+        });
+
+        let worker: SessionMeta = serde_json::from_value(value.clone()).unwrap();
+        assert_eq!(worker.role, SessionRole::Generic);
+
+        value["role"] = json!("agent");
+        let agent: SessionMeta = serde_json::from_value(value.clone()).unwrap();
+        assert_eq!(agent.role, SessionRole::Agent);
+
+        value["role"] = json!("custom_helper");
+        let custom: SessionMeta = serde_json::from_value(value).unwrap();
+        assert_eq!(custom.role, SessionRole::Generic);
     }
 
     #[test]

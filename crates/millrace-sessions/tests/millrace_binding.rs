@@ -111,10 +111,10 @@ exit 0
     assert_eq!(daemon["attached_existing"], false);
 
     for (input_role, expected_role) in [
-        ("agent", "agent"),
+        ("millrace-agent", "millrace_agent"),
+        ("agent", "millrace_agent"),
         ("shell", "shell"),
         ("generic", "generic"),
-        ("custom-role", "custom_role"),
     ] {
         let value = start_role(
             &host,
@@ -127,6 +127,19 @@ exit 0
         assert_eq!(value["attached_existing"], false);
         assert!(value["session"]["session_id"].as_str().is_some());
     }
+
+    let invalid = millmux_command(&host)
+        .env("PATH", &path_env)
+        .args(["start", "--json", "--role", "custom-role", "--workspace"])
+        .arg(&workspace)
+        .args(["--cwd"])
+        .arg(&workspace)
+        .args(["--", "sh", "-c", "printf aux; sleep 0.2"])
+        .output()
+        .expect("run millmux invalid role");
+    assert!(!invalid.status.success());
+    let stderr = String::from_utf8_lossy(&invalid.stderr);
+    assert!(stderr.contains("invalid role"), "{stderr}");
 }
 
 #[test]

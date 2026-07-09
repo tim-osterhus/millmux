@@ -19,15 +19,19 @@ use millrace_sessions_core::{
     ids::{SessionId, UiId},
     paths::{state_paths, StatePaths},
     protocol::{
-        AttachStreamFrame, AttentionClearRequest, AttentionListRequest, AttentionListResponse,
-        AttentionMarkRequest, AttentionMutationResponse, AttentionReadRequest, ControlErrorBody,
-        ControlErrorCode, ControlResponse, DoctorRequest, EventStreamFrame, HostStatusRequest,
-        HostStatusResponse, LogLine, LogStream, LogStreamFrame, ScreenFrame, SessionArtifacts,
-        SessionAttachRequest, SessionAttachResponse, SessionCapabilities, SessionDeleteRequest,
-        SessionDeleteResponse, SessionEventsRequest, SessionEventsResponse, SessionInspectRequest,
-        SessionInspectResponse, SessionKillRequest, SessionKillResponse, SessionListRequest,
-        SessionListResponse, SessionLogsRequest, SessionLogsResponse, SessionResizeRequest,
-        SessionResizeResponse, SessionScreenRequest, SessionScreenResponse, SessionSendRequest,
+        ApiCapabilitiesRequest, ApiCapabilitiesResponse, ApiCapability, ApiEnvelopeDescription,
+        ApiIdentifyRequest, ApiIdentifyResponse, ApiStability, AttachStreamFrame,
+        AttentionClearRequest, AttentionListRequest, AttentionListResponse, AttentionMarkRequest,
+        AttentionMutationResponse, AttentionReadRequest, ControlErrorBody, ControlErrorCode,
+        ControlMethod, ControlResponse, DoctorRequest, EventStreamFrame, EventStreamLagReason,
+        EventSubscribeRequest, EventSubscribeResponse, EventSubscriptionContract,
+        HostStatusRequest, HostStatusResponse, InputSendRequest, InputSendResponse, InputTarget,
+        LogLine, LogStream, LogStreamFrame, ScreenFrame, SessionArtifacts, SessionAttachRequest,
+        SessionAttachResponse, SessionCapabilities, SessionDeleteRequest, SessionDeleteResponse,
+        SessionEventsRequest, SessionEventsResponse, SessionInspectRequest, SessionInspectResponse,
+        SessionKillRequest, SessionKillResponse, SessionListRequest, SessionListResponse,
+        SessionLogsRequest, SessionLogsResponse, SessionResizeRequest, SessionResizeResponse,
+        SessionScreenRequest, SessionScreenResponse, SessionSelector, SessionSendRequest,
         SessionSendResponse, SessionStartRequest, SessionStartResponse, SessionStopRequest,
         SessionStopResponse, SessionSummary, SnapshotUnavailableReason, StreamKind, StreamSetup,
         UiContextCloseRequest, UiContextCloseResponse, UiContextGetRequest, UiContextGetResponse,
@@ -35,12 +39,14 @@ use millrace_sessions_core::{
         UiContextSetResponse, WorkerAckResponse, WorkerAttachRequest, WorkerAttachResponse,
         WorkerControlMethod, WorkerControlRequest, WorkerControlResponse, WorkerResizeRequest,
         WorkerResizeResponse, WorkerSendRequest, WorkerSendResponse, M1_PROTOCOL_VERSION,
+        V04_API_SCHEMA, V04_API_VERSION,
     },
     scrollback::TerminalSnapshot,
     state::{
         AttentionItem, AttentionKind, AttentionRollup, AttentionState, AttentionTargetType,
         HostMeta, MonitorProfile, ProcessState, SessionLiveness, SessionMeta, SessionPaths,
-        SessionRole, StatusSummary, UiContext, UiContextPaths, UiEvent, UiEventKind, WorkerMeta,
+        SessionRole, StatusSummary, UiContext, UiContextPaths, UiEvent, UiEventKind,
+        UiPaneViewKind, UiPaneViewMode, WorkerMeta,
     },
     storage::{append_json_line, create_private_dir_all, read_json, write_json_atomic},
     workspace::WorkspaceIdentity,
@@ -180,6 +186,9 @@ fn should_stream_request(line: &str) -> bool {
     if method == "session.attach" {
         return true;
     }
+    if method == "events.subscribe" {
+        return true;
+    }
     if !matches!(method, "session.logs" | "session.events") {
         return false;
     }
@@ -215,14 +224,17 @@ async fn handle_streaming_request(
         };
 
     match request.method {
-        millrace_sessions_core::protocol::ControlMethod::SessionAttach => {
+        ControlMethod::SessionAttach => {
             handle_attach_stream(request, lines, writer, runtime.paths()).await
         }
-        millrace_sessions_core::protocol::ControlMethod::SessionLogs => {
+        ControlMethod::SessionLogs => {
             handle_logs_follow_stream(request, writer, runtime.paths()).await
         }
-        millrace_sessions_core::protocol::ControlMethod::SessionEvents => {
+        ControlMethod::SessionEvents => {
             handle_events_follow_stream(request, writer, runtime.paths()).await
+        }
+        ControlMethod::EventsSubscribe => {
+            handle_events_subscribe_stream(request, writer, runtime.paths()).await
         }
         _ => Ok(()),
     }
@@ -261,13 +273,15 @@ pub fn dispatch_json_line(line: &str, paths: &StatePaths, host: &HostMeta) -> Co
             )
         }
     };
+    let version = value.get("version").and_then(Value::as_str);
     let params = value.get("params").cloned().unwrap_or_else(|| json!({}));
 
-    match method {
+    let response = match method {
         "host.status" => dispatch_host_status(id, params, paths, host),
         "host.doctor" => dispatch_host_doctor(id, params, paths, host),
         "session.start" => dispatch_session_start(id, params, paths),
         "session.list" => dispatch_session_list(id, params, paths),
+        "session.status" => dispatch_session_inspect(id, params, paths),
         "session.inspect" => dispatch_session_inspect(id, params, paths),
         "session.screen" => dispatch_session_screen(id, params, paths),
         "session.logs" => dispatch_session_logs(id, params, paths),
@@ -277,6 +291,8 @@ pub fn dispatch_json_line(line: &str, paths: &StatePaths, host: &HostMeta) -> Co
         "session.stop" => dispatch_session_stop(id, params, paths),
         "session.kill" => dispatch_session_kill(id, params, paths),
         "session.delete" => dispatch_session_delete(id, params, paths),
+        "input.send" => dispatch_input_send(id, params, paths),
+        "events.subscribe" => dispatch_events_subscribe(id, params, paths),
         "attention.list" => dispatch_attention_list(id, params, paths),
         "attention.mark" => dispatch_attention_mark(id, params, paths),
         "attention.read" => dispatch_attention_read(id, params, paths),
@@ -285,11 +301,19 @@ pub fn dispatch_json_line(line: &str, paths: &StatePaths, host: &HostMeta) -> Co
         "ui.context.set" => dispatch_ui_context_set(id, params, paths),
         "ui.context.list" => dispatch_ui_context_list(id, params, paths),
         "ui.context.close" => dispatch_ui_context_close(id, params, paths),
+        "api.capabilities" => dispatch_api_capabilities(id, params),
+        "api.identify" => dispatch_api_identify(id, params),
         _ => error_response(
             id,
             ControlErrorCode::UnknownMethod,
             format!("unsupported method: {method}"),
         ),
+    };
+
+    if version == Some(V04_API_VERSION) {
+        response.into_v04_method(method)
+    } else {
+        response
     }
 }
 
@@ -319,13 +343,7 @@ fn dispatch_host_doctor(
 fn dispatch_session_start(id: String, params: Value, paths: &StatePaths) -> ControlResponse {
     let request = match serde_json::from_value::<SessionStartRequest>(params) {
         Ok(request) => request,
-        Err(error) => {
-            return error_response(
-                id,
-                ControlErrorCode::InvalidRequest,
-                format!("invalid session.start params: {error}"),
-            )
-        }
+        Err(error) => return invalid_params_response(id, "session.start", error),
     };
 
     match start_session(paths, request) {
@@ -669,16 +687,26 @@ fn dispatch_host_status(
     success_response(id, &result)
 }
 
+fn dispatch_api_capabilities(id: String, params: Value) -> ControlResponse {
+    if let Err(error) = serde_json::from_value::<ApiCapabilitiesRequest>(params) {
+        return invalid_params_response(id, "api.capabilities", error);
+    }
+
+    success_response(id, &api_capabilities_response())
+}
+
+fn dispatch_api_identify(id: String, params: Value) -> ControlResponse {
+    if let Err(error) = serde_json::from_value::<ApiIdentifyRequest>(params) {
+        return invalid_params_response(id, "api.identify", error);
+    }
+
+    success_response(id, &api_identify_response())
+}
+
 fn dispatch_session_list(id: String, params: Value, paths: &StatePaths) -> ControlResponse {
     let request = match serde_json::from_value::<SessionListRequest>(params) {
         Ok(request) => request,
-        Err(error) => {
-            return error_response(
-                id,
-                ControlErrorCode::InvalidRequest,
-                format!("invalid session.list params: {error}"),
-            )
-        }
+        Err(error) => return invalid_params_response(id, "session.list", error),
     };
 
     let registry = match HostRegistry::load(paths.clone()) {
@@ -696,13 +724,7 @@ fn dispatch_session_list(id: String, params: Value, paths: &StatePaths) -> Contr
 fn dispatch_session_inspect(id: String, params: Value, paths: &StatePaths) -> ControlResponse {
     let request = match serde_json::from_value::<SessionInspectRequest>(params) {
         Ok(request) => request,
-        Err(error) => {
-            return error_response(
-                id,
-                ControlErrorCode::InvalidRequest,
-                format!("invalid session.inspect params: {error}"),
-            )
-        }
+        Err(error) => return invalid_params_response(id, "session.inspect", error),
     };
 
     let registry = match HostRegistry::load(paths.clone()) {
@@ -723,13 +745,7 @@ fn dispatch_session_inspect(id: String, params: Value, paths: &StatePaths) -> Co
 fn dispatch_session_screen(id: String, params: Value, paths: &StatePaths) -> ControlResponse {
     let request = match serde_json::from_value::<SessionScreenRequest>(params) {
         Ok(request) => request,
-        Err(error) => {
-            return error_response(
-                id,
-                ControlErrorCode::InvalidRequest,
-                format!("invalid session.screen params: {error}"),
-            )
-        }
+        Err(error) => return invalid_params_response(id, "session.screen", error),
     };
 
     match build_screen_response(paths, &request) {
@@ -741,13 +757,7 @@ fn dispatch_session_screen(id: String, params: Value, paths: &StatePaths) -> Con
 fn dispatch_session_logs(id: String, params: Value, paths: &StatePaths) -> ControlResponse {
     let request = match serde_json::from_value::<SessionLogsRequest>(params) {
         Ok(request) => request,
-        Err(error) => {
-            return error_response(
-                id,
-                ControlErrorCode::InvalidRequest,
-                format!("invalid session.logs params: {error}"),
-            )
-        }
+        Err(error) => return invalid_params_response(id, "session.logs", error),
     };
 
     match build_logs_response(paths, &request, request.follow) {
@@ -759,13 +769,7 @@ fn dispatch_session_logs(id: String, params: Value, paths: &StatePaths) -> Contr
 fn dispatch_session_events(id: String, params: Value, paths: &StatePaths) -> ControlResponse {
     let request = match serde_json::from_value::<SessionEventsRequest>(params) {
         Ok(request) => request,
-        Err(error) => {
-            return error_response(
-                id,
-                ControlErrorCode::InvalidRequest,
-                format!("invalid session.events params: {error}"),
-            )
-        }
+        Err(error) => return invalid_params_response(id, "session.events", error),
     };
 
     match build_events_response(paths, &request, request.follow) {
@@ -774,16 +778,22 @@ fn dispatch_session_events(id: String, params: Value, paths: &StatePaths) -> Con
     }
 }
 
+fn dispatch_events_subscribe(id: String, params: Value, paths: &StatePaths) -> ControlResponse {
+    let request = match serde_json::from_value::<EventSubscribeRequest>(params) {
+        Ok(request) => request,
+        Err(error) => return invalid_params_response(id, "events.subscribe", error),
+    };
+
+    match build_event_subscribe_response(paths, &request) {
+        Ok(result) => success_response(id, &result),
+        Err(error) => ControlResponse::failure(id, error),
+    }
+}
+
 fn dispatch_session_send(id: String, params: Value, paths: &StatePaths) -> ControlResponse {
     let request = match serde_json::from_value::<SessionSendRequest>(params) {
         Ok(request) => request,
-        Err(error) => {
-            return error_response(
-                id,
-                ControlErrorCode::InvalidRequest,
-                format!("invalid session.send params: {error}"),
-            )
-        }
+        Err(error) => return invalid_params_response(id, "session.send", error),
     };
 
     match send_to_session(paths, request, None) {
@@ -792,16 +802,22 @@ fn dispatch_session_send(id: String, params: Value, paths: &StatePaths) -> Contr
     }
 }
 
+fn dispatch_input_send(id: String, params: Value, paths: &StatePaths) -> ControlResponse {
+    let request = match serde_json::from_value::<InputSendRequest>(params) {
+        Ok(request) => request,
+        Err(error) => return invalid_params_response(id, "input.send", error),
+    };
+
+    match input_send(paths, request) {
+        Ok(result) => success_response(id, &result),
+        Err(error) => ControlResponse::failure(id, error),
+    }
+}
+
 fn dispatch_session_resize(id: String, params: Value, paths: &StatePaths) -> ControlResponse {
     let request = match serde_json::from_value::<SessionResizeRequest>(params) {
         Ok(request) => request,
-        Err(error) => {
-            return error_response(
-                id,
-                ControlErrorCode::InvalidRequest,
-                format!("invalid session.resize params: {error}"),
-            )
-        }
+        Err(error) => return invalid_params_response(id, "session.resize", error),
     };
 
     match resize_session(paths, request) {
@@ -813,13 +829,7 @@ fn dispatch_session_resize(id: String, params: Value, paths: &StatePaths) -> Con
 fn dispatch_session_stop(id: String, params: Value, paths: &StatePaths) -> ControlResponse {
     let request = match serde_json::from_value::<SessionStopRequest>(params) {
         Ok(request) => request,
-        Err(error) => {
-            return error_response(
-                id,
-                ControlErrorCode::InvalidRequest,
-                format!("invalid session.stop params: {error}"),
-            )
-        }
+        Err(error) => return invalid_params_response(id, "session.stop", error),
     };
 
     match stop_session(paths, request) {
@@ -831,13 +841,7 @@ fn dispatch_session_stop(id: String, params: Value, paths: &StatePaths) -> Contr
 fn dispatch_session_kill(id: String, params: Value, paths: &StatePaths) -> ControlResponse {
     let request = match serde_json::from_value::<SessionKillRequest>(params) {
         Ok(request) => request,
-        Err(error) => {
-            return error_response(
-                id,
-                ControlErrorCode::InvalidRequest,
-                format!("invalid session.kill params: {error}"),
-            )
-        }
+        Err(error) => return invalid_params_response(id, "session.kill", error),
     };
 
     match kill_session(paths, request) {
@@ -849,13 +853,7 @@ fn dispatch_session_kill(id: String, params: Value, paths: &StatePaths) -> Contr
 fn dispatch_session_delete(id: String, params: Value, paths: &StatePaths) -> ControlResponse {
     let request = match serde_json::from_value::<SessionDeleteRequest>(params) {
         Ok(request) => request,
-        Err(error) => {
-            return error_response(
-                id,
-                ControlErrorCode::InvalidRequest,
-                format!("invalid session.delete params: {error}"),
-            )
-        }
+        Err(error) => return invalid_params_response(id, "session.delete", error),
     };
 
     match delete_session(paths, request) {
@@ -867,13 +865,7 @@ fn dispatch_session_delete(id: String, params: Value, paths: &StatePaths) -> Con
 fn dispatch_attention_list(id: String, params: Value, paths: &StatePaths) -> ControlResponse {
     let request = match serde_json::from_value::<AttentionListRequest>(params) {
         Ok(request) => request,
-        Err(error) => {
-            return error_response(
-                id,
-                ControlErrorCode::InvalidRequest,
-                format!("invalid attention.list params: {error}"),
-            )
-        }
+        Err(error) => return invalid_params_response(id, "attention.list", error),
     };
 
     match list_attention(paths, request) {
@@ -885,13 +877,7 @@ fn dispatch_attention_list(id: String, params: Value, paths: &StatePaths) -> Con
 fn dispatch_attention_mark(id: String, params: Value, paths: &StatePaths) -> ControlResponse {
     let request = match serde_json::from_value::<AttentionMarkRequest>(params) {
         Ok(request) => request,
-        Err(error) => {
-            return error_response(
-                id,
-                ControlErrorCode::InvalidRequest,
-                format!("invalid attention.mark params: {error}"),
-            )
-        }
+        Err(error) => return invalid_params_response(id, "attention.mark", error),
     };
 
     match mark_attention(paths, request) {
@@ -903,13 +889,7 @@ fn dispatch_attention_mark(id: String, params: Value, paths: &StatePaths) -> Con
 fn dispatch_attention_read(id: String, params: Value, paths: &StatePaths) -> ControlResponse {
     let request = match serde_json::from_value::<AttentionReadRequest>(params) {
         Ok(request) => request,
-        Err(error) => {
-            return error_response(
-                id,
-                ControlErrorCode::InvalidRequest,
-                format!("invalid attention.read params: {error}"),
-            )
-        }
+        Err(error) => return invalid_params_response(id, "attention.read", error),
     };
 
     match read_attention(paths, request) {
@@ -921,13 +901,7 @@ fn dispatch_attention_read(id: String, params: Value, paths: &StatePaths) -> Con
 fn dispatch_attention_clear(id: String, params: Value, paths: &StatePaths) -> ControlResponse {
     let request = match serde_json::from_value::<AttentionClearRequest>(params) {
         Ok(request) => request,
-        Err(error) => {
-            return error_response(
-                id,
-                ControlErrorCode::InvalidRequest,
-                format!("invalid attention.clear params: {error}"),
-            )
-        }
+        Err(error) => return invalid_params_response(id, "attention.clear", error),
     };
 
     match clear_attention(paths, request) {
@@ -1069,6 +1043,28 @@ fn build_events_response(
         session_id: inspected.session.session_id,
         events,
         follow: include_follow.then(|| stream_setup(StreamKind::Events, true, false)),
+    })
+}
+
+fn build_event_subscribe_response(
+    paths: &StatePaths,
+    request: &EventSubscribeRequest,
+) -> Result<EventSubscribeResponse, ControlErrorBody> {
+    let inspected = resolve_session(paths, &request.selector)?;
+    let cursor = match request.cursor.as_deref() {
+        Some(cursor) => cursor.to_string(),
+        None => event_cursor(inspected.session.session_id, 0),
+    };
+    Ok(EventSubscribeResponse {
+        schema_version: M1_PROTOCOL_VERSION,
+        protocol_version: M1_PROTOCOL_VERSION,
+        session_id: inspected.session.session_id,
+        stream: stream_setup(StreamKind::Events, true, false),
+        cursor,
+        replay_limit: normalized_replay_limit(request),
+        subscriber_queue_limit: normalized_subscriber_queue_limit(request),
+        heartbeat_ms: normalized_heartbeat_ms(request),
+        contract: EventSubscriptionContract::default(),
     })
 }
 
@@ -1304,6 +1300,135 @@ fn send_to_session(
         session_id: inspected.session.session_id,
         bytes_sent: worker.bytes_sent,
     })
+}
+
+fn input_send(
+    paths: &StatePaths,
+    request: InputSendRequest,
+) -> Result<InputSendResponse, ControlErrorBody> {
+    let InputSendRequest {
+        target,
+        text,
+        require_focus,
+        owner,
+    } = request;
+    let (selector, routed_via_focus, response_target) =
+        input_target_selector(paths, target, require_focus)?;
+    let response = send_to_session(paths, SessionSendRequest { selector, text }, owner)?;
+    Ok(InputSendResponse {
+        schema_version: response.schema_version,
+        protocol_version: response.protocol_version,
+        session_id: response.session_id,
+        target: response_target,
+        bytes_sent: response.bytes_sent,
+        routed_via_focus,
+    })
+}
+
+fn input_target_selector(
+    paths: &StatePaths,
+    target: InputTarget,
+    require_focus: bool,
+) -> Result<(SessionSelector, bool, InputTarget), ControlErrorBody> {
+    match target {
+        InputTarget::Session { selector } => {
+            let response_target = InputTarget::Session {
+                selector: selector.clone(),
+            };
+            Ok((selector, false, response_target))
+        }
+        InputTarget::Pane { ui_id, pane_id } => {
+            let ui_paths = paths.ui_context_paths(ui_id);
+            let context = read_json::<UiContext>(&ui_paths.context_json).map_err(|error| {
+                ControlErrorBody::new(
+                    ControlErrorCode::UiContextNotFound,
+                    format!("UI context {ui_id} not found: {error}"),
+                )
+            })?;
+            let pane = context
+                .panes
+                .iter()
+                .find(|pane| pane.id == pane_id)
+                .ok_or_else(|| {
+                    ControlErrorBody::new(
+                        ControlErrorCode::InvalidRequest,
+                        format!("pane {pane_id} not found in UI context {ui_id}"),
+                    )
+                })?;
+            if pane.stale {
+                return Err(ControlErrorBody::new(
+                    ControlErrorCode::InvalidRequest,
+                    format!("pane {pane_id} is stale"),
+                ));
+            }
+            if pane.view.kind != UiPaneViewKind::SessionTerminal {
+                return Err(ControlErrorBody::new(
+                    ControlErrorCode::InvalidRequest,
+                    format!("pane {pane_id} is not a live session terminal"),
+                )
+                .with_details(json!({
+                    "ui_id": ui_id,
+                    "pane_id": pane_id,
+                    "view_kind": pane.view.kind,
+                })));
+            }
+            if pane.view.view_mode != UiPaneViewMode::Live {
+                return Err(ControlErrorBody::new(
+                    ControlErrorCode::InvalidRequest,
+                    format!("pane {pane_id} is in scrollback mode"),
+                )
+                .with_details(json!({
+                    "ui_id": ui_id,
+                    "pane_id": pane_id,
+                    "view_mode": pane.view.view_mode,
+                })));
+            }
+            if pane.read_only {
+                return Err(ControlErrorBody::new(
+                    ControlErrorCode::InputOwnerConflict,
+                    format!("pane {pane_id} is read-only"),
+                )
+                .with_details(json!({
+                    "ui_id": ui_id,
+                    "pane_id": pane_id,
+                    "read_only": true,
+                })));
+            }
+            if pane.overlay_active {
+                return Err(ControlErrorBody::new(
+                    ControlErrorCode::InputOwnerConflict,
+                    format!("pane {pane_id} has an active overlay"),
+                )
+                .with_details(json!({
+                    "ui_id": ui_id,
+                    "pane_id": pane_id,
+                    "overlay_active": true,
+                })));
+            }
+            if require_focus && !pane.focused {
+                return Err(ControlErrorBody::new(
+                    ControlErrorCode::InputOwnerConflict,
+                    format!("pane {pane_id} is not focused"),
+                )
+                .with_details(json!({
+                    "ui_id": ui_id,
+                    "pane_id": pane_id,
+                    "require_focus": true
+                })));
+            }
+            let session_id = pane.view.session_id.ok_or_else(|| {
+                ControlErrorBody::new(
+                    ControlErrorCode::InvalidRequest,
+                    format!("pane {pane_id} is not backed by a session"),
+                )
+            })?;
+            Ok((
+                SessionSelector::Id { session_id },
+                true,
+                InputTarget::Pane { ui_id, pane_id },
+            ))
+        }
+    }
 }
 
 fn resize_session(
@@ -2488,14 +2613,16 @@ async fn handle_logs_follow_stream(
     mut writer: OwnedWriteHalf,
     paths: &StatePaths,
 ) -> Result<(), HostServerError> {
+    let is_v04 = request.is_v04();
     let params = match request.params_as::<SessionLogsRequest>() {
         Ok(params) => params,
         Err(error) => {
-            let response = error_response(
-                request.id,
-                ControlErrorCode::InvalidRequest,
-                format!("invalid session.logs params: {error}"),
-            );
+            let response = invalid_params_response(request.id, "session.logs", error);
+            let response = if is_v04 {
+                response.into_v04(ControlMethod::SessionLogs)
+            } else {
+                response
+            };
             writer
                 .write_all(response.to_json_line()?.as_bytes())
                 .await?;
@@ -2507,21 +2634,25 @@ async fn handle_logs_follow_stream(
     let inspected = match resolve_session(paths, &params.selector) {
         Ok(inspected) => inspected,
         Err(error) => {
+            let response = if is_v04 {
+                ControlResponse::failure_v04(request.id, ControlMethod::SessionLogs, error)
+            } else {
+                ControlResponse::failure(request.id, error)
+            };
             writer
-                .write_all(
-                    ControlResponse::failure(request.id, error)
-                        .to_json_line()?
-                        .as_bytes(),
-                )
+                .write_all(response.to_json_line()?.as_bytes())
                 .await?;
             writer.flush().await?;
             return Ok(());
         }
     };
-    let response = match build_logs_response(paths, &params, true) {
+    let mut response = match build_logs_response(paths, &params, true) {
         Ok(result) => ControlResponse::success(request.id.clone(), &result)?,
         Err(error) => ControlResponse::failure(request.id.clone(), error),
     };
+    if is_v04 {
+        response = response.into_v04(ControlMethod::SessionLogs);
+    }
     writer
         .write_all(response.to_json_line()?.as_bytes())
         .await?;
@@ -2623,14 +2754,16 @@ async fn handle_events_follow_stream(
     mut writer: OwnedWriteHalf,
     paths: &StatePaths,
 ) -> Result<(), HostServerError> {
+    let is_v04 = request.is_v04();
     let params = match request.params_as::<SessionEventsRequest>() {
         Ok(params) => params,
         Err(error) => {
-            let response = error_response(
-                request.id,
-                ControlErrorCode::InvalidRequest,
-                format!("invalid session.events params: {error}"),
-            );
+            let response = invalid_params_response(request.id, "session.events", error);
+            let response = if is_v04 {
+                response.into_v04(ControlMethod::SessionEvents)
+            } else {
+                response
+            };
             writer
                 .write_all(response.to_json_line()?.as_bytes())
                 .await?;
@@ -2642,21 +2775,25 @@ async fn handle_events_follow_stream(
     let inspected = match resolve_session(paths, &params.selector) {
         Ok(inspected) => inspected,
         Err(error) => {
+            let response = if is_v04 {
+                ControlResponse::failure_v04(request.id, ControlMethod::SessionEvents, error)
+            } else {
+                ControlResponse::failure(request.id, error)
+            };
             writer
-                .write_all(
-                    ControlResponse::failure(request.id, error)
-                        .to_json_line()?
-                        .as_bytes(),
-                )
+                .write_all(response.to_json_line()?.as_bytes())
                 .await?;
             writer.flush().await?;
             return Ok(());
         }
     };
-    let response = match build_events_response(paths, &params, true) {
+    let mut response = match build_events_response(paths, &params, true) {
         Ok(result) => ControlResponse::success(request.id.clone(), &result)?,
         Err(error) => ControlResponse::failure(request.id.clone(), error),
     };
+    if is_v04 {
+        response = response.into_v04(ControlMethod::SessionEvents);
+    }
     writer
         .write_all(response.to_json_line()?.as_bytes())
         .await?;
@@ -2665,14 +2802,9 @@ async fn handle_events_follow_stream(
     let mut offset = file_len(&inspected.paths.events_jsonl);
     loop {
         sleep(FOLLOW_POLL).await;
-        let next = match read_from_offset(&inspected.paths.events_jsonl, offset) {
-            Ok((bytes, new_offset)) => {
-                offset = new_offset;
-                bytes
-            }
-            Err(_) => Vec::new(),
-        };
-        if next.is_empty() {
+        let records = read_event_records_from_offset(&inspected.paths.events_jsonl, offset)
+            .unwrap_or_default();
+        if records.is_empty() {
             if session_is_terminal(&inspected.paths.meta_json) {
                 let frame = EventStreamFrame::Closed;
                 let _ = writer.write_all(frame.to_json_line()?.as_bytes()).await;
@@ -2682,14 +2814,12 @@ async fn handle_events_follow_stream(
             continue;
         }
 
-        for line in String::from_utf8_lossy(&next).lines() {
-            if line.trim().is_empty() {
-                continue;
-            }
-            let Ok(event) = serde_json::from_str::<SessionEvent>(line) else {
-                continue;
+        for (event, cursor_offset) in records {
+            offset = cursor_offset;
+            let frame = EventStreamFrame::Event {
+                cursor: event_cursor(inspected.session.session_id, cursor_offset),
+                event,
             };
-            let frame = EventStreamFrame::Event { event };
             if writer
                 .write_all(frame.to_json_line()?.as_bytes())
                 .await
@@ -2704,20 +2834,201 @@ async fn handle_events_follow_stream(
     Ok(())
 }
 
+async fn handle_events_subscribe_stream(
+    request: millrace_sessions_core::protocol::ControlRequest,
+    mut writer: OwnedWriteHalf,
+    paths: &StatePaths,
+) -> Result<(), HostServerError> {
+    let params = match request.params_as::<EventSubscribeRequest>() {
+        Ok(params) => params,
+        Err(error) => {
+            let response = invalid_params_response(request.id, "events.subscribe", error)
+                .into_v04(ControlMethod::EventsSubscribe);
+            writer
+                .write_all(response.to_json_line()?.as_bytes())
+                .await?;
+            writer.flush().await?;
+            return Ok(());
+        }
+    };
+
+    let inspected = match resolve_session(paths, &params.selector) {
+        Ok(inspected) => inspected,
+        Err(error) => {
+            writer
+                .write_all(
+                    ControlResponse::failure_v04(request.id, ControlMethod::EventsSubscribe, error)
+                        .to_json_line()?
+                        .as_bytes(),
+                )
+                .await?;
+            writer.flush().await?;
+            return Ok(());
+        }
+    };
+
+    let response = match build_event_subscribe_response(paths, &params) {
+        Ok(result) => ControlResponse::success_v04(
+            request.id.clone(),
+            ControlMethod::EventsSubscribe,
+            &result,
+        )?,
+        Err(error) => {
+            ControlResponse::failure_v04(request.id.clone(), ControlMethod::EventsSubscribe, error)
+        }
+    };
+    writer
+        .write_all(response.to_json_line()?.as_bytes())
+        .await?;
+    writer.flush().await?;
+
+    let replay_limit = normalized_replay_limit(&params);
+    let queue_limit = normalized_subscriber_queue_limit(&params);
+    let heartbeat_ms = normalized_heartbeat_ms(&params);
+    let current_len = file_len(&inspected.paths.events_jsonl);
+    let start_offset = match params.cursor.as_deref() {
+        Some(cursor) => match parse_event_cursor(cursor, inspected.session.session_id) {
+            Ok(offset) if offset <= current_len => offset,
+            _ => {
+                write_event_stream_frame(
+                    &mut writer,
+                    &EventStreamFrame::Error {
+                        error: ControlErrorBody::new(
+                            ControlErrorCode::EventCursorExpired,
+                            "event cursor is invalid or no longer readable",
+                        )
+                        .with_retryable(false)
+                        .with_details(json!({
+                            "cursor": cursor,
+                            "session_id": inspected.session.session_id,
+                        })),
+                    },
+                )
+                .await?;
+                write_event_stream_frame(&mut writer, &EventStreamFrame::Closed).await?;
+                return Ok(());
+            }
+        },
+        None => 0,
+    };
+
+    let all_replay = read_event_records_from_offset(&inspected.paths.events_jsonl, start_offset)
+        .unwrap_or_default();
+    let dropped_replay = all_replay.len().saturating_sub(replay_limit);
+    let replay = all_replay
+        .into_iter()
+        .skip(dropped_replay)
+        .collect::<Vec<_>>();
+    let mut offset = replay
+        .last()
+        .map(|(_, cursor_offset)| *cursor_offset)
+        .unwrap_or(start_offset);
+
+    write_event_stream_frame(
+        &mut writer,
+        &EventStreamFrame::Ack {
+            cursor: event_cursor(inspected.session.session_id, start_offset),
+            replayed: replay.len(),
+            subscriber_queue_limit: queue_limit,
+            heartbeat_ms,
+        },
+    )
+    .await?;
+    if dropped_replay > 0 {
+        write_event_stream_frame(
+            &mut writer,
+            &EventStreamFrame::StreamLagged {
+                dropped_events: dropped_replay as u64,
+                cursor: event_cursor(inspected.session.session_id, offset),
+                reason: EventStreamLagReason::SubscriberBackpressure,
+                recover: "resubscribe_with_newer_cursor_or_lower_replay_limit".to_string(),
+            },
+        )
+        .await?;
+    }
+    for (event, cursor_offset) in replay {
+        offset = cursor_offset;
+        write_event_stream_frame(
+            &mut writer,
+            &EventStreamFrame::Event {
+                cursor: event_cursor(inspected.session.session_id, cursor_offset),
+                event,
+            },
+        )
+        .await?;
+    }
+
+    let heartbeat = Duration::from_millis(heartbeat_ms);
+    let mut last_heartbeat = Instant::now();
+    loop {
+        sleep(FOLLOW_POLL).await;
+        let records = read_event_records_from_offset(&inspected.paths.events_jsonl, offset)
+            .unwrap_or_default();
+        if records.is_empty() {
+            if session_is_terminal(&inspected.paths.meta_json) {
+                write_event_stream_frame(&mut writer, &EventStreamFrame::Closed).await?;
+                break;
+            }
+            if last_heartbeat.elapsed() >= heartbeat {
+                write_event_stream_frame(
+                    &mut writer,
+                    &EventStreamFrame::Heartbeat {
+                        cursor: event_cursor(inspected.session.session_id, offset),
+                    },
+                )
+                .await?;
+                last_heartbeat = Instant::now();
+            }
+            continue;
+        }
+
+        let dropped = records.len().saturating_sub(queue_limit);
+        let records = records.into_iter().skip(dropped).collect::<Vec<_>>();
+        if dropped > 0 {
+            write_event_stream_frame(
+                &mut writer,
+                &EventStreamFrame::StreamLagged {
+                    dropped_events: dropped as u64,
+                    cursor: event_cursor(inspected.session.session_id, offset),
+                    reason: EventStreamLagReason::SubscriberBackpressure,
+                    recover: "resubscribe_with_latest_cursor".to_string(),
+                },
+            )
+            .await?;
+        }
+        for (event, cursor_offset) in records {
+            offset = cursor_offset;
+            write_event_stream_frame(
+                &mut writer,
+                &EventStreamFrame::Event {
+                    cursor: event_cursor(inspected.session.session_id, cursor_offset),
+                    event,
+                },
+            )
+            .await?;
+        }
+        last_heartbeat = Instant::now();
+    }
+
+    Ok(())
+}
+
 async fn handle_attach_stream(
     request: millrace_sessions_core::protocol::ControlRequest,
     lines: Lines<TokioBufReader<OwnedReadHalf>>,
     mut writer: OwnedWriteHalf,
     paths: &StatePaths,
 ) -> Result<(), HostServerError> {
+    let is_v04 = request.is_v04();
     let params = match request.params_as::<SessionAttachRequest>() {
         Ok(params) => params,
         Err(error) => {
-            let response = error_response(
-                request.id,
-                ControlErrorCode::InvalidRequest,
-                format!("invalid session.attach params: {error}"),
-            );
+            let response = invalid_params_response(request.id, "session.attach", error);
+            let response = if is_v04 {
+                response.into_v04(ControlMethod::SessionAttach)
+            } else {
+                response
+            };
             writer
                 .write_all(response.to_json_line()?.as_bytes())
                 .await?;
@@ -3049,6 +3360,80 @@ fn read_from_offset(path: &std::path::Path, offset: u64) -> std::io::Result<(Vec
     Ok((bytes, new_offset))
 }
 
+fn read_event_records_from_offset(
+    path: &std::path::Path,
+    offset: u64,
+) -> std::io::Result<Vec<(SessionEvent, u64)>> {
+    let (bytes, _) = read_from_offset(path, offset)?;
+    let mut cursor = offset;
+    let mut records = Vec::new();
+    for line in bytes.split_inclusive(|byte| *byte == b'\n') {
+        cursor = cursor.saturating_add(line.len() as u64);
+        let line = String::from_utf8_lossy(line);
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if let Ok(event) = serde_json::from_str::<SessionEvent>(trimmed) {
+            records.push((event, cursor));
+        }
+    }
+    Ok(records)
+}
+
+fn event_cursor(session_id: SessionId, offset: u64) -> String {
+    format!("events:{session_id}:{offset}")
+}
+
+fn parse_event_cursor(
+    cursor: &str,
+    expected_session_id: SessionId,
+) -> Result<u64, ControlErrorBody> {
+    let mut parts = cursor.split(':');
+    match (parts.next(), parts.next(), parts.next(), parts.next()) {
+        (Some("events"), Some(session_id), Some(offset), None)
+            if session_id == expected_session_id.to_string() =>
+        {
+            offset
+                .parse::<u64>()
+                .map_err(|_| event_cursor_expired(cursor))
+        }
+        _ => Err(event_cursor_expired(cursor)),
+    }
+}
+
+fn event_cursor_expired(cursor: &str) -> ControlErrorBody {
+    ControlErrorBody::new(
+        ControlErrorCode::EventCursorExpired,
+        "event cursor is invalid or expired",
+    )
+    .with_details(json!({ "cursor": cursor }))
+}
+
+fn normalized_replay_limit(request: &EventSubscribeRequest) -> usize {
+    request.replay_limit.unwrap_or(128).min(1_000)
+}
+
+fn normalized_subscriber_queue_limit(request: &EventSubscribeRequest) -> usize {
+    request
+        .subscriber_queue_limit
+        .unwrap_or(256)
+        .clamp(1, 10_000)
+}
+
+fn normalized_heartbeat_ms(request: &EventSubscribeRequest) -> u64 {
+    request.heartbeat_ms.unwrap_or(5_000).clamp(50, 60_000)
+}
+
+async fn write_event_stream_frame(
+    writer: &mut OwnedWriteHalf,
+    frame: &EventStreamFrame,
+) -> Result<(), HostServerError> {
+    writer.write_all(frame.to_json_line()?.as_bytes()).await?;
+    writer.flush().await?;
+    Ok(())
+}
+
 fn session_is_terminal(meta_json: &std::path::Path) -> bool {
     read_json::<SessionMeta>(meta_json)
         .map(|meta| {
@@ -3100,6 +3485,156 @@ fn error_response(
     message: impl Into<String>,
 ) -> ControlResponse {
     ControlResponse::failure(id, ControlErrorBody::new(code, message))
+}
+
+fn invalid_params_response(
+    id: String,
+    method: &'static str,
+    error: serde_json::Error,
+) -> ControlResponse {
+    let message = format!("invalid {method} params: {error}");
+    let code = if message.contains("invalid role") {
+        ControlErrorCode::InvalidRole
+    } else {
+        ControlErrorCode::InvalidRequest
+    };
+    error_response(id, code, message)
+}
+
+fn api_identify_response() -> ApiIdentifyResponse {
+    ApiIdentifyResponse {
+        schema_version: M1_PROTOCOL_VERSION,
+        api_version: V04_API_VERSION.to_string(),
+        schema: V04_API_SCHEMA.to_string(),
+        socket_envelope: ApiEnvelopeDescription {
+            request: r#"{"id":"req_...","version":"0.4","method":"domain.action","params":{}}"#
+                .to_string(),
+            success_response:
+                r#"{"id":"req_...","ok":true,"schema":"millmux.api.v0.4","method":"domain.action","result":{}}"#
+                    .to_string(),
+            error_response:
+                r#"{"id":"req_...","ok":false,"schema":"millmux.api.v0.4","method":"domain.action","error":{"code":"...","message":"...","retryable":false,"details":{}}}"#
+                    .to_string(),
+        },
+        stable_command_groups: stable_command_groups(),
+        experimental_command_groups: experimental_command_groups(),
+        network_exposure: "local_unix_socket_only".to_string(),
+    }
+}
+
+fn api_capabilities_response() -> ApiCapabilitiesResponse {
+    let stable = [
+        ("workspace", vec!["session.list"]),
+        (
+            "session",
+            vec![
+                "session.start",
+                "session.attach",
+                "session.list",
+                "session.status",
+                "session.inspect",
+                "session.screen",
+                "session.logs",
+                "session.events",
+                "session.send",
+                "session.resize",
+                "session.stop",
+                "session.kill",
+                "session.delete",
+            ],
+        ),
+        ("agent", vec!["session.start", "session.list"]),
+        ("shell", vec!["session.start", "session.list"]),
+        ("daemon", vec!["session.start", "session.list"]),
+        ("pane", vec!["ui.context.get", "ui.context.list"]),
+        ("input", vec!["input.send"]),
+        ("screen", vec!["session.screen"]),
+        ("scrollback", vec!["session.screen"]),
+        ("logs", vec!["session.logs"]),
+        ("events", vec!["session.events", "events.subscribe"]),
+        (
+            "attention",
+            vec![
+                "attention.list",
+                "attention.mark",
+                "attention.read",
+                "attention.clear",
+            ],
+        ),
+        ("api", vec!["api.capabilities", "api.identify"]),
+        ("identify", vec!["api.identify"]),
+        ("context export", vec!["ui.context.get", "ui.context.list"]),
+        ("doctor", vec!["host.doctor"]),
+        ("cockpit", vec!["ui.context.set", "session.attach"]),
+        ("console", vec!["ui.context.set", "session.logs"]),
+    ]
+    .into_iter()
+    .map(|(name, methods)| ApiCapability {
+        name: name.to_string(),
+        methods: methods.into_iter().map(str::to_string).collect(),
+        available: true,
+        stability: ApiStability::Stable,
+        unavailable_reason: None,
+    })
+    .collect();
+
+    let experimental = [
+        (
+            "input leases",
+            "owner leases require TTL, token, identity, stale recovery, and events",
+        ),
+        ("browser adapters", "batch-6 follow-on surface"),
+        ("remote sockets", "network exposure is out of v0.4 scope"),
+    ]
+    .into_iter()
+    .map(|(name, reason)| ApiCapability {
+        name: name.to_string(),
+        methods: Vec::new(),
+        available: false,
+        stability: ApiStability::Experimental,
+        unavailable_reason: Some(reason.to_string()),
+    })
+    .collect();
+
+    ApiCapabilitiesResponse {
+        schema_version: M1_PROTOCOL_VERSION,
+        api_version: V04_API_VERSION.to_string(),
+        stable,
+        experimental,
+    }
+}
+
+fn stable_command_groups() -> Vec<String> {
+    [
+        "workspace",
+        "session",
+        "agent",
+        "shell",
+        "daemon",
+        "pane",
+        "input",
+        "screen",
+        "scrollback",
+        "logs",
+        "events",
+        "attention",
+        "api",
+        "identify",
+        "context export",
+        "doctor",
+        "cockpit",
+        "console",
+    ]
+    .into_iter()
+    .map(str::to_string)
+    .collect()
+}
+
+fn experimental_command_groups() -> Vec<String> {
+    ["input leases", "browser adapters", "remote sockets"]
+        .into_iter()
+        .map(str::to_string)
+        .collect()
 }
 
 #[derive(Debug, Error)]

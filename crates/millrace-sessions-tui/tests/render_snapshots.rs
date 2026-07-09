@@ -158,7 +158,7 @@ fn agent_cockpit_right_layout_snapshot() {
 Sessions | count=2
   millrace_daemon daemon st=running att=millrace_idle live=w:unknown c:unknown unread=unavailable cwd=/tmp/daemon git=un
   status millmux_session:running millrace_runtime=idle terminal_screen=unavailable operator=unavailable inferred=unav~
-> agent agent st=running att=millrace_idle live=w:unknown c:unknown unread=unavailable cwd=/tmp/agent git=unavailable@~a
+> millrace_agent agent st=running att=millrace_idle live=w:unknown c:unknown unread=unavailable cwd=/tmp/agent git=unava
   status millmux_session:running millrace_runtime=unavailable terminal_screen=unavailable operator=unavailable inferr~
 Agent Terminal | owned live cur=1,2 | selected                    Daemon Monitor | mon=basic | follow=live
 Millracer operator ready                                          daemon ready
@@ -179,7 +179,7 @@ fn agent_cockpit_bottom_layout_snapshot() {
 Sessions | count=2
   millrace_daemon daemon st=running att=millrace_idle live=w:unknown c:unknown u
   status millmux_session:running millrace_runtime=idle terminal_screen=unavai~
-> agent agent st=running att=millrace_idle live=w:unknown c:unknown unread=unava
+> millrace_agent agent st=running att=millrace_idle live=w:unknown c:unknown unr
   status millmux_session:running millrace_runtime=unavailable terminal_screen~
 Agent Terminal | owned live cur=1,2 | selected
 Millracer operator ready

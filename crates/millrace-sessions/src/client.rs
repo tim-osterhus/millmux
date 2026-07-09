@@ -10,10 +10,12 @@ use millrace_sessions_core::{
     error::MillmuxError,
     paths::{state_paths, StatePaths, STATE_DIR_ENV},
     protocol::{
+        ApiCapabilitiesRequest, ApiCapabilitiesResponse, ApiIdentifyRequest, ApiIdentifyResponse,
         AttachStreamFrame, AttentionClearRequest, AttentionListRequest, AttentionListResponse,
         AttentionMarkRequest, AttentionMutationResponse, AttentionReadRequest, ControlErrorBody,
         ControlMethod, ControlRequest, ControlResponse, DoctorRequest, DoctorResponse,
-        EventStreamFrame, HostStatusRequest, HostStatusResponse, LogStreamFrame,
+        EventStreamFrame, EventSubscribeRequest, EventSubscribeResponse, HostStatusRequest,
+        HostStatusResponse, InputSendRequest, InputSendResponse, LogStreamFrame,
         SessionAttachRequest, SessionAttachResponse, SessionDeleteRequest, SessionDeleteResponse,
         SessionEventsRequest, SessionEventsResponse, SessionInspectRequest, SessionInspectResponse,
         SessionKillRequest, SessionKillResponse, SessionListRequest, SessionListResponse,
@@ -111,6 +113,13 @@ impl SessionControlClient {
         self.request(ControlMethod::SessionInspect, request).await
     }
 
+    pub async fn status(
+        &self,
+        request: &SessionInspectRequest,
+    ) -> Result<SessionInspectResponse, ClientError> {
+        self.request(ControlMethod::SessionStatus, request).await
+    }
+
     pub async fn screen(
         &self,
         request: &SessionScreenRequest,
@@ -162,6 +171,20 @@ impl SessionControlClient {
             )
             .await?;
         Ok(EventsConnection { result, reader })
+    }
+
+    pub async fn events_subscribe(
+        &self,
+        request: &EventSubscribeRequest,
+    ) -> Result<EventSubscribeConnection, ClientError> {
+        let (result, reader) = self
+            .open_v04_response_stream(
+                ControlMethod::EventsSubscribe,
+                request,
+                "host closed events subscription stream without a response",
+            )
+            .await?;
+        Ok(EventSubscribeConnection { result, reader })
     }
 
     pub async fn send(
@@ -225,6 +248,26 @@ impl SessionControlClient {
         request: &AttentionClearRequest,
     ) -> Result<AttentionMutationResponse, ClientError> {
         self.request(ControlMethod::AttentionClear, request).await
+    }
+
+    pub async fn input_send(
+        &self,
+        request: &InputSendRequest,
+    ) -> Result<InputSendResponse, ClientError> {
+        self.request_v04(ControlMethod::InputSend, request).await
+    }
+
+    pub async fn api_capabilities(&self) -> Result<ApiCapabilitiesResponse, ClientError> {
+        self.request_v04(
+            ControlMethod::ApiCapabilities,
+            &ApiCapabilitiesRequest::default(),
+        )
+        .await
+    }
+
+    pub async fn api_identify(&self) -> Result<ApiIdentifyResponse, ClientError> {
+        self.request_v04(ControlMethod::ApiIdentify, &ApiIdentifyRequest::default())
+            .await
     }
 
     pub async fn ui_context_get(
@@ -297,7 +340,18 @@ impl SessionControlClient {
         R: DeserializeOwned,
     {
         let id = next_request_id();
-        let request = ControlRequest::with_params(id.clone(), method, params)?;
+        let request = ControlRequest::v04_with_params(id.clone(), method, params)?;
+        let response = self.exchange(&request).await?;
+        response_result(response, &id)
+    }
+
+    async fn request_v04<P, R>(&self, method: ControlMethod, params: &P) -> Result<R, ClientError>
+    where
+        P: Serialize,
+        R: DeserializeOwned,
+    {
+        let id = next_request_id();
+        let request = ControlRequest::v04_with_params(id.clone(), method, params)?;
         let response = self.exchange(&request).await?;
         response_result(response, &id)
     }
@@ -313,7 +367,36 @@ impl SessionControlClient {
         R: DeserializeOwned,
     {
         let id = next_request_id();
-        let request = ControlRequest::with_params(id.clone(), method, params)?;
+        let request = ControlRequest::v04_with_params(id.clone(), method, params)?;
+        let stream = UnixStream::connect(&self.paths.control_sock).await?;
+        let (reader, mut writer) = stream.into_split();
+        writer.write_all(request.to_json_line()?.as_bytes()).await?;
+        writer.flush().await?;
+
+        let mut reader = BufReader::new(reader);
+        let mut line = String::new();
+        let bytes = reader.read_line(&mut line).await?;
+        if bytes == 0 {
+            return Err(ClientError::Protocol(empty_response_message.to_string()));
+        }
+
+        let response = ControlResponse::from_json_line(&line)?;
+        let result = response_result::<R>(response, &id)?;
+        Ok((result, reader))
+    }
+
+    async fn open_v04_response_stream<P, R>(
+        &self,
+        method: ControlMethod,
+        params: &P,
+        empty_response_message: &'static str,
+    ) -> Result<(R, BufReader<OwnedReadHalf>), ClientError>
+    where
+        P: Serialize,
+        R: DeserializeOwned,
+    {
+        let id = next_request_id();
+        let request = ControlRequest::v04_with_params(id.clone(), method, params)?;
         let stream = UnixStream::connect(&self.paths.control_sock).await?;
         let (reader, mut writer) = stream.into_split();
         writer.write_all(request.to_json_line()?.as_bytes()).await?;
@@ -423,6 +506,22 @@ pub struct EventsConnection {
 
 impl EventsConnection {
     pub fn split(self) -> (SessionEventsResponse, EventReader) {
+        (
+            self.result,
+            EventReader {
+                reader: self.reader,
+            },
+        )
+    }
+}
+
+pub struct EventSubscribeConnection {
+    pub result: EventSubscribeResponse,
+    reader: BufReader<OwnedReadHalf>,
+}
+
+impl EventSubscribeConnection {
+    pub fn split(self) -> (EventSubscribeResponse, EventReader) {
         (
             self.result,
             EventReader {

@@ -453,6 +453,385 @@ fn protocol_contract_foreground_daemon_persists_ui_context_contract() {
 }
 
 #[test]
+fn v04_api_dispatch_wraps_success_and_invalid_role_errors() {
+    let temp = tempfile::tempdir().unwrap();
+    let paths = StatePaths::new(temp.path().join("state"));
+    let host = host_meta(&paths);
+
+    let capabilities = dispatch_json_line(
+        &format!(
+            "{}\n",
+            serde_json::to_string(&json!({
+                "id": "api-cap-1",
+                "version": "0.4",
+                "method": "api.capabilities",
+                "params": {}
+            }))
+            .unwrap()
+        ),
+        &paths,
+        &host,
+    );
+    let value = serde_json::to_value(capabilities).unwrap();
+    assert_eq!(value["id"], "api-cap-1");
+    assert_eq!(value["ok"], true);
+    assert_eq!(value["schema"], "millmux.api.v0.4");
+    assert_eq!(value["method"], "api.capabilities");
+    assert!(value["result"]["stable"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|capability| capability["name"] == "logs"));
+    let session_capability = value["result"]["stable"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|capability| capability["name"] == "session")
+        .expect("session capability");
+    for method in [
+        "session.start",
+        "session.attach",
+        "session.list",
+        "session.status",
+        "session.inspect",
+        "session.screen",
+        "session.logs",
+        "session.events",
+        "session.send",
+        "session.resize",
+        "session.stop",
+        "session.kill",
+        "session.delete",
+    ] {
+        assert!(
+            session_capability["methods"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|candidate| candidate.as_str() == Some(method)),
+            "missing {method}: {session_capability:#?}"
+        );
+    }
+
+    let invalid_role = dispatch_json_line(
+        &format!(
+            "{}\n",
+            serde_json::to_string(&json!({
+                "id": "role-bad-1",
+                "version": "0.4",
+                "method": "session.list",
+                "params": {"role": "worker"}
+            }))
+            .unwrap()
+        ),
+        &paths,
+        &host,
+    );
+    let value = serde_json::to_value(invalid_role).unwrap();
+    assert_eq!(value["ok"], false);
+    assert_eq!(value["schema"], "millmux.api.v0.4");
+    assert_eq!(value["method"], "session.list");
+    assert_eq!(value["error"]["code"], "invalid_role");
+    assert_eq!(value["error"]["retryable"], false);
+    assert_eq!(value["error"]["details"], json!({}));
+
+    let invalid_selector = json!({
+        "type": "workspace_role",
+        "workspace": temp.path().join("workspace").display().to_string(),
+        "role": "worker"
+    });
+    for (method, params) in [
+        (
+            "session.inspect",
+            json!({"selector": invalid_selector.clone()}),
+        ),
+        (
+            "session.screen",
+            json!({"selector": invalid_selector.clone()}),
+        ),
+        (
+            "session.logs",
+            json!({"selector": invalid_selector.clone()}),
+        ),
+        (
+            "session.events",
+            json!({"selector": invalid_selector.clone()}),
+        ),
+        (
+            "session.send",
+            json!({"selector": invalid_selector.clone(), "text": "x"}),
+        ),
+        (
+            "input.send",
+            json!({
+                "target": {"type": "session", "selector": invalid_selector.clone()},
+                "text": "x"
+            }),
+        ),
+        (
+            "session.resize",
+            json!({"selector": invalid_selector.clone(), "rows": 24, "cols": 80}),
+        ),
+        (
+            "session.stop",
+            json!({"selector": invalid_selector.clone()}),
+        ),
+        (
+            "session.kill",
+            json!({"selector": invalid_selector.clone()}),
+        ),
+        (
+            "session.delete",
+            json!({"selector": invalid_selector.clone()}),
+        ),
+        (
+            "attention.list",
+            json!({"selector": invalid_selector.clone()}),
+        ),
+        (
+            "attention.mark",
+            json!({
+                "selector": invalid_selector.clone(),
+                "kind": "needs_input",
+                "severity": "warning",
+                "source": "api",
+                "message": "waiting"
+            }),
+        ),
+        (
+            "attention.read",
+            json!({"selector": invalid_selector.clone()}),
+        ),
+        (
+            "attention.clear",
+            json!({"selector": invalid_selector.clone()}),
+        ),
+    ] {
+        let response = dispatch_json_line(
+            &format!(
+                "{}\n",
+                serde_json::to_string(&json!({
+                    "id": format!("{method}-bad-role"),
+                    "version": "0.4",
+                    "method": method,
+                    "params": params
+                }))
+                .unwrap()
+            ),
+            &paths,
+            &host,
+        );
+        let value = serde_json::to_value(response).unwrap();
+        assert_eq!(value["ok"], false, "{method}: {value:#?}");
+        assert_eq!(value["method"], method, "{method}: {value:#?}");
+        assert_eq!(
+            value["error"]["code"], "invalid_role",
+            "{method}: {value:#?}"
+        );
+    }
+
+    let unknown = dispatch_json_line(
+        &format!(
+            "{}\n",
+            serde_json::to_string(&json!({
+                "id": "unknown-v04-1",
+                "version": "0.4",
+                "method": "future.command",
+                "params": {}
+            }))
+            .unwrap()
+        ),
+        &paths,
+        &host,
+    );
+    let value = serde_json::to_value(unknown).unwrap();
+    assert_eq!(value["ok"], false);
+    assert_eq!(value["schema"], "millmux.api.v0.4");
+    assert_eq!(value["method"], "future.command");
+    assert_eq!(value["error"]["code"], "unknown_method");
+    assert_eq!(value["error"]["retryable"], false);
+    assert_eq!(value["error"]["details"], json!({}));
+}
+
+#[test]
+fn input_send_pane_target_requires_focus_before_worker_send() {
+    let temp = tempfile::tempdir().unwrap();
+    let paths = StatePaths::new(temp.path().join("state"));
+    let workspace = temp.path().join("workspace");
+    fs::create_dir_all(&workspace).unwrap();
+    let session = sample_session(&workspace);
+    write_session_meta(&paths, &session);
+
+    let ui_id = UiId::new();
+    let pane_id = PaneId::new();
+    let ui_paths = paths.ui_context_paths(ui_id);
+    write_json_atomic(
+        &ui_paths.context_json,
+        &json!({
+            "schema_version": 1,
+            "ui_id": ui_id,
+            "mode": "agent_cockpit",
+            "active_pane_id": pane_id,
+            "panes": [{
+                "id": pane_id,
+                "title": "Agent",
+                "view": {
+                    "kind": "session_terminal",
+                    "session_id": session.id
+                },
+                "focused": false,
+                "stale": false
+            }],
+            "selected_session_id": session.id,
+            "focused_session_id": session.id,
+            "focused_pane_kind": "agent_terminal",
+            "active_daemon_session_id": null,
+            "active_workspace": null,
+            "agent_session_id": session.id,
+            "managed_session_ids": [session.id],
+            "managed_daemon_session_ids": [],
+            "monitor_profile": "basic",
+            "daemon_health": [],
+            "updated_at": "2026-07-09T00:00:00Z"
+        }),
+    )
+    .unwrap();
+
+    let response = dispatch_json_line(
+        &format!(
+            "{}\n",
+            serde_json::to_string(&json!({
+                "id": "input-pane-1",
+                "version": "0.4",
+                "method": "input.send",
+                "params": {
+                    "target": {
+                        "type": "pane",
+                        "ui_id": ui_id,
+                        "pane_id": pane_id
+                    },
+                    "text": "hello",
+                    "require_focus": true
+                }
+            }))
+            .unwrap()
+        ),
+        &paths,
+        &host_meta(&paths),
+    );
+
+    let value = serde_json::to_value(response).unwrap();
+    assert_eq!(value["ok"], false);
+    assert_eq!(value["method"], "input.send");
+    assert_eq!(value["error"]["code"], "input_owner_conflict");
+    assert_eq!(value["error"]["details"]["require_focus"], true);
+
+    for (case, pane_patch, expected_code) in [
+        (
+            "scrollback",
+            json!({
+                "view": {
+                    "kind": "session_terminal",
+                    "session_id": session.id,
+                    "view_mode": "scrollback"
+                },
+                "focused": true,
+                "stale": false,
+                "read_only": false,
+                "overlay_active": false
+            }),
+            "invalid_request",
+        ),
+        (
+            "read-only",
+            json!({
+                "view": {
+                    "kind": "session_terminal",
+                    "session_id": session.id
+                },
+                "focused": true,
+                "stale": false,
+                "read_only": true,
+                "overlay_active": false
+            }),
+            "input_owner_conflict",
+        ),
+        (
+            "overlay",
+            json!({
+                "view": {
+                    "kind": "session_terminal",
+                    "session_id": session.id
+                },
+                "focused": true,
+                "stale": false,
+                "read_only": false,
+                "overlay_active": true
+            }),
+            "input_owner_conflict",
+        ),
+    ] {
+        write_json_atomic(
+            &ui_paths.context_json,
+            &json!({
+                "schema_version": 1,
+                "ui_id": ui_id,
+                "mode": "agent_cockpit",
+                "active_pane_id": pane_id,
+                "panes": [{
+                    "id": pane_id,
+                    "title": "Agent",
+                    "view": pane_patch["view"].clone(),
+                    "focused": pane_patch["focused"].clone(),
+                    "stale": pane_patch["stale"].clone(),
+                    "read_only": pane_patch["read_only"].clone(),
+                    "overlay_active": pane_patch["overlay_active"].clone()
+                }],
+                "selected_session_id": session.id,
+                "focused_session_id": session.id,
+                "focused_pane_kind": "agent_terminal",
+                "active_daemon_session_id": null,
+                "active_workspace": null,
+                "agent_session_id": session.id,
+                "managed_session_ids": [session.id],
+                "managed_daemon_session_ids": [],
+                "monitor_profile": "basic",
+                "daemon_health": [],
+                "updated_at": "2026-07-09T00:00:00Z"
+            }),
+        )
+        .unwrap();
+
+        let response = dispatch_json_line(
+            &format!(
+                "{}\n",
+                serde_json::to_string(&json!({
+                    "id": format!("input-pane-{case}"),
+                    "version": "0.4",
+                    "method": "input.send",
+                    "params": {
+                        "target": {
+                            "type": "pane",
+                            "ui_id": ui_id,
+                            "pane_id": pane_id
+                        },
+                        "text": "hello",
+                        "require_focus": true
+                    }
+                }))
+                .unwrap()
+            ),
+            &paths,
+            &host_meta(&paths),
+        );
+        let value = serde_json::to_value(response).unwrap();
+        assert_eq!(value["ok"], false, "{case}: {value:#?}");
+        assert_eq!(value["method"], "input.send");
+        assert_eq!(value["error"]["code"], expected_code, "{case}: {value:#?}");
+    }
+}
+
+#[test]
 fn session_screen_returns_structured_snapshot_from_terminal_checkpoint() {
     let temp = tempfile::tempdir().unwrap();
     let paths = StatePaths::new(temp.path().join("state"));

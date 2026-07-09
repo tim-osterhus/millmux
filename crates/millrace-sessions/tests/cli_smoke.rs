@@ -329,6 +329,141 @@ fn cli_smoke_concurrent_list_json_calls_share_autostarted_host() {
 }
 
 #[test]
+fn cli_smoke_api_capabilities_identify_and_grouped_aliases() {
+    let host = TempHost::new();
+    millmux_command(&host)
+        .args(["list", "--json"])
+        .assert()
+        .success();
+    let session_id = seed_screen_session(&host);
+
+    let capabilities_output = millmux_command(&host)
+        .args(["api", "capabilities", "--json"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let capabilities: Value =
+        serde_json::from_slice(&capabilities_output).expect("api capabilities json");
+    assert_eq!(capabilities["api_version"], "0.4");
+    let stable = capabilities["stable"]
+        .as_array()
+        .expect("stable capabilities");
+    for group in [
+        "workspace",
+        "session",
+        "agent",
+        "shell",
+        "daemon",
+        "pane",
+        "input",
+        "screen",
+        "scrollback",
+        "logs",
+        "events",
+        "attention",
+        "api",
+        "identify",
+        "context export",
+        "doctor",
+        "cockpit",
+        "console",
+    ] {
+        assert!(
+            stable
+                .iter()
+                .any(|capability| capability["name"].as_str() == Some(group)),
+            "missing stable capability {group}: {capabilities:#?}"
+        );
+    }
+    let session_methods = stable
+        .iter()
+        .find(|capability| capability["name"] == "session")
+        .expect("session capability")["methods"]
+        .as_array()
+        .expect("session methods");
+    for method in [
+        "session.start",
+        "session.attach",
+        "session.list",
+        "session.status",
+        "session.inspect",
+        "session.screen",
+        "session.logs",
+        "session.events",
+        "session.send",
+        "session.resize",
+        "session.stop",
+        "session.kill",
+        "session.delete",
+    ] {
+        assert!(
+            session_methods
+                .iter()
+                .any(|candidate| candidate.as_str() == Some(method)),
+            "missing session method {method}: {capabilities:#?}"
+        );
+    }
+
+    let identify_output = millmux_command(&host)
+        .args(["identify", "--json"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let identify: Value = serde_json::from_slice(&identify_output).expect("identify json");
+    assert_eq!(identify["schema"], "millmux.api.v0.4");
+    assert_eq!(identify["network_exposure"], "local_unix_socket_only");
+
+    let grouped_list_output = millmux_command(&host)
+        .args(["session", "list", "--json"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let grouped_list: Value =
+        serde_json::from_slice(&grouped_list_output).expect("session list json");
+    assert!(grouped_list["sessions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|session| session["session_id"].as_str() == Some(session_id.as_str())));
+
+    let scrollback_output = millmux_command(&host)
+        .args(["scrollback", "show", "--json", &session_id])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let scrollback: Value = serde_json::from_slice(&scrollback_output).expect("scrollback json");
+    assert_eq!(scrollback["session_id"], session_id);
+    assert!(
+        matches!(
+            scrollback["type"].as_str(),
+            Some("screen_snapshot" | "snapshot_unavailable")
+        ),
+        "scrollback show must be backed by the structured screen API: {scrollback:#?}"
+    );
+
+    let stderr = millmux_command(&host)
+        .args(["start", "--role", "worker", "--", "sh", "-c", "true"])
+        .assert()
+        .failure()
+        .get_output()
+        .stderr
+        .clone();
+    assert!(
+        String::from_utf8_lossy(&stderr).contains("invalid role"),
+        "{}",
+        String::from_utf8_lossy(&stderr)
+    );
+}
+
+#[test]
 fn cli_smoke_short_reader_pipelines_exit_cleanly_for_json_and_line_outputs() {
     let host = TempHost::new();
     millmux_command(&host)
