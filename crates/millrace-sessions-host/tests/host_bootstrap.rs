@@ -216,6 +216,8 @@ fn sample_session(workspace: impl AsRef<Path>, role: SessionRole) -> SessionMeta
         role,
         process_state: ProcessState::Running,
         attention_state: AttentionState::MillraceIdle,
+        attention_items: Vec::new(),
+        status_summary: None,
         workspace: Some(WorkspaceIdentity::capture(workspace).unwrap()),
         cwd: workspace.to_path_buf(),
         argv: vec![

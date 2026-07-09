@@ -34,6 +34,10 @@ pub enum SessionEventKind {
     Archived,
     Purged,
     DoctorRepair,
+    AttentionMarked,
+    AttentionRead,
+    AttentionCleared,
+    StatusSummaryUpdated,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -86,6 +90,10 @@ mod tests {
         assert_eq!(
             serde_json::to_string(&SessionEventKind::DoctorRepair).unwrap(),
             "\"doctor_repair\""
+        );
+        assert_eq!(
+            serde_json::to_string(&SessionEventKind::AttentionMarked).unwrap(),
+            "\"attention_marked\""
         );
     }
 

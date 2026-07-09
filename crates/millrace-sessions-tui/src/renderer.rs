@@ -482,29 +482,7 @@ fn render_workspace_session_list(frame: &mut ratatui::Frame<'_>, area: Rect, app
 }
 
 fn status_source_line(row: &crate::pane::WorkspaceSessionRow) -> String {
-    format!(
-        "millmux_session millrace_runtime={} terminal_screen=preview operator=unavailable inferred={}",
-        runtime_source_value(&row.source_summary),
-        inferred_source_value(&row.source_summary)
-    )
-}
-
-fn runtime_source_value(source: &str) -> &'static str {
-    if source.contains("millrace_runtime:busy") {
-        "busy"
-    } else if source.contains("millrace_runtime:idle") {
-        "idle"
-    } else {
-        "unavailable"
-    }
-}
-
-fn inferred_source_value(source: &str) -> &'static str {
-    if source.contains("inferred=inferred") {
-        "inferred"
-    } else {
-        "unavailable"
-    }
+    row.source_summary.clone()
 }
 
 fn render_log(

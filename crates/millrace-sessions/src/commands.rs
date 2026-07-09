@@ -6,13 +6,17 @@ use millrace_sessions_core::{
     paths::UI_ID_ENV,
     protocol::{
         AttachFrameType, AttachInitialReplay, AttachReplayMode, AttachStreamEncoding,
+        AttentionClearRequest, AttentionListRequest, AttentionMarkRequest, AttentionReadRequest,
         DoctorRepairMode, DoctorRequest, SessionAttachRequest, SessionDeleteRequest,
         SessionEventsRequest, SessionInspectRequest, SessionKillRequest, SessionListRequest,
         SessionLogsRequest, SessionResizeRequest, SessionScreenRequest, SessionSelector,
         SessionSendRequest, SessionStartRequest, SessionStopRequest, UiContextGetRequest,
         UiContextListRequest, M2_ATTACH_PROTOCOL_VERSION,
     },
-    state::{MonitorProfile, SessionRole, SpawnMode},
+    state::{
+        AttentionKind, AttentionSeverity, AttentionSource, AttentionTargetType, MonitorProfile,
+        SessionRole, SpawnMode,
+    },
 };
 use millrace_sessions_tui::{AgentCockpitLayout, DaemonConsoleLayout};
 use thiserror::Error;
@@ -41,6 +45,7 @@ pub enum CliCommand {
     Stop(StopArgs),
     Kill(KillArgs),
     Delete(DeleteArgs),
+    Attention(AttentionArgs),
     Context(ContextArgs),
     Console(ConsoleArgs),
     Cockpit(CockpitArgs),
@@ -63,6 +68,7 @@ impl CliCommand {
             | Self::Stop(_)
             | Self::Kill(_)
             | Self::Delete(_)
+            | Self::Attention(_)
             | Self::Context(_)
             | Self::Console(_)
             | Self::Cockpit(_)
@@ -426,6 +432,129 @@ impl DeleteArgs {
 }
 
 #[derive(Debug, Args)]
+pub struct AttentionArgs {
+    #[command(subcommand)]
+    pub command: AttentionCommand,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum AttentionCommand {
+    List(AttentionListArgs),
+    Mark(AttentionMarkArgs),
+    Read(AttentionReadArgs),
+    Clear(AttentionClearArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct AttentionListArgs {
+    #[command(flatten)]
+    pub selector: SelectorArgs,
+    #[arg(long)]
+    pub include_read: bool,
+    #[arg(long)]
+    pub include_cleared: bool,
+    #[arg(long)]
+    pub json: bool,
+}
+
+impl AttentionListArgs {
+    pub fn request(&self) -> Result<AttentionListRequest, CommandError> {
+        Ok(AttentionListRequest {
+            selector: self.selector.required()?,
+            include_read: self.include_read,
+            include_cleared: self.include_cleared,
+        })
+    }
+}
+
+#[derive(Debug, Args)]
+pub struct AttentionMarkArgs {
+    #[command(flatten)]
+    pub selector: SelectorArgs,
+    #[arg(long, value_parser = parse_attention_target_type, default_value = "session")]
+    pub target_type: AttentionTargetType,
+    #[arg(long)]
+    pub target_id: Option<String>,
+    #[arg(long, value_parser = parse_attention_kind)]
+    pub kind: AttentionKind,
+    #[arg(long, value_parser = parse_attention_severity, default_value = "info")]
+    pub severity: AttentionSeverity,
+    #[arg(long, value_parser = parse_attention_source, default_value = "cli")]
+    pub source: AttentionSource,
+    #[arg(long)]
+    pub message: String,
+    #[arg(long)]
+    pub dedupe_key: Option<String>,
+    #[arg(long)]
+    pub status_label: Option<String>,
+    #[arg(long)]
+    pub status_detail: Option<String>,
+    #[arg(long)]
+    pub json: bool,
+}
+
+impl AttentionMarkArgs {
+    pub fn request(&self) -> Result<AttentionMarkRequest, CommandError> {
+        Ok(AttentionMarkRequest {
+            selector: self.selector.required()?,
+            target_type: self.target_type,
+            target_id: self.target_id.clone(),
+            kind: self.kind,
+            severity: self.severity,
+            source: self.source,
+            message: self.message.clone(),
+            dedupe_key: self.dedupe_key.clone(),
+            status_label: self.status_label.clone(),
+            status_detail: self.status_detail.clone(),
+        })
+    }
+}
+
+#[derive(Debug, Args)]
+pub struct AttentionReadArgs {
+    #[command(flatten)]
+    pub selector: SelectorArgs,
+    #[arg(long)]
+    pub item: Option<String>,
+    #[arg(long = "kind", value_parser = parse_attention_kind)]
+    pub kinds: Vec<AttentionKind>,
+    #[arg(long)]
+    pub json: bool,
+}
+
+impl AttentionReadArgs {
+    pub fn request(&self) -> Result<AttentionReadRequest, CommandError> {
+        Ok(AttentionReadRequest {
+            selector: self.selector.required()?,
+            item_id: self.item.clone(),
+            kinds: self.kinds.clone(),
+        })
+    }
+}
+
+#[derive(Debug, Args)]
+pub struct AttentionClearArgs {
+    #[command(flatten)]
+    pub selector: SelectorArgs,
+    #[arg(long)]
+    pub item: Option<String>,
+    #[arg(long = "kind", value_parser = parse_attention_kind)]
+    pub kinds: Vec<AttentionKind>,
+    #[arg(long)]
+    pub json: bool,
+}
+
+impl AttentionClearArgs {
+    pub fn request(&self) -> Result<AttentionClearRequest, CommandError> {
+        Ok(AttentionClearRequest {
+            selector: self.selector.required()?,
+            item_id: self.item.clone(),
+            kinds: self.kinds.clone(),
+        })
+    }
+}
+
+#[derive(Debug, Args)]
 pub struct DoctorArgs {
     #[arg(long)]
     pub json: bool,
@@ -627,6 +756,14 @@ pub enum CommandError {
     InvalidCockpitLayout(String),
     #[error("invalid daemon console command: {0}")]
     InvalidConsoleCommand(String),
+    #[error("invalid attention target type: {0}")]
+    InvalidAttentionTargetType(String),
+    #[error("invalid attention kind: {0}")]
+    InvalidAttentionKind(String),
+    #[error("invalid attention severity: {0}")]
+    InvalidAttentionSeverity(String),
+    #[error("invalid attention source: {0}")]
+    InvalidAttentionSource(String),
 }
 
 fn selector_from_value(value: &str) -> SessionSelector {
@@ -707,6 +844,30 @@ fn parse_console_command(value: &str) -> Result<ConsoleCommand, CommandError> {
         "purge" => Ok(ConsoleCommand::Purge),
         other => Err(CommandError::InvalidConsoleCommand(other.to_string())),
     }
+}
+
+fn parse_attention_target_type(value: &str) -> Result<AttentionTargetType, CommandError> {
+    value
+        .parse()
+        .map_err(|_| CommandError::InvalidAttentionTargetType(value.to_string()))
+}
+
+fn parse_attention_kind(value: &str) -> Result<AttentionKind, CommandError> {
+    value
+        .parse()
+        .map_err(|_| CommandError::InvalidAttentionKind(value.to_string()))
+}
+
+fn parse_attention_severity(value: &str) -> Result<AttentionSeverity, CommandError> {
+    value
+        .parse()
+        .map_err(|_| CommandError::InvalidAttentionSeverity(value.to_string()))
+}
+
+fn parse_attention_source(value: &str) -> Result<AttentionSource, CommandError> {
+    value
+        .parse()
+        .map_err(|_| CommandError::InvalidAttentionSource(value.to_string()))
 }
 
 #[cfg(test)]

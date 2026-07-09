@@ -225,6 +225,8 @@ fn sample_session(cwd: &Path) -> SessionMeta {
         role: SessionRole::Shell,
         process_state: ProcessState::Starting,
         attention_state: AttentionState::Active,
+        attention_items: Vec::new(),
+        status_summary: None,
         workspace: None,
         cwd: cwd.to_path_buf(),
         argv: vec!["sh".to_string(), "-c".to_string(), "echo ready".to_string()],

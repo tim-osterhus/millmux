@@ -5,9 +5,9 @@ use millrace_sessions_core::{
     ids::{PaneId, SessionId, UiId},
     protocol::SessionSummary,
     state::{
-        AttentionState, LivenessState, MonitorProfile, ProcessState, SessionRole, UiContext,
-        UiDaemonHealth, UiDaemonRecoveryAction, UiMode, UiPaneContext, UiPaneView, UiPaneViewKind,
-        UiPaneViewMode,
+        AttentionState, LivenessState, MonitorProfile, ProcessState, SessionRole, StatusSummary,
+        StatusSummarySource, UiContext, UiDaemonHealth, UiDaemonRecoveryAction, UiMode,
+        UiPaneContext, UiPaneView, UiPaneViewKind, UiPaneViewMode,
     },
     workspace::{GitWorktreeIdentity, WorkspaceIdentity},
 };
@@ -1994,7 +1994,26 @@ fn workspace_session_row(
             "unavailable",
         ),
     };
-    let runtime_source = runtime_status_source(session);
+    let attention = attention_label_for_row(session).to_string();
+    let unread = unread_label_for_row(session);
+    let status = effective_status_summary(session);
+    let status_summary = format!(
+        "status {}:{} liveness={}",
+        status.source,
+        status.label,
+        liveness_label(session)
+    );
+    let source_summary = format!(
+        "status {}:{} millrace_runtime={} terminal_screen={} operator={} inferred={} attention_sources={} read_open={}",
+        status.source,
+        status.label,
+        runtime_source_value(session, &status),
+        terminal_screen_source_value(&status),
+        operator_source_value(&status),
+        inferred_source_value(&status, inferred_source),
+        attention_sources_label(&session.attention),
+        session.attention.read_open_count
+    );
     WorkspaceSessionRow {
         session_id: session.session_id,
         role: session_role_label(&session.role).to_string(),
@@ -2007,18 +2026,14 @@ fn workspace_session_row(
         branch,
         process_state: process_state_label(&session.process_state).to_string(),
         liveness: liveness_label(session),
-        unread: "unread=unavailable".to_string(),
-        attention: attention_label_for_row(&session.attention_state).to_string(),
+        unread,
+        attention,
+        attention_rollup: session.attention.clone(),
+        status,
         selected,
         focused,
-        status_summary: format!(
-            "status millmux_session:{} liveness={}",
-            process_state_label(&session.process_state),
-            liveness_label(session)
-        ),
-        source_summary: format!(
-            "source millmux_session runtime={runtime_source} terminal_screen=preview operator=unavailable inferred={inferred_source}"
-        ),
+        status_summary,
+        source_summary,
     }
 }
 
@@ -2050,8 +2065,35 @@ fn liveness_state_label(state: LivenessState) -> &'static str {
     }
 }
 
-fn attention_label_for_row(state: &AttentionState) -> &'static str {
-    match state {
+fn attention_label_for_row(session: &SessionSummary) -> String {
+    if session.attention.open_count > 0 {
+        let severity = session
+            .attention
+            .highest_severity
+            .map(|severity| severity.to_string())
+            .unwrap_or_else(|| "info".to_string());
+        let kinds = if session.attention.kinds.is_empty() {
+            "none".to_string()
+        } else {
+            session
+                .attention
+                .kinds
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(",")
+        };
+        return format!(
+            "open={} unread={} read={} sev={} kinds={} src={}",
+            session.attention.open_count,
+            session.attention.unread_count,
+            session.attention.read_open_count,
+            severity,
+            kinds,
+            attention_sources_label(&session.attention)
+        );
+    }
+    match session.attention_state {
         AttentionState::Unknown => "unknown",
         AttentionState::Active => "active",
         AttentionState::Idle => "idle",
@@ -2059,17 +2101,86 @@ fn attention_label_for_row(state: &AttentionState) -> &'static str {
         AttentionState::MillraceIdle => "millrace_idle",
         AttentionState::MillraceBusy => "millrace_busy",
     }
+    .to_string()
 }
 
-fn runtime_status_source(session: &SessionSummary) -> &'static str {
+fn attention_sources_label(attention: &millrace_sessions_core::state::AttentionRollup) -> String {
+    if attention.sources.is_empty() {
+        "none".to_string()
+    } else {
+        attention
+            .sources
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(",")
+    }
+}
+
+fn unread_label_for_row(session: &SessionSummary) -> String {
+    if has_attention_rollup_evidence(session) {
+        format!("unread={}", session.attention.unread_count)
+    } else {
+        "unread=unavailable".to_string()
+    }
+}
+
+fn has_attention_rollup_evidence(session: &SessionSummary) -> bool {
+    session.attention.open_count > 0
+        || session.attention.unread_count > 0
+        || session.attention.highest_severity.is_some()
+        || !session.attention.kinds.is_empty()
+        || session.attention.top_message.is_some()
+        || session.attention.status_label.is_some()
+        || session.attention.status_detail.is_some()
+}
+
+fn effective_status_summary(session: &SessionSummary) -> StatusSummary {
+    if session.status_summary.source != StatusSummarySource::Unavailable {
+        return session.status_summary.clone();
+    }
+    StatusSummary::millmux_session(
+        process_state_label(&session.process_state),
+        Some(liveness_label(session)),
+    )
+}
+
+fn runtime_source_value(session: &SessionSummary, status: &StatusSummary) -> String {
+    if status.source == StatusSummarySource::MillraceRuntime {
+        return status.label.clone();
+    }
     if session.role == SessionRole::MillraceDaemon {
         match session.attention_state {
-            AttentionState::MillraceIdle => "millrace_runtime:idle",
-            AttentionState::MillraceBusy => "millrace_runtime:busy",
-            _ => "unavailable",
+            AttentionState::MillraceIdle => "idle".to_string(),
+            AttentionState::MillraceBusy => "busy".to_string(),
+            _ => "unavailable".to_string(),
         }
     } else {
-        "unavailable"
+        "unavailable".to_string()
+    }
+}
+
+fn terminal_screen_source_value(status: &StatusSummary) -> String {
+    if status.source == StatusSummarySource::TerminalScreen {
+        status.label.clone()
+    } else {
+        "unavailable".to_string()
+    }
+}
+
+fn operator_source_value(status: &StatusSummary) -> String {
+    if status.source == StatusSummarySource::Operator {
+        status.label.clone()
+    } else {
+        "unavailable".to_string()
+    }
+}
+
+fn inferred_source_value(status: &StatusSummary, fallback: &str) -> String {
+    if status.source == StatusSummarySource::Inferred {
+        status.label.clone()
+    } else {
+        fallback.to_string()
     }
 }
 
@@ -2398,8 +2509,10 @@ mod tests {
         assert_eq!(daemon.role, "millrace_daemon");
         assert!(daemon.status_summary.contains("millmux_session:running"));
         assert!(daemon.source_summary.contains("millmux_session"));
-        assert!(daemon.source_summary.contains("millrace_runtime:busy"));
-        assert!(daemon.source_summary.contains("terminal_screen=preview"));
+        assert!(daemon.source_summary.contains("millrace_runtime=busy"));
+        assert!(daemon
+            .source_summary
+            .contains("terminal_screen=unavailable"));
         assert!(daemon.source_summary.contains("operator=unavailable"));
         assert!(daemon.source_summary.contains("inferred=unavailable"));
         let agent = rows.iter().find(|row| row.session_id == agent_id).unwrap();
@@ -3578,6 +3691,77 @@ mod tests {
             .any(|pane| pane.view.kind == UiPaneViewKind::SessionList));
     }
 
+    #[test]
+    fn attention_rollup_and_status_source_feed_workspace_rows() {
+        let mut daemon = summary("daemon");
+        daemon.attention = millrace_sessions_core::state::AttentionRollup {
+            schema_version: 1,
+            open_count: 2,
+            unread_count: 1,
+            highest_severity: Some(millrace_sessions_core::state::AttentionSeverity::Critical),
+            kinds: vec![
+                millrace_sessions_core::state::AttentionKind::Unread,
+                millrace_sessions_core::state::AttentionKind::Blocked,
+            ],
+            sources: vec![
+                millrace_sessions_core::state::AttentionSource::Agent,
+                millrace_sessions_core::state::AttentionSource::Operator,
+            ],
+            read_open_count: 1,
+            top_message: Some("operator needed".to_string()),
+            status_label: Some("blocked".to_string()),
+            status_detail: Some("approval required".to_string()),
+        };
+        daemon.status_summary = millrace_sessions_core::state::StatusSummary {
+            schema_version: 1,
+            source: millrace_sessions_core::state::StatusSummarySource::MillraceRuntime,
+            label: "idle".to_string(),
+            detail: Some("runtime reported idle".to_string()),
+            updated_at: Some("2026-05-26T00:00:02Z".to_string()),
+        };
+        let daemon_id = daemon.session_id;
+        let mut agent = summary("agent");
+        agent.role = SessionRole::Agent;
+        let app = AppModel::agent_cockpit(
+            UiId::new(),
+            agent,
+            vec![daemon],
+            Some(daemon_id),
+            BTreeMap::new(),
+            AgentTerminalPane::new(10, 40, true, false),
+            AgentCockpitLayout::Right,
+            MonitorProfile::Basic,
+        );
+
+        let rows = app.workspace_session_rows();
+        let row = rows
+            .iter()
+            .find(|row| row.session_id == daemon_id)
+            .expect("daemon row");
+
+        assert_eq!(row.attention_rollup.open_count, 2);
+        assert_eq!(row.attention_rollup.unread_count, 1);
+        assert_eq!(row.status.source.to_string(), "millrace_runtime");
+        assert_eq!(row.status.label, "idle");
+        assert_eq!(row.unread, "unread=1");
+        assert!(row.attention.contains("critical"), "{}", row.attention);
+        assert!(
+            row.attention.contains("src=agent,operator"),
+            "{}",
+            row.attention
+        );
+        assert!(
+            row.source_summary.contains("status millrace_runtime:idle"),
+            "{}",
+            row.source_summary
+        );
+        assert!(
+            row.source_summary.contains("read_open=1"),
+            "{}",
+            row.source_summary
+        );
+    }
+
     fn summary(name: &str) -> SessionSummary {
         let cwd = std::path::PathBuf::from(format!("/tmp/{name}"));
         SessionSummary {
@@ -3587,6 +3771,8 @@ mod tests {
             spawn_mode: SpawnMode::Pty,
             process_state: ProcessState::Running,
             attention_state: AttentionState::MillraceIdle,
+            attention: Default::default(),
+            status_summary: Default::default(),
             failure_message: None,
             workspace: Some(WorkspaceIdentity {
                 canonical_path: cwd.clone(),

@@ -19,26 +19,28 @@ use millrace_sessions_core::{
     ids::{SessionId, UiId},
     paths::{state_paths, StatePaths},
     protocol::{
-        AttachStreamFrame, ControlErrorBody, ControlErrorCode, ControlResponse, DoctorRequest,
-        EventStreamFrame, HostStatusRequest, HostStatusResponse, LogLine, LogStream,
-        LogStreamFrame, ScreenFrame, SessionArtifacts, SessionAttachRequest, SessionAttachResponse,
-        SessionCapabilities, SessionDeleteRequest, SessionDeleteResponse, SessionEventsRequest,
-        SessionEventsResponse, SessionInspectRequest, SessionInspectResponse, SessionKillRequest,
-        SessionKillResponse, SessionListRequest, SessionListResponse, SessionLogsRequest,
-        SessionLogsResponse, SessionResizeRequest, SessionResizeResponse, SessionScreenRequest,
-        SessionScreenResponse, SessionSendRequest, SessionSendResponse, SessionStartRequest,
-        SessionStartResponse, SessionStopRequest, SessionStopResponse, SessionSummary,
-        SnapshotUnavailableReason, StreamKind, StreamSetup, UiContextCloseRequest,
-        UiContextCloseResponse, UiContextGetRequest, UiContextGetResponse, UiContextListEntry,
-        UiContextListRequest, UiContextListResponse, UiContextSetRequest, UiContextSetResponse,
-        WorkerAckResponse, WorkerAttachRequest, WorkerAttachResponse, WorkerControlMethod,
-        WorkerControlRequest, WorkerControlResponse, WorkerResizeRequest, WorkerResizeResponse,
-        WorkerSendRequest, WorkerSendResponse, M1_PROTOCOL_VERSION,
+        AttachStreamFrame, AttentionClearRequest, AttentionListRequest, AttentionListResponse,
+        AttentionMarkRequest, AttentionMutationResponse, AttentionReadRequest, ControlErrorBody,
+        ControlErrorCode, ControlResponse, DoctorRequest, EventStreamFrame, HostStatusRequest,
+        HostStatusResponse, LogLine, LogStream, LogStreamFrame, ScreenFrame, SessionArtifacts,
+        SessionAttachRequest, SessionAttachResponse, SessionCapabilities, SessionDeleteRequest,
+        SessionDeleteResponse, SessionEventsRequest, SessionEventsResponse, SessionInspectRequest,
+        SessionInspectResponse, SessionKillRequest, SessionKillResponse, SessionListRequest,
+        SessionListResponse, SessionLogsRequest, SessionLogsResponse, SessionResizeRequest,
+        SessionResizeResponse, SessionScreenRequest, SessionScreenResponse, SessionSendRequest,
+        SessionSendResponse, SessionStartRequest, SessionStartResponse, SessionStopRequest,
+        SessionStopResponse, SessionSummary, SnapshotUnavailableReason, StreamKind, StreamSetup,
+        UiContextCloseRequest, UiContextCloseResponse, UiContextGetRequest, UiContextGetResponse,
+        UiContextListEntry, UiContextListRequest, UiContextListResponse, UiContextSetRequest,
+        UiContextSetResponse, WorkerAckResponse, WorkerAttachRequest, WorkerAttachResponse,
+        WorkerControlMethod, WorkerControlRequest, WorkerControlResponse, WorkerResizeRequest,
+        WorkerResizeResponse, WorkerSendRequest, WorkerSendResponse, M1_PROTOCOL_VERSION,
     },
     scrollback::TerminalSnapshot,
     state::{
-        AttentionState, HostMeta, MonitorProfile, ProcessState, SessionLiveness, SessionMeta,
-        SessionPaths, SessionRole, UiContext, UiContextPaths, UiEvent, UiEventKind, WorkerMeta,
+        AttentionItem, AttentionKind, AttentionRollup, AttentionState, AttentionTargetType,
+        HostMeta, MonitorProfile, ProcessState, SessionLiveness, SessionMeta, SessionPaths,
+        SessionRole, StatusSummary, UiContext, UiContextPaths, UiEvent, UiEventKind, WorkerMeta,
     },
     storage::{append_json_line, create_private_dir_all, read_json, write_json_atomic},
     workspace::WorkspaceIdentity,
@@ -275,6 +277,10 @@ pub fn dispatch_json_line(line: &str, paths: &StatePaths, host: &HostMeta) -> Co
         "session.stop" => dispatch_session_stop(id, params, paths),
         "session.kill" => dispatch_session_kill(id, params, paths),
         "session.delete" => dispatch_session_delete(id, params, paths),
+        "attention.list" => dispatch_attention_list(id, params, paths),
+        "attention.mark" => dispatch_attention_mark(id, params, paths),
+        "attention.read" => dispatch_attention_read(id, params, paths),
+        "attention.clear" => dispatch_attention_clear(id, params, paths),
         "ui.context.get" => dispatch_ui_context_get(id, params, paths),
         "ui.context.set" => dispatch_ui_context_set(id, params, paths),
         "ui.context.list" => dispatch_ui_context_list(id, params, paths),
@@ -440,6 +446,8 @@ fn start_session(
         role,
         process_state: ProcessState::Starting,
         attention_state: AttentionState::Active,
+        attention_items: Vec::new(),
+        status_summary: None,
         workspace,
         cwd,
         argv,
@@ -851,6 +859,78 @@ fn dispatch_session_delete(id: String, params: Value, paths: &StatePaths) -> Con
     };
 
     match delete_session(paths, request) {
+        Ok(result) => success_response(id, &result),
+        Err(error) => ControlResponse::failure(id, error),
+    }
+}
+
+fn dispatch_attention_list(id: String, params: Value, paths: &StatePaths) -> ControlResponse {
+    let request = match serde_json::from_value::<AttentionListRequest>(params) {
+        Ok(request) => request,
+        Err(error) => {
+            return error_response(
+                id,
+                ControlErrorCode::InvalidRequest,
+                format!("invalid attention.list params: {error}"),
+            )
+        }
+    };
+
+    match list_attention(paths, request) {
+        Ok(result) => success_response(id, &result),
+        Err(error) => ControlResponse::failure(id, error),
+    }
+}
+
+fn dispatch_attention_mark(id: String, params: Value, paths: &StatePaths) -> ControlResponse {
+    let request = match serde_json::from_value::<AttentionMarkRequest>(params) {
+        Ok(request) => request,
+        Err(error) => {
+            return error_response(
+                id,
+                ControlErrorCode::InvalidRequest,
+                format!("invalid attention.mark params: {error}"),
+            )
+        }
+    };
+
+    match mark_attention(paths, request) {
+        Ok(result) => success_response(id, &result),
+        Err(error) => ControlResponse::failure(id, error),
+    }
+}
+
+fn dispatch_attention_read(id: String, params: Value, paths: &StatePaths) -> ControlResponse {
+    let request = match serde_json::from_value::<AttentionReadRequest>(params) {
+        Ok(request) => request,
+        Err(error) => {
+            return error_response(
+                id,
+                ControlErrorCode::InvalidRequest,
+                format!("invalid attention.read params: {error}"),
+            )
+        }
+    };
+
+    match read_attention(paths, request) {
+        Ok(result) => success_response(id, &result),
+        Err(error) => ControlResponse::failure(id, error),
+    }
+}
+
+fn dispatch_attention_clear(id: String, params: Value, paths: &StatePaths) -> ControlResponse {
+    let request = match serde_json::from_value::<AttentionClearRequest>(params) {
+        Ok(request) => request,
+        Err(error) => {
+            return error_response(
+                id,
+                ControlErrorCode::InvalidRequest,
+                format!("invalid attention.clear params: {error}"),
+            )
+        }
+    };
+
+    match clear_attention(paths, request) {
         Ok(result) => success_response(id, &result),
         Err(error) => ControlResponse::failure(id, error),
     }
@@ -1538,6 +1618,270 @@ fn delete_session(
         purged: false,
         archive_path: Some(inspected.paths.root),
     })
+}
+
+fn list_attention(
+    paths: &StatePaths,
+    request: AttentionListRequest,
+) -> Result<AttentionListResponse, ControlErrorBody> {
+    let inspected = resolve_session(paths, &request.selector)?;
+    let meta = read_json::<SessionMeta>(&inspected.paths.meta_json).map_err(control_core_error)?;
+    let items = filtered_attention_items(
+        &meta.attention_items,
+        request.include_read,
+        request.include_cleared,
+    );
+    Ok(AttentionListResponse {
+        schema_version: M1_PROTOCOL_VERSION,
+        protocol_version: M1_PROTOCOL_VERSION,
+        session_id: meta.id,
+        attention: AttentionRollup::from_items(&meta.attention_items),
+        attention_items: items,
+    })
+}
+
+fn mark_attention(
+    paths: &StatePaths,
+    request: AttentionMarkRequest,
+) -> Result<AttentionMutationResponse, ControlErrorBody> {
+    if request.message.trim().is_empty() {
+        return Err(ControlErrorBody::new(
+            ControlErrorCode::InvalidRequest,
+            "attention.mark message must not be empty",
+        ));
+    }
+
+    let inspected = resolve_session(paths, &request.selector)?;
+    let now = current_timestamp();
+    let mut meta =
+        read_json::<SessionMeta>(&inspected.paths.meta_json).map_err(control_core_error)?;
+    let target_id = request
+        .target_id
+        .clone()
+        .unwrap_or_else(|| default_attention_target_id(&request.target_type, &meta));
+    let mut item = AttentionItem::new(
+        request.target_type,
+        target_id,
+        request.kind,
+        request.severity,
+        request.source,
+        request.message.trim().to_string(),
+        now.clone(),
+    );
+    item.dedupe_key = normalize_optional(request.dedupe_key);
+    item.status_label = normalize_optional(request.status_label);
+    item.status_detail = normalize_optional(request.status_detail);
+
+    let item_id = if let Some(dedupe_key) = item.dedupe_key.as_deref() {
+        if let Some(existing) = meta.attention_items.iter_mut().find(|candidate| {
+            candidate.is_open() && candidate.dedupe_key.as_deref() == Some(dedupe_key)
+        }) {
+            existing.target_type = item.target_type;
+            existing.target_id = item.target_id;
+            existing.kind = item.kind;
+            existing.severity = item.severity;
+            existing.source = item.source;
+            existing.message = item.message;
+            existing.read_at = None;
+            existing.status_label = item.status_label;
+            existing.status_detail = item.status_detail;
+            existing.id.clone()
+        } else {
+            let id = item.id.clone();
+            meta.attention_items.push(item);
+            id
+        }
+    } else {
+        let id = item.id.clone();
+        meta.attention_items.push(item);
+        id
+    };
+
+    meta.updated_at = now.clone();
+    write_json_atomic(&inspected.paths.meta_json, &meta).map_err(control_core_error)?;
+    append_attention_event(
+        &inspected.paths,
+        meta.id,
+        SessionEventKind::AttentionMarked,
+        &item_id,
+        1,
+        Some(&request.kind),
+    )?;
+    attention_mutation_response(meta, 1)
+}
+
+fn read_attention(
+    paths: &StatePaths,
+    request: AttentionReadRequest,
+) -> Result<AttentionMutationResponse, ControlErrorBody> {
+    let kinds = if request.item_id.is_none() && request.kinds.is_empty() {
+        vec![AttentionKind::Unread]
+    } else {
+        request.kinds
+    };
+    mutate_attention_items(
+        paths,
+        &request.selector,
+        SessionEventKind::AttentionRead,
+        request.item_id.as_deref(),
+        &kinds,
+        |item, now| {
+            if item.read_at.is_none() {
+                item.read_at = Some(now.to_string());
+                true
+            } else {
+                false
+            }
+        },
+    )
+}
+
+fn clear_attention(
+    paths: &StatePaths,
+    request: AttentionClearRequest,
+) -> Result<AttentionMutationResponse, ControlErrorBody> {
+    mutate_attention_items(
+        paths,
+        &request.selector,
+        SessionEventKind::AttentionCleared,
+        request.item_id.as_deref(),
+        &request.kinds,
+        |item, now| {
+            if item.cleared_at.is_none() {
+                item.cleared_at = Some(now.to_string());
+                true
+            } else {
+                false
+            }
+        },
+    )
+}
+
+fn mutate_attention_items<F>(
+    paths: &StatePaths,
+    selector: &millrace_sessions_core::protocol::SessionSelector,
+    event_kind: SessionEventKind,
+    item_id: Option<&str>,
+    kinds: &[AttentionKind],
+    mut apply: F,
+) -> Result<AttentionMutationResponse, ControlErrorBody>
+where
+    F: FnMut(&mut AttentionItem, &str) -> bool,
+{
+    let inspected = resolve_session(paths, selector)?;
+    let now = current_timestamp();
+    let mut meta =
+        read_json::<SessionMeta>(&inspected.paths.meta_json).map_err(control_core_error)?;
+    let mut mutated_count = 0_u32;
+    let mut first_item_id = None;
+    let mut first_kind = None;
+
+    for item in &mut meta.attention_items {
+        if !attention_item_matches(item, item_id, kinds) {
+            continue;
+        }
+        if apply(item, &now) {
+            mutated_count = mutated_count.saturating_add(1);
+            first_item_id.get_or_insert_with(|| item.id.clone());
+            first_kind.get_or_insert(item.kind);
+        }
+    }
+
+    if mutated_count > 0 {
+        meta.updated_at = now;
+        write_json_atomic(&inspected.paths.meta_json, &meta).map_err(control_core_error)?;
+        append_attention_event(
+            &inspected.paths,
+            meta.id,
+            event_kind,
+            first_item_id.as_deref().unwrap_or("multiple"),
+            mutated_count,
+            first_kind.as_ref(),
+        )?;
+    }
+
+    attention_mutation_response(meta, mutated_count)
+}
+
+fn attention_item_matches(
+    item: &AttentionItem,
+    item_id: Option<&str>,
+    kinds: &[AttentionKind],
+) -> bool {
+    if !item.is_open() {
+        return false;
+    }
+    if let Some(item_id) = item_id {
+        return item.id == item_id;
+    }
+    kinds.is_empty() || kinds.contains(&item.kind)
+}
+
+fn attention_mutation_response(
+    meta: SessionMeta,
+    mutated_count: u32,
+) -> Result<AttentionMutationResponse, ControlErrorBody> {
+    Ok(AttentionMutationResponse {
+        schema_version: M1_PROTOCOL_VERSION,
+        protocol_version: M1_PROTOCOL_VERSION,
+        session_id: meta.id,
+        mutated_count,
+        attention: AttentionRollup::from_items(&meta.attention_items),
+        attention_items: filtered_attention_items(&meta.attention_items, true, false),
+    })
+}
+
+fn filtered_attention_items(
+    items: &[AttentionItem],
+    include_read: bool,
+    include_cleared: bool,
+) -> Vec<AttentionItem> {
+    items
+        .iter()
+        .filter(|item| include_cleared || item.is_open())
+        .filter(|item| include_read || item.read_at.is_none())
+        .cloned()
+        .collect()
+}
+
+fn default_attention_target_id(target_type: &AttentionTargetType, meta: &SessionMeta) -> String {
+    match target_type {
+        AttentionTargetType::Workspace => meta
+            .workspace
+            .as_ref()
+            .map(|workspace| workspace.canonical_path.display().to_string())
+            .unwrap_or_else(|| meta.id.to_string()),
+        AttentionTargetType::Session | AttentionTargetType::Pane => meta.id.to_string(),
+    }
+}
+
+fn normalize_optional(value: Option<String>) -> Option<String> {
+    value
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+fn append_attention_event(
+    paths: &SessionPaths,
+    session_id: SessionId,
+    kind: SessionEventKind,
+    item_id: &str,
+    mutated_count: u32,
+    attention_kind: Option<&AttentionKind>,
+) -> Result<(), ControlErrorBody> {
+    let mut event = SessionEvent::new(session_id, kind);
+    event
+        .fields
+        .insert("attention_item_id".to_string(), item_id.to_string());
+    event
+        .fields
+        .insert("mutated_count".to_string(), mutated_count.to_string());
+    if let Some(attention_kind) = attention_kind {
+        event
+            .fields
+            .insert("attention_kind".to_string(), attention_kind.to_string());
+    }
+    append_event(&paths.events_jsonl, &event).map_err(control_core_error)
 }
 
 fn delete_requires_kill(state: &ProcessState) -> bool {
@@ -2801,6 +3145,8 @@ fn summary_from_meta(
         spawn_mode: meta.spawn_mode,
         process_state: meta.process_state.clone(),
         attention_state: meta.attention_state.clone(),
+        attention: AttentionRollup::from_items(&meta.attention_items),
+        status_summary: status_summary_from_meta(meta),
         failure_message: meta.failure_message.clone(),
         workspace: meta.workspace.clone(),
         cwd: meta.cwd.clone(),
@@ -2815,6 +3161,33 @@ fn summary_from_meta(
         capabilities: SessionCapabilities::for_spawn_mode(meta.spawn_mode),
         artifacts: SessionArtifacts::for_paths(meta.spawn_mode, paths),
         liveness: SessionLiveness::default(),
+    }
+}
+
+fn status_summary_from_meta(meta: &SessionMeta) -> StatusSummary {
+    meta.status_summary.clone().unwrap_or_else(|| {
+        StatusSummary::millmux_session(
+            process_state_label(&meta.process_state),
+            Some(format!(
+                "liveness source=millmux_session session={}",
+                meta.id
+            )),
+        )
+    })
+}
+
+fn process_state_label(state: &ProcessState) -> &'static str {
+    match state {
+        ProcessState::Starting => "starting",
+        ProcessState::Running => "running",
+        ProcessState::Orphaned => "orphaned",
+        ProcessState::Exited => "exited",
+        ProcessState::Crashed => "crashed",
+        ProcessState::Killed => "killed",
+        ProcessState::FailedStart => "failed_start",
+        ProcessState::Failed => "failed",
+        ProcessState::Lost => "lost",
+        ProcessState::Stale => "stale",
     }
 }
 

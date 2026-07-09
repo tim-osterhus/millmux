@@ -131,6 +131,8 @@ fn seed_large_output_session(host: &TempHost) -> String {
         role: SessionRole::Agent,
         process_state: ProcessState::Exited,
         attention_state: AttentionState::Active,
+        attention_items: Vec::new(),
+        status_summary: None,
         workspace: None,
         cwd: host.state_dir().to_path_buf(),
         argv: vec!["fixture-agent".to_string(), large_text.clone()],
@@ -177,6 +179,8 @@ fn seed_screen_session(host: &TempHost) -> String {
         role: SessionRole::Agent,
         process_state: ProcessState::Running,
         attention_state: AttentionState::Active,
+        attention_items: Vec::new(),
+        status_summary: None,
         workspace: None,
         cwd: host.state_dir().to_path_buf(),
         argv: vec!["fixture-agent".to_string()],
@@ -372,6 +376,90 @@ fn cli_smoke_screen_json_and_text_use_structured_snapshot() {
         .clone();
     let text = String::from_utf8(text_output).expect("screen text output");
     assert!(text.contains("agent ready"), "{text}");
+}
+
+#[test]
+fn cli_smoke_attention_mark_list_read_and_clear_json() {
+    let host = TempHost::new();
+    millmux_command(&host)
+        .args(["list", "--json"])
+        .assert()
+        .success();
+    let session_id = seed_screen_session(&host);
+
+    let mark_output = millmux_command(&host)
+        .args([
+            "attention",
+            "mark",
+            &session_id,
+            "--kind",
+            "unread",
+            "--severity",
+            "warning",
+            "--source",
+            "cli",
+            "--message",
+            "new output",
+            "--dedupe-key",
+            "output",
+            "--json",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let mark: Value = serde_json::from_slice(&mark_output).expect("attention mark json");
+    assert_eq!(mark["mutated_count"], 1);
+    assert_eq!(mark["attention"]["open_count"], 1);
+    assert_eq!(mark["attention"]["unread_count"], 1);
+
+    let list_output = millmux_command(&host)
+        .args(["attention", "list", &session_id, "--json"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let list: Value = serde_json::from_slice(&list_output).expect("attention list json");
+    assert_eq!(list["attention_items"].as_array().unwrap().len(), 1);
+    assert_eq!(list["attention_items"][0]["kind"], "unread");
+
+    let read_output = millmux_command(&host)
+        .args([
+            "attention",
+            "read",
+            &session_id,
+            "--kind",
+            "unread",
+            "--json",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let read: Value = serde_json::from_slice(&read_output).expect("attention read json");
+    assert_eq!(read["mutated_count"], 1);
+    assert_eq!(read["attention"]["unread_count"], 0);
+
+    let clear_output = millmux_command(&host)
+        .args([
+            "attention",
+            "clear",
+            &session_id,
+            "--kind",
+            "unread",
+            "--json",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let clear: Value = serde_json::from_slice(&clear_output).expect("attention clear json");
+    assert_eq!(clear["mutated_count"], 1);
+    assert_eq!(clear["attention"]["open_count"], 0);
 }
 
 #[test]

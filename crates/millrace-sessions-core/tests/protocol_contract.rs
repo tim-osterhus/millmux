@@ -149,6 +149,8 @@ fn session_list_request_and_response_match_m1_jsonl_contract() {
             spawn_mode: SpawnMode::Pty,
             process_state: ProcessState::Running,
             attention_state: AttentionState::MillraceIdle,
+            attention: Default::default(),
+            status_summary: Default::default(),
             failure_message: None,
             workspace: None,
             cwd: PathBuf::from("/tmp/millmux-workspace"),
@@ -189,6 +191,16 @@ fn session_list_request_and_response_match_m1_jsonl_contract() {
                     "spawn_mode": "pty",
                     "process_state": "running",
                     "attention_state": "millrace_idle",
+                    "attention": {
+                        "schema_version": 1,
+                        "open_count": 0,
+                        "unread_count": 0
+                    },
+                    "status_summary": {
+                        "schema_version": 1,
+                        "source": "unavailable",
+                        "label": "unavailable"
+                    },
                     "workspace": null,
                     "cwd": "/tmp/millmux-workspace",
                     "argv": ["millrace", "run", "daemon"],

@@ -773,6 +773,8 @@ fn sample_meta(state: ProcessState, root: &Path) -> SessionMeta {
         role: SessionRole::Shell,
         process_state: state,
         attention_state: AttentionState::Active,
+        attention_items: Vec::new(),
+        status_summary: None,
         workspace: None,
         cwd: root.to_path_buf(),
         argv: vec!["sh".to_string()],

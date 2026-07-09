@@ -12,7 +12,7 @@ use std::{
 };
 
 use clap::Parser;
-use commands::{Cli, CliCommand};
+use commands::{AttentionCommand, Cli, CliCommand};
 use millrace_sessions_core::ids::SessionId;
 use millrace_sessions_core::paths::state_paths;
 use millrace_sessions_core::protocol::{
@@ -230,6 +230,43 @@ async fn run() -> Result<(), MillmuxCliError> {
                 output::render_delete(&result)
             })?;
         }
+        CliCommand::Attention(args) => {
+            let client = ready_client().await?;
+            match args.command {
+                AttentionCommand::List(args) => {
+                    let result = client.attention_list(&args.request()?).await?;
+                    write_stdout(if args.json {
+                        output::render_json(&result)?
+                    } else {
+                        output::render_attention_list(&result)
+                    })?;
+                }
+                AttentionCommand::Mark(args) => {
+                    let result = client.attention_mark(&args.request()?).await?;
+                    write_stdout(if args.json {
+                        output::render_json(&result)?
+                    } else {
+                        output::render_attention_mutation("marked", &result)
+                    })?;
+                }
+                AttentionCommand::Read(args) => {
+                    let result = client.attention_read(&args.request()?).await?;
+                    write_stdout(if args.json {
+                        output::render_json(&result)?
+                    } else {
+                        output::render_attention_mutation("read", &result)
+                    })?;
+                }
+                AttentionCommand::Clear(args) => {
+                    let result = client.attention_clear(&args.request()?).await?;
+                    write_stdout(if args.json {
+                        output::render_json(&result)?
+                    } else {
+                        output::render_attention_mutation("cleared", &result)
+                    })?;
+                }
+            }
+        }
         CliCommand::Context(args) => {
             let client = ready_client().await?;
             if args.list {
@@ -420,6 +457,8 @@ mod tests {
             spawn_mode: SpawnMode::Pty,
             process_state,
             attention_state: AttentionState::Active,
+            attention: Default::default(),
+            status_summary: Default::default(),
             failure_message: None,
             workspace: None,
             cwd: PathBuf::from("/tmp"),

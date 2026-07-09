@@ -157,9 +157,9 @@ fn agent_cockpit_right_layout_snapshot() {
     insta::assert_snapshot!(snapshot, @r###"
 Sessions | count=2
   millrace_daemon daemon st=running att=millrace_idle live=w:unknown c:unknown unread=unavailable cwd=/tmp/daemon git=un
-  millmux_session millrace_runtime=idle terminal_screen=preview operator=unavailable inferred=unavailable
+  status millmux_session:running millrace_runtime=idle terminal_screen=unavailable operator=unavailable inferred=unav~
 > agent agent st=running att=millrace_idle live=w:unknown c:unknown unread=unavailable cwd=/tmp/agent git=unavailable@~a
-  millmux_session millrace_runtime=unavailable terminal_screen=preview operator=unavailable inferred=unavailable
+  status millmux_session:running millrace_runtime=unavailable terminal_screen=unavailable operator=unavailable inferr~
 Agent Terminal | owned live cur=1,2 | selected                    Daemon Monitor | mon=basic | follow=live
 Millracer operator ready                                          daemon ready
 >                                                                 daemon idle
@@ -178,9 +178,9 @@ fn agent_cockpit_bottom_layout_snapshot() {
     insta::assert_snapshot!(snapshot, @r###"
 Sessions | count=2
   millrace_daemon daemon st=running att=millrace_idle live=w:unknown c:unknown u
-  millmux_session millrace_runtime=idle terminal_screen=preview operator=unav~
+  status millmux_session:running millrace_runtime=idle terminal_screen=unavai~
 > agent agent st=running att=millrace_idle live=w:unknown c:unknown unread=unava
-  millmux_session millrace_runtime=unavailable terminal_screen=preview operat~
+  status millmux_session:running millrace_runtime=unavailable terminal_screen~
 Agent Terminal | owned live cur=1,2 | selected
 Millracer operator ready
 >
@@ -487,6 +487,8 @@ fn summary(name: &str) -> SessionSummary {
         spawn_mode: SpawnMode::Pty,
         process_state: ProcessState::Running,
         attention_state: AttentionState::MillraceIdle,
+        attention: Default::default(),
+        status_summary: Default::default(),
         failure_message: None,
         workspace: Some(WorkspaceIdentity {
             canonical_path: cwd.clone(),

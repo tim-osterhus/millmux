@@ -10,17 +10,18 @@ use millrace_sessions_core::{
     error::MillmuxError,
     paths::{state_paths, StatePaths, STATE_DIR_ENV},
     protocol::{
-        AttachStreamFrame, ControlErrorBody, ControlMethod, ControlRequest, ControlResponse,
-        DoctorRequest, DoctorResponse, EventStreamFrame, HostStatusRequest, HostStatusResponse,
-        LogStreamFrame, SessionAttachRequest, SessionAttachResponse, SessionDeleteRequest,
-        SessionDeleteResponse, SessionEventsRequest, SessionEventsResponse, SessionInspectRequest,
-        SessionInspectResponse, SessionKillRequest, SessionKillResponse, SessionListRequest,
-        SessionListResponse, SessionLogsRequest, SessionLogsResponse, SessionResizeRequest,
-        SessionResizeResponse, SessionScreenRequest, SessionScreenResponse, SessionSendRequest,
-        SessionSendResponse, SessionStartRequest, SessionStartResponse, SessionStopRequest,
-        SessionStopResponse, UiContextCloseRequest, UiContextCloseResponse, UiContextGetRequest,
-        UiContextGetResponse, UiContextListRequest, UiContextListResponse, UiContextSetRequest,
-        UiContextSetResponse,
+        AttachStreamFrame, AttentionClearRequest, AttentionListRequest, AttentionListResponse,
+        AttentionMarkRequest, AttentionMutationResponse, AttentionReadRequest, ControlErrorBody,
+        ControlMethod, ControlRequest, ControlResponse, DoctorRequest, DoctorResponse,
+        EventStreamFrame, HostStatusRequest, HostStatusResponse, LogStreamFrame,
+        SessionAttachRequest, SessionAttachResponse, SessionDeleteRequest, SessionDeleteResponse,
+        SessionEventsRequest, SessionEventsResponse, SessionInspectRequest, SessionInspectResponse,
+        SessionKillRequest, SessionKillResponse, SessionListRequest, SessionListResponse,
+        SessionLogsRequest, SessionLogsResponse, SessionResizeRequest, SessionResizeResponse,
+        SessionScreenRequest, SessionScreenResponse, SessionSendRequest, SessionSendResponse,
+        SessionStartRequest, SessionStartResponse, SessionStopRequest, SessionStopResponse,
+        UiContextCloseRequest, UiContextCloseResponse, UiContextGetRequest, UiContextGetResponse,
+        UiContextListRequest, UiContextListResponse, UiContextSetRequest, UiContextSetResponse,
     },
 };
 use serde::{de::DeserializeOwned, Serialize};
@@ -196,6 +197,34 @@ impl SessionControlClient {
         request: &SessionDeleteRequest,
     ) -> Result<SessionDeleteResponse, ClientError> {
         self.request(ControlMethod::SessionDelete, request).await
+    }
+
+    pub async fn attention_list(
+        &self,
+        request: &AttentionListRequest,
+    ) -> Result<AttentionListResponse, ClientError> {
+        self.request(ControlMethod::AttentionList, request).await
+    }
+
+    pub async fn attention_mark(
+        &self,
+        request: &AttentionMarkRequest,
+    ) -> Result<AttentionMutationResponse, ClientError> {
+        self.request(ControlMethod::AttentionMark, request).await
+    }
+
+    pub async fn attention_read(
+        &self,
+        request: &AttentionReadRequest,
+    ) -> Result<AttentionMutationResponse, ClientError> {
+        self.request(ControlMethod::AttentionRead, request).await
+    }
+
+    pub async fn attention_clear(
+        &self,
+        request: &AttentionClearRequest,
+    ) -> Result<AttentionMutationResponse, ClientError> {
+        self.request(ControlMethod::AttentionClear, request).await
     }
 
     pub async fn ui_context_get(

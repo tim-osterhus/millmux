@@ -2,6 +2,7 @@ use std::{collections::BTreeMap, fmt, path::PathBuf, str::FromStr};
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use time::OffsetDateTime;
+use uuid::Uuid;
 
 use crate::{
     ids::{PaneId, SessionId, UiId},
@@ -154,6 +155,441 @@ pub enum AttentionState {
     NeedsAttention,
     MillraceIdle,
     MillraceBusy,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AttentionTargetType {
+    Workspace,
+    Session,
+    Pane,
+}
+
+impl AttentionTargetType {
+    pub fn as_wire_value(&self) -> &'static str {
+        match self {
+            Self::Workspace => "workspace",
+            Self::Session => "session",
+            Self::Pane => "pane",
+        }
+    }
+}
+
+impl fmt::Display for AttentionTargetType {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_wire_value())
+    }
+}
+
+impl FromStr for AttentionTargetType {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value.trim().to_ascii_lowercase().replace('-', "_").as_str() {
+            "workspace" => Ok(Self::Workspace),
+            "session" => Ok(Self::Session),
+            "pane" => Ok(Self::Pane),
+            _ => Err("attention target type must be workspace, session, or pane".to_string()),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AttentionKind {
+    Unread,
+    NeedsInput,
+    ApprovalRequired,
+    Blocked,
+    Failed,
+    Degraded,
+    HandoffPending,
+    Stale,
+}
+
+impl AttentionKind {
+    pub fn as_wire_value(&self) -> &'static str {
+        match self {
+            Self::Unread => "unread",
+            Self::NeedsInput => "needs_input",
+            Self::ApprovalRequired => "approval_required",
+            Self::Blocked => "blocked",
+            Self::Failed => "failed",
+            Self::Degraded => "degraded",
+            Self::HandoffPending => "handoff_pending",
+            Self::Stale => "stale",
+        }
+    }
+}
+
+impl fmt::Display for AttentionKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_wire_value())
+    }
+}
+
+impl FromStr for AttentionKind {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value.trim().to_ascii_lowercase().replace('-', "_").as_str() {
+            "unread" => Ok(Self::Unread),
+            "needs_input" => Ok(Self::NeedsInput),
+            "approval_required" => Ok(Self::ApprovalRequired),
+            "blocked" => Ok(Self::Blocked),
+            "failed" => Ok(Self::Failed),
+            "degraded" => Ok(Self::Degraded),
+            "handoff_pending" => Ok(Self::HandoffPending),
+            "stale" => Ok(Self::Stale),
+            _ => Err("attention kind must be unread, needs_input, approval_required, blocked, failed, degraded, handoff_pending, or stale".to_string()),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AttentionSeverity {
+    Info,
+    Progress,
+    Success,
+    Warning,
+    Error,
+    Critical,
+}
+
+impl AttentionSeverity {
+    pub fn as_wire_value(&self) -> &'static str {
+        match self {
+            Self::Info => "info",
+            Self::Progress => "progress",
+            Self::Success => "success",
+            Self::Warning => "warning",
+            Self::Error => "error",
+            Self::Critical => "critical",
+        }
+    }
+
+    pub fn rank(self) -> u8 {
+        match self {
+            Self::Info => 0,
+            Self::Progress => 1,
+            Self::Success => 2,
+            Self::Warning => 3,
+            Self::Error => 4,
+            Self::Critical => 5,
+        }
+    }
+}
+
+impl fmt::Display for AttentionSeverity {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_wire_value())
+    }
+}
+
+impl FromStr for AttentionSeverity {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value.trim().to_ascii_lowercase().replace('-', "_").as_str() {
+            "info" => Ok(Self::Info),
+            "progress" => Ok(Self::Progress),
+            "success" => Ok(Self::Success),
+            "warning" => Ok(Self::Warning),
+            "error" => Ok(Self::Error),
+            "critical" => Ok(Self::Critical),
+            _ => Err(
+                "attention severity must be info, progress, success, warning, error, or critical"
+                    .to_string(),
+            ),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AttentionSource {
+    Operator,
+    Cli,
+    Api,
+    Millmux,
+    Millrace,
+    Agent,
+}
+
+impl AttentionSource {
+    pub fn as_wire_value(&self) -> &'static str {
+        match self {
+            Self::Operator => "operator",
+            Self::Cli => "cli",
+            Self::Api => "api",
+            Self::Millmux => "millmux",
+            Self::Millrace => "millrace",
+            Self::Agent => "agent",
+        }
+    }
+}
+
+impl fmt::Display for AttentionSource {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_wire_value())
+    }
+}
+
+impl FromStr for AttentionSource {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value.trim().to_ascii_lowercase().replace('-', "_").as_str() {
+            "operator" => Ok(Self::Operator),
+            "cli" => Ok(Self::Cli),
+            "api" => Ok(Self::Api),
+            "millmux" => Ok(Self::Millmux),
+            "millrace" => Ok(Self::Millrace),
+            "agent" => Ok(Self::Agent),
+            _ => Err(
+                "attention source must be operator, cli, api, millmux, millrace, or agent"
+                    .to_string(),
+            ),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AttentionItem {
+    pub id: String,
+    pub target_type: AttentionTargetType,
+    pub target_id: String,
+    pub kind: AttentionKind,
+    pub severity: AttentionSeverity,
+    pub source: AttentionSource,
+    pub message: String,
+    pub created_at: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub read_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cleared_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dedupe_key: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status_label: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status_detail: Option<String>,
+}
+
+impl AttentionItem {
+    pub fn new(
+        target_type: AttentionTargetType,
+        target_id: impl Into<String>,
+        kind: AttentionKind,
+        severity: AttentionSeverity,
+        source: AttentionSource,
+        message: impl Into<String>,
+        created_at: impl Into<String>,
+    ) -> Self {
+        Self {
+            id: Uuid::new_v4().to_string(),
+            target_type,
+            target_id: target_id.into(),
+            kind,
+            severity,
+            source,
+            message: message.into(),
+            created_at: created_at.into(),
+            read_at: None,
+            cleared_at: None,
+            dedupe_key: None,
+            status_label: None,
+            status_detail: None,
+        }
+    }
+
+    pub fn is_open(&self) -> bool {
+        self.cleared_at.is_none()
+    }
+
+    pub fn is_unread(&self) -> bool {
+        self.is_open() && self.kind == AttentionKind::Unread && self.read_at.is_none()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AttentionRollup {
+    #[serde(default = "default_attention_rollup_schema_version")]
+    pub schema_version: u32,
+    #[serde(default)]
+    pub open_count: u32,
+    #[serde(default)]
+    pub unread_count: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub highest_severity: Option<AttentionSeverity>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub kinds: Vec<AttentionKind>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub sources: Vec<AttentionSource>,
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub read_open_count: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub top_message: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status_label: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status_detail: Option<String>,
+}
+
+fn default_attention_rollup_schema_version() -> u32 {
+    1
+}
+
+impl Default for AttentionRollup {
+    fn default() -> Self {
+        Self {
+            schema_version: default_attention_rollup_schema_version(),
+            open_count: 0,
+            unread_count: 0,
+            highest_severity: None,
+            kinds: Vec::new(),
+            sources: Vec::new(),
+            read_open_count: 0,
+            top_message: None,
+            status_label: None,
+            status_detail: None,
+        }
+    }
+}
+
+impl AttentionRollup {
+    pub fn from_items(items: &[AttentionItem]) -> Self {
+        let mut rollup = Self::default();
+        let open_items = items.iter().filter(|item| item.is_open());
+        let mut top: Option<&AttentionItem> = None;
+
+        for item in open_items {
+            rollup.open_count = rollup.open_count.saturating_add(1);
+            if item.is_unread() {
+                rollup.unread_count = rollup.unread_count.saturating_add(1);
+            } else if item.read_at.is_some() {
+                rollup.read_open_count = rollup.read_open_count.saturating_add(1);
+            }
+            if !rollup.kinds.contains(&item.kind) {
+                rollup.kinds.push(item.kind);
+            }
+            if !rollup.sources.contains(&item.source) {
+                rollup.sources.push(item.source);
+            }
+            if top.map_or(true, |candidate| {
+                item.severity.rank() > candidate.severity.rank()
+                    || (item.severity == candidate.severity
+                        && item.created_at > candidate.created_at)
+            }) {
+                top = Some(item);
+            }
+        }
+
+        if let Some(top) = top {
+            rollup.highest_severity = Some(top.severity);
+            rollup.top_message = Some(top.message.clone());
+            rollup.status_label = top.status_label.clone();
+            rollup.status_detail = top.status_detail.clone();
+        }
+        rollup.kinds.sort();
+        rollup.sources.sort();
+        rollup
+    }
+}
+
+fn is_zero_u32(value: &u32) -> bool {
+    *value == 0
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StatusSummarySource {
+    MillraceRuntime,
+    MillmuxSession,
+    TerminalScreen,
+    Operator,
+    Inferred,
+    Unavailable,
+}
+
+impl StatusSummarySource {
+    pub fn as_wire_value(&self) -> &'static str {
+        match self {
+            Self::MillraceRuntime => "millrace_runtime",
+            Self::MillmuxSession => "millmux_session",
+            Self::TerminalScreen => "terminal_screen",
+            Self::Operator => "operator",
+            Self::Inferred => "inferred",
+            Self::Unavailable => "unavailable",
+        }
+    }
+}
+
+impl fmt::Display for StatusSummarySource {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_wire_value())
+    }
+}
+
+impl FromStr for StatusSummarySource {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value.trim().to_ascii_lowercase().replace('-', "_").as_str() {
+            "millrace_runtime" => Ok(Self::MillraceRuntime),
+            "millmux_session" => Ok(Self::MillmuxSession),
+            "terminal_screen" => Ok(Self::TerminalScreen),
+            "operator" => Ok(Self::Operator),
+            "inferred" => Ok(Self::Inferred),
+            "unavailable" => Ok(Self::Unavailable),
+            _ => Err("status summary source must be millrace_runtime, millmux_session, terminal_screen, operator, inferred, or unavailable".to_string()),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StatusSummary {
+    #[serde(default = "default_status_summary_schema_version")]
+    pub schema_version: u32,
+    pub source: StatusSummarySource,
+    pub label: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub updated_at: Option<String>,
+}
+
+fn default_status_summary_schema_version() -> u32 {
+    1
+}
+
+impl Default for StatusSummary {
+    fn default() -> Self {
+        Self::unavailable()
+    }
+}
+
+impl StatusSummary {
+    pub fn unavailable() -> Self {
+        Self {
+            schema_version: default_status_summary_schema_version(),
+            source: StatusSummarySource::Unavailable,
+            label: "unavailable".to_string(),
+            detail: None,
+            updated_at: None,
+        }
+    }
+
+    pub fn millmux_session(label: impl Into<String>, detail: Option<String>) -> Self {
+        Self {
+            schema_version: default_status_summary_schema_version(),
+            source: StatusSummarySource::MillmuxSession,
+            label: label.into(),
+            detail,
+            updated_at: None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -449,6 +885,10 @@ pub struct SessionMeta {
     pub role: SessionRole,
     pub process_state: ProcessState,
     pub attention_state: AttentionState,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub attention_items: Vec<AttentionItem>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status_summary: Option<StatusSummary>,
     pub workspace: Option<WorkspaceIdentity>,
     pub cwd: PathBuf,
     pub argv: Vec<String>,
@@ -561,6 +1001,22 @@ mod tests {
             "\"millrace_idle\""
         );
         assert_eq!(
+            serde_json::to_string(&AttentionKind::ApprovalRequired).unwrap(),
+            "\"approval_required\""
+        );
+        assert_eq!(
+            serde_json::to_string(&AttentionSeverity::Critical).unwrap(),
+            "\"critical\""
+        );
+        assert_eq!(
+            serde_json::to_string(&AttentionSource::Millrace).unwrap(),
+            "\"millrace\""
+        );
+        assert_eq!(
+            serde_json::to_string(&StatusSummarySource::MillmuxSession).unwrap(),
+            "\"millmux_session\""
+        );
+        assert_eq!(
             serde_json::to_string(&UiMode::DaemonConsole).unwrap(),
             "\"daemon_console\""
         );
@@ -615,6 +1071,19 @@ mod tests {
             role: SessionRole::MillraceDaemon,
             process_state: ProcessState::Running,
             attention_state: AttentionState::MillraceIdle,
+            attention_items: vec![AttentionItem::new(
+                AttentionTargetType::Session,
+                "session-1",
+                AttentionKind::Unread,
+                AttentionSeverity::Info,
+                AttentionSource::Millmux,
+                "new output",
+                "2026-05-20T00:00:00Z",
+            )],
+            status_summary: Some(StatusSummary::millmux_session(
+                "running",
+                Some("worker alive".to_string()),
+            )),
             workspace: None,
             cwd: PathBuf::from("/tmp"),
             argv: vec!["millrace".to_string(), "daemon".to_string()],
@@ -658,6 +1127,57 @@ mod tests {
         let meta: SessionMeta = serde_json::from_value(value).unwrap();
 
         assert_eq!(meta.spawn_mode, SpawnMode::Pty);
+        assert!(meta.attention_items.is_empty());
+        assert_eq!(meta.status_summary, None);
+    }
+
+    #[test]
+    fn attention_rollup_counts_open_and_unread_items() {
+        let mut unread = AttentionItem::new(
+            AttentionTargetType::Session,
+            "session-1",
+            AttentionKind::Unread,
+            AttentionSeverity::Info,
+            AttentionSource::Millmux,
+            "new output",
+            "2026-05-20T00:00:00Z",
+        );
+        let blocking = AttentionItem::new(
+            AttentionTargetType::Session,
+            "session-1",
+            AttentionKind::Blocked,
+            AttentionSeverity::Critical,
+            AttentionSource::Agent,
+            "blocked",
+            "2026-05-20T00:00:01Z",
+        );
+        let mut cleared = AttentionItem::new(
+            AttentionTargetType::Session,
+            "session-1",
+            AttentionKind::Failed,
+            AttentionSeverity::Error,
+            AttentionSource::Millrace,
+            "old failure",
+            "2026-05-20T00:00:02Z",
+        );
+        cleared.cleared_at = Some("2026-05-20T00:00:03Z".to_string());
+        unread.status_label = Some("unread".to_string());
+
+        let rollup = AttentionRollup::from_items(&[unread, blocking, cleared]);
+
+        assert_eq!(rollup.open_count, 2);
+        assert_eq!(rollup.unread_count, 1);
+        assert_eq!(rollup.read_open_count, 0);
+        assert_eq!(rollup.highest_severity, Some(AttentionSeverity::Critical));
+        assert_eq!(
+            rollup.kinds,
+            vec![AttentionKind::Unread, AttentionKind::Blocked]
+        );
+        assert_eq!(
+            rollup.sources,
+            vec![AttentionSource::Millmux, AttentionSource::Agent]
+        );
+        assert_eq!(rollup.top_message.as_deref(), Some("blocked"));
     }
 
     #[test]

@@ -1,12 +1,13 @@
 use millrace_sessions_core::{
     protocol::{
-        DoctorResponse, EventStreamFrame, HostStatusResponse, LogLine, LogStream, LogStreamFrame,
-        ScreenFrame, SessionDeleteResponse, SessionEventsResponse, SessionInspectResponse,
-        SessionKillResponse, SessionListResponse, SessionLogsResponse, SessionResizeResponse,
-        SessionScreenResponse, SessionSendResponse, SessionStartResponse, SessionStopResponse,
-        SessionSummary, UiContextGetResponse, UiContextListResponse,
+        AttentionListResponse, AttentionMutationResponse, DoctorResponse, EventStreamFrame,
+        HostStatusResponse, LogLine, LogStream, LogStreamFrame, ScreenFrame, SessionDeleteResponse,
+        SessionEventsResponse, SessionInspectResponse, SessionKillResponse, SessionListResponse,
+        SessionLogsResponse, SessionResizeResponse, SessionScreenResponse, SessionSendResponse,
+        SessionStartResponse, SessionStopResponse, SessionSummary, UiContextGetResponse,
+        UiContextListResponse,
     },
-    state::{AttentionState, ProcessState, SessionRole},
+    state::{AttentionItem, AttentionState, ProcessState, SessionRole},
 };
 use serde::Serialize;
 use serde_json::Value;
@@ -212,6 +213,28 @@ pub fn render_delete(result: &SessionDeleteResponse) -> String {
     )
 }
 
+pub fn render_attention_list(result: &AttentionListResponse) -> String {
+    let mut output = format!(
+        "attention {} open={} unread={}\n",
+        result.session_id, result.attention.open_count, result.attention.unread_count
+    );
+    push_attention_items(&mut output, &result.attention_items);
+    output
+}
+
+pub fn render_attention_mutation(action: &str, result: &AttentionMutationResponse) -> String {
+    let mut output = format!(
+        "attention {} {}={} open={} unread={}\n",
+        result.session_id,
+        action,
+        result.mutated_count,
+        result.attention.open_count,
+        result.attention.unread_count
+    );
+    push_attention_items(&mut output, &result.attention_items);
+    output
+}
+
 pub fn render_context(result: &UiContextGetResponse) -> String {
     let context = &result.context;
     let mut lines = String::new();
@@ -288,6 +311,28 @@ pub fn render_inspect(result: &SessionInspectResponse) -> String {
         "attention",
         &attention_state(&session.attention_state),
     );
+    push_field(
+        &mut lines,
+        "attention_rollup",
+        &format!(
+            "open={} unread={} severity={}",
+            session.attention.open_count,
+            session.attention.unread_count,
+            session
+                .attention
+                .highest_severity
+                .map(|severity| severity.to_string())
+                .unwrap_or_else(|| "none".to_string())
+        ),
+    );
+    push_field(
+        &mut lines,
+        "status_summary",
+        &format!(
+            "{}:{}",
+            session.status_summary.source, session.status_summary.label
+        ),
+    );
     push_field(&mut lines, "cwd", &session.cwd.display().to_string());
     push_field(&mut lines, "monitor", &session.monitor_profile.to_string());
     push_field(
@@ -316,6 +361,10 @@ pub fn render_inspect(result: &SessionInspectResponse) -> String {
             ),
         );
     }
+    if !result.attention_items.is_empty() {
+        lines.push_str("attention_items:\n");
+        push_attention_items(&mut lines, &result.attention_items);
+    }
     lines
 }
 
@@ -333,6 +382,23 @@ fn push_event_line(output: &mut String, event: &millrace_sessions_core::events::
         json_string(&event.kind),
         event.message.as_deref().unwrap_or("")
     ));
+}
+
+fn push_attention_items(output: &mut String, items: &[AttentionItem]) {
+    for item in items {
+        output.push_str(&format!(
+            "  {} target={}:{} kind={} severity={} source={} read={} cleared={} message={}\n",
+            item.id,
+            item.target_type,
+            item.target_id,
+            item.kind,
+            item.severity,
+            item.source,
+            item.read_at.as_deref().unwrap_or("-"),
+            item.cleared_at.as_deref().unwrap_or("-"),
+            item.message
+        ));
+    }
 }
 
 fn argv(session: &SessionSummary) -> String {
@@ -405,6 +471,8 @@ mod tests {
             spawn_mode: SpawnMode::Pty,
             process_state: ProcessState::Running,
             attention_state: AttentionState::Active,
+            attention: Default::default(),
+            status_summary: Default::default(),
             failure_message: None,
             workspace: None,
             cwd: PathBuf::from("/tmp"),
@@ -469,6 +537,7 @@ mod tests {
                 worker_sock: PathBuf::from("/state/sessions/id/worker.sock"),
             },
             session,
+            attention_items: Vec::new(),
             worker: None,
         };
 

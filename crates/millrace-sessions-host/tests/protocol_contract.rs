@@ -10,6 +10,7 @@ use std::{
 };
 
 use millrace_sessions_core::{
+    events::{read_events, SessionEventKind},
     ids::{PaneId, SessionId, UiId},
     paths::{StatePaths, STATE_DIR_ENV},
     protocol::{
@@ -671,6 +672,142 @@ fn write_session_meta(paths: &StatePaths, meta: &SessionMeta) {
     write_json_atomic(&session_paths.meta_json, meta).unwrap();
 }
 
+#[test]
+fn attention_dispatch_persists_dedupe_read_clear_and_events() {
+    let temp = tempfile::tempdir().unwrap();
+    let paths = StatePaths::new(temp.path().join("state"));
+    let workspace = temp.path().join("workspace");
+    fs::create_dir_all(&workspace).unwrap();
+    let session = sample_session(&workspace);
+    let session_id = session.id;
+    write_session_meta(&paths, &session);
+    let host = host_meta(&paths);
+
+    let mark = attention_request(
+        "attention-mark-1",
+        "attention.mark",
+        json!({
+            "selector": {"type": "id", "session_id": session_id},
+            "kind": "unread",
+            "severity": "warning",
+            "source": "cli",
+            "message": "new terminal output",
+            "dedupe_key": "terminal-output"
+        }),
+    );
+    let response = dispatch_json_line(&mark, &paths, &host);
+    assert!(response.ok, "{response:#?}");
+    let value = response.result.expect("mark result");
+    assert_eq!(value["mutated_count"], 1);
+    assert_eq!(value["attention"]["open_count"], 1);
+    assert_eq!(value["attention"]["unread_count"], 1);
+
+    let dedupe = attention_request(
+        "attention-mark-2",
+        "attention.mark",
+        json!({
+            "selector": {"type": "id", "session_id": session_id},
+            "kind": "unread",
+            "severity": "error",
+            "source": "cli",
+            "message": "updated terminal output",
+            "dedupe_key": "terminal-output"
+        }),
+    );
+    let response = dispatch_json_line(&dedupe, &paths, &host);
+    assert!(response.ok, "{response:#?}");
+    let value = response.result.expect("dedupe result");
+    assert_eq!(value["attention_items"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        value["attention_items"][0]["message"],
+        "updated terminal output"
+    );
+    assert_eq!(value["attention"]["highest_severity"], "error");
+
+    let block = attention_request(
+        "attention-mark-3",
+        "attention.mark",
+        json!({
+            "selector": {"type": "id", "session_id": session_id},
+            "kind": "blocked",
+            "severity": "critical",
+            "source": "agent",
+            "message": "waiting on operator"
+        }),
+    );
+    assert!(dispatch_json_line(&block, &paths, &host).ok);
+
+    let read_unread = attention_request(
+        "attention-read-1",
+        "attention.read",
+        json!({
+            "selector": {"type": "id", "session_id": session_id}
+        }),
+    );
+    let response = dispatch_json_line(&read_unread, &paths, &host);
+    assert!(response.ok, "{response:#?}");
+    let value = response.result.expect("read result");
+    assert_eq!(value["mutated_count"], 1);
+    assert_eq!(value["attention"]["open_count"], 2);
+    assert_eq!(value["attention"]["unread_count"], 0);
+
+    let list = attention_request(
+        "attention-list-1",
+        "attention.list",
+        json!({
+            "selector": {"type": "id", "session_id": session_id},
+            "include_read": true
+        }),
+    );
+    let response = dispatch_json_line(&list, &paths, &host);
+    assert!(response.ok, "{response:#?}");
+    let value = response.result.expect("list result");
+    let items = value["attention_items"].as_array().unwrap();
+    let blocked = items
+        .iter()
+        .find(|item| item["kind"] == "blocked")
+        .expect("blocked item remains");
+    assert!(blocked.get("read_at").is_none(), "{blocked:#?}");
+
+    let clear_unread = attention_request(
+        "attention-clear-1",
+        "attention.clear",
+        json!({
+            "selector": {"type": "id", "session_id": session_id},
+            "kinds": ["unread"]
+        }),
+    );
+    let response = dispatch_json_line(&clear_unread, &paths, &host);
+    assert!(response.ok, "{response:#?}");
+    let value = response.result.expect("clear result");
+    assert_eq!(value["mutated_count"], 1);
+    assert_eq!(value["attention"]["open_count"], 1);
+    assert_eq!(value["attention"]["kinds"], json!(["blocked"]));
+
+    let events = read_events(paths.session_paths(session_id).events_jsonl).unwrap();
+    assert!(events
+        .iter()
+        .any(|event| event.kind == SessionEventKind::AttentionMarked));
+    assert!(events
+        .iter()
+        .any(|event| event.kind == SessionEventKind::AttentionRead));
+    assert!(events
+        .iter()
+        .any(|event| event.kind == SessionEventKind::AttentionCleared));
+}
+
+fn attention_request(id: &str, method: &str, params: Value) -> String {
+    format!(
+        "{}\n",
+        serde_json::to_string(&json!({
+            "id": id,
+            "method": method,
+            "params": params
+        }))
+        .unwrap()
+    )
+}
+
 fn dispatch_screen(
     paths: &StatePaths,
     session_id: SessionId,
@@ -799,6 +936,8 @@ fn sample_session(workspace: impl AsRef<Path>) -> SessionMeta {
         role: SessionRole::MillraceDaemon,
         process_state: ProcessState::Running,
         attention_state: AttentionState::MillraceIdle,
+        attention_items: Vec::new(),
+        status_summary: None,
         workspace: Some(WorkspaceIdentity::capture(workspace).unwrap()),
         cwd: workspace.to_path_buf(),
         argv: vec![

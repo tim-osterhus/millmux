@@ -12,7 +12,10 @@ use millrace_sessions_core::{
         SessionArtifacts, SessionCapabilities, SessionInspectResponse, SessionListRequest,
         SessionSelector, SessionSummary, M1_PROTOCOL_VERSION,
     },
-    state::{MonitorProfile, ProcessState, SessionLiveness, SessionMeta, SessionRole, WorkerMeta},
+    state::{
+        AttentionRollup, MonitorProfile, ProcessState, SessionLiveness, SessionMeta, SessionRole,
+        StatusSummary, WorkerMeta,
+    },
     storage::read_json,
     workspace::WorkspaceIdentity,
 };
@@ -110,6 +113,7 @@ impl HostRegistry {
             protocol_version: M1_PROTOCOL_VERSION,
             session: summary_from_record(record),
             paths: record.paths.clone(),
+            attention_items: record.meta.attention_items.clone(),
             worker: record.worker.clone(),
         })
     }
@@ -283,6 +287,8 @@ fn summary_from_meta(
         spawn_mode: meta.spawn_mode,
         process_state: meta.process_state.clone(),
         attention_state: meta.attention_state.clone(),
+        attention: AttentionRollup::from_items(&meta.attention_items),
+        status_summary: status_summary_from_meta(meta),
         failure_message: meta.failure_message.clone(),
         workspace: meta.workspace.clone(),
         cwd: meta.cwd.clone(),
@@ -297,6 +303,33 @@ fn summary_from_meta(
         capabilities: SessionCapabilities::for_spawn_mode(meta.spawn_mode),
         artifacts: SessionArtifacts::for_paths(meta.spawn_mode, paths),
         liveness: SessionLiveness::default(),
+    }
+}
+
+fn status_summary_from_meta(meta: &SessionMeta) -> StatusSummary {
+    meta.status_summary.clone().unwrap_or_else(|| {
+        StatusSummary::millmux_session(
+            process_state_label(&meta.process_state),
+            Some(format!(
+                "liveness source=millmux_session session={}",
+                meta.id
+            )),
+        )
+    })
+}
+
+fn process_state_label(state: &ProcessState) -> &'static str {
+    match state {
+        ProcessState::Starting => "starting",
+        ProcessState::Running => "running",
+        ProcessState::Orphaned => "orphaned",
+        ProcessState::Exited => "exited",
+        ProcessState::Crashed => "crashed",
+        ProcessState::Killed => "killed",
+        ProcessState::FailedStart => "failed_start",
+        ProcessState::Failed => "failed",
+        ProcessState::Lost => "lost",
+        ProcessState::Stale => "stale",
     }
 }
 
@@ -360,6 +393,8 @@ mod tests {
             role: SessionRole::Shell,
             process_state: ProcessState::Running,
             attention_state: AttentionState::Active,
+            attention_items: Vec::new(),
+            status_summary: None,
             workspace: None,
             cwd: temp.path().to_path_buf(),
             argv: vec!["sh".to_string()],
@@ -451,6 +486,8 @@ mod tests {
             role: SessionRole::MillraceDaemon,
             process_state,
             attention_state: AttentionState::Active,
+            attention_items: Vec::new(),
+            status_summary: None,
             workspace: Some(WorkspaceIdentity::capture(workspace).unwrap()),
             cwd: workspace.to_path_buf(),
             argv: vec![

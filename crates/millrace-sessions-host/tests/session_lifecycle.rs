@@ -2365,6 +2365,8 @@ fn write_liveness_orphan_session(
         role: SessionRole::Shell,
         process_state: ProcessState::Running,
         attention_state: AttentionState::Active,
+        attention_items: Vec::new(),
+        status_summary: None,
         workspace: None,
         cwd: paths.root.clone(),
         argv: vec!["sh".to_string(), "-c".to_string(), "sleep 60".to_string()],

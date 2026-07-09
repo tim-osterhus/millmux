@@ -24,12 +24,13 @@ use millrace_sessions_core::{
     paths::{state_paths, CONTROL_SOCK_ENV, STATE_DIR_ENV, UI_ID_ENV},
     protocol::{
         AttachFrameType, AttachInitialReplay, AttachReplayMode, AttachStreamEncoding,
-        AttachStreamFrame, ControlErrorCode, SessionAttachRequest, SessionListRequest,
-        SessionLogsRequest, SessionSelector, SessionStartRequest, TerminalDimensions,
-        UiContextGetRequest, UiContextSetRequest, M2_ATTACH_PROTOCOL_VERSION,
+        AttachStreamFrame, AttentionReadRequest, ControlErrorCode, SessionAttachRequest,
+        SessionListRequest, SessionLogsRequest, SessionSelector, SessionStartRequest,
+        TerminalDimensions, UiContextGetRequest, UiContextSetRequest, M2_ATTACH_PROTOCOL_VERSION,
     },
     state::{
-        MonitorProfile, ProcessState, SessionRole, SpawnMode, UiContext, UiEvent, UiEventKind,
+        AttentionKind, MonitorProfile, ProcessState, SessionRole, SpawnMode, UiContext, UiEvent,
+        UiEventKind,
     },
 };
 use millrace_sessions_tui::{
@@ -998,6 +999,7 @@ async fn handle_cockpit_key(
                     {
                         Ok(()) => {
                             let _ = app.select_workspace_session(session_id);
+                            mark_unread_attention_read_for_session(client, app, session_id).await;
                             *attach_state.attached_session_id = session_id;
                             record_ui_event(
                                 client,
@@ -1015,9 +1017,11 @@ async fn handle_cockpit_key(
                 }
                 WorkspaceSessionSelection::DaemonSelected(session_id) => {
                     let _ = app.select_workspace_session(session_id);
+                    mark_unread_attention_read_for_session(client, app, session_id).await;
                 }
                 WorkspaceSessionSelection::AttachSelected(session_id) => {
                     let _ = app.select_workspace_session(session_id);
+                    mark_unread_attention_read_for_session(client, app, session_id).await;
                 }
                 WorkspaceSessionSelection::NotAttachable(session_id) => {
                     app.status_message = format!("session not attachable {session_id}");
@@ -1263,6 +1267,29 @@ fn handle_daemon_switcher_key(app: &mut AppModel, event: KeyEvent) -> Option<Ses
             None
         }
         _ => None,
+    }
+}
+
+async fn mark_unread_attention_read_for_session(
+    client: &SessionControlClient,
+    app: &mut AppModel,
+    session_id: SessionId,
+) {
+    match client
+        .attention_read(&AttentionReadRequest {
+            selector: SessionSelector::Id { session_id },
+            item_id: None,
+            kinds: vec![AttentionKind::Unread],
+        })
+        .await
+    {
+        Ok(response) if response.mutated_count > 0 => {
+            app.status_message = format!("marked {} unread item(s) read", response.mutated_count);
+        }
+        Ok(_) => {}
+        Err(error) => {
+            app.status_message = format!("attention read failed: {error}");
+        }
     }
 }
 
@@ -2159,6 +2186,8 @@ mod tests {
             spawn_mode: SpawnMode::Pty,
             process_state: ProcessState::Running,
             attention_state: millrace_sessions_core::state::AttentionState::Idle,
+            attention: Default::default(),
+            status_summary: Default::default(),
             failure_message: None,
             workspace: Some(millrace_sessions_core::workspace::WorkspaceIdentity {
                 canonical_path: cwd.clone(),

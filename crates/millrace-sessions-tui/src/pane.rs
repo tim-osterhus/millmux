@@ -2,7 +2,7 @@ use std::{collections::VecDeque, fmt, str::FromStr};
 
 use millrace_sessions_core::{
     ids::{PaneId, SessionId},
-    state::{UiPaneContext, UiPaneView, UiPaneViewKind},
+    state::{AttentionRollup, StatusSummary, UiPaneContext, UiPaneView, UiPaneViewKind},
 };
 
 use crate::terminal::TerminalSnapshot;
@@ -234,6 +234,8 @@ pub struct WorkspaceSessionRow {
     pub liveness: String,
     pub unread: String,
     pub attention: String,
+    pub attention_rollup: AttentionRollup,
+    pub status: StatusSummary,
     pub selected: bool,
     pub focused: bool,
     pub status_summary: String,

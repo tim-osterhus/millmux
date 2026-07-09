@@ -8,8 +8,10 @@ use crate::{
     events::SessionEvent,
     ids::{SessionId, UiId},
     state::{
-        AttentionState, HostMeta, MonitorProfile, ProcessState, SessionLiveness, SessionPaths,
-        SessionRole, SpawnMode, UiContext, UiContextPaths, UiEvent, WorkerMeta,
+        AttentionItem, AttentionKind, AttentionRollup, AttentionSeverity, AttentionSource,
+        AttentionState, AttentionTargetType, HostMeta, MonitorProfile, ProcessState,
+        SessionLiveness, SessionPaths, SessionRole, SpawnMode, StatusSummary, UiContext,
+        UiContextPaths, UiEvent, WorkerMeta,
     },
     workspace::WorkspaceIdentity,
 };
@@ -52,6 +54,14 @@ pub enum ControlMethod {
     SessionKill,
     #[serde(rename = "session.delete")]
     SessionDelete,
+    #[serde(rename = "attention.list")]
+    AttentionList,
+    #[serde(rename = "attention.mark")]
+    AttentionMark,
+    #[serde(rename = "attention.read")]
+    AttentionRead,
+    #[serde(rename = "attention.clear")]
+    AttentionClear,
     #[serde(rename = "ui.context.get")]
     UiContextGet,
     #[serde(rename = "ui.context.set")]
@@ -626,6 +636,56 @@ pub struct SessionDeleteRequest {
     pub kill: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AttentionListRequest {
+    pub selector: SessionSelector,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub include_read: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub include_cleared: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AttentionMarkRequest {
+    pub selector: SessionSelector,
+    #[serde(default = "default_attention_target_type")]
+    pub target_type: AttentionTargetType,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_id: Option<String>,
+    pub kind: AttentionKind,
+    pub severity: AttentionSeverity,
+    pub source: AttentionSource,
+    pub message: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dedupe_key: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status_label: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status_detail: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AttentionReadRequest {
+    pub selector: SessionSelector,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub item_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub kinds: Vec<AttentionKind>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AttentionClearRequest {
+    pub selector: SessionSelector,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub item_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub kinds: Vec<AttentionKind>,
+}
+
+fn default_attention_target_type() -> AttentionTargetType {
+    AttentionTargetType::Session
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct UiContextGetRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -985,6 +1045,10 @@ pub struct SessionSummary {
     pub spawn_mode: SpawnMode,
     pub process_state: ProcessState,
     pub attention_state: AttentionState,
+    #[serde(default)]
+    pub attention: AttentionRollup,
+    #[serde(default)]
+    pub status_summary: StatusSummary,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub failure_message: Option<String>,
     pub workspace: Option<WorkspaceIdentity>,
@@ -1129,6 +1193,8 @@ pub struct SessionInspectResponse {
     pub protocol_version: u32,
     pub session: SessionSummary,
     pub paths: SessionPaths,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub attention_items: Vec<AttentionItem>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub worker: Option<WorkerMeta>,
 }
@@ -1263,6 +1329,25 @@ pub struct SessionDeleteResponse {
     pub purged: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub archive_path: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AttentionListResponse {
+    pub schema_version: u32,
+    pub protocol_version: u32,
+    pub session_id: SessionId,
+    pub attention: AttentionRollup,
+    pub attention_items: Vec<AttentionItem>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AttentionMutationResponse {
+    pub schema_version: u32,
+    pub protocol_version: u32,
+    pub session_id: SessionId,
+    pub mutated_count: u32,
+    pub attention: AttentionRollup,
+    pub attention_items: Vec<AttentionItem>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1844,6 +1929,10 @@ mod tests {
             (ControlMethod::SessionStop, "session.stop"),
             (ControlMethod::SessionKill, "session.kill"),
             (ControlMethod::SessionDelete, "session.delete"),
+            (ControlMethod::AttentionList, "attention.list"),
+            (ControlMethod::AttentionMark, "attention.mark"),
+            (ControlMethod::AttentionRead, "attention.read"),
+            (ControlMethod::AttentionClear, "attention.clear"),
             (ControlMethod::UiContextGet, "ui.context.get"),
             (ControlMethod::UiContextSet, "ui.context.set"),
             (ControlMethod::UiContextList, "ui.context.list"),
