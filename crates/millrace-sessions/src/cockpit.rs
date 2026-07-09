@@ -661,25 +661,21 @@ async fn run_interactive_cockpit(
                     }
                 }
                 Event::Paste(text) => {
-                    handle_cockpit_paste(&client, &mut app, &mut attach, text).await?;
+                    handle_cockpit_paste(&client, &mut app, &mut attach, attached_session_id, text)
+                        .await?;
                     redraw.mark_dirty();
                 }
-                Event::Resize(width, height) => {
-                    if let Some((rows, cols)) = app.agent_terminal_size_for(width, height) {
-                        if (rows, cols) != last_size {
-                            emulator.resize(rows, cols);
-                            app.resize_agent_terminal(rows, cols);
-                            app.update_agent_terminal_view(
-                                emulator.snapshot(),
-                                emulator.is_following(),
-                            );
-                            attach
-                                .writer
-                                .write_frame(&AttachStreamFrame::Resize { rows, cols })
-                                .await?;
-                            last_size = (rows, cols);
-                            redraw.mark_dirty();
-                        }
+                Event::Resize(_, _) => {
+                    let resized = sync_agent_geometry_from_terminal(
+                        &mut app,
+                        &mut terminal,
+                        &mut attach,
+                        &mut emulator,
+                        &mut last_size,
+                    )
+                    .await?;
+                    if resized {
+                        redraw.mark_dirty();
                     }
                 }
                 _ => {}
@@ -689,6 +685,17 @@ async fn run_interactive_cockpit(
         if last_refresh.elapsed() >= REFRESH_INTERVAL {
             refresh_daemon_sessions(&client, &mut app).await?;
             refresh_logs(&client, &mut app).await?;
+            if sync_agent_geometry_from_terminal(
+                &mut app,
+                &mut terminal,
+                &mut attach,
+                &mut emulator,
+                &mut last_size,
+            )
+            .await?
+            {
+                redraw.mark_dirty();
+            }
             last_refresh = Instant::now();
             redraw.mark_dirty();
         }
@@ -825,6 +832,26 @@ async fn sync_agent_attach_size(
         .write_frame(&AttachStreamFrame::Resize { rows, cols })
         .await?;
     Ok(())
+}
+
+async fn sync_agent_geometry_from_terminal(
+    app: &mut AppModel,
+    terminal: &mut TerminalSession,
+    attach: &mut OpenedAgentAttach,
+    emulator: &mut TerminalEmulator,
+    last_size: &mut (u16, u16),
+) -> Result<bool, CockpitError> {
+    let size = terminal.terminal.size()?;
+    let Some((rows, cols)) = app.agent_terminal_size_for(size.width, size.height) else {
+        return Ok(false);
+    };
+    if (rows, cols) == *last_size {
+        return Ok(false);
+    }
+    sync_agent_terminal_to_interactive_size(app, emulator, rows, cols);
+    sync_agent_attach_size(attach, rows, cols).await?;
+    *last_size = (rows, cols);
+    Ok(true)
 }
 
 async fn switch_agent_attach(
@@ -1007,7 +1034,8 @@ async fn handle_cockpit_key(
     }
 
     let previous_daemon = app.active_daemon_session_id;
-    let agent_was_focused = app.focused_agent_terminal();
+    let attached_agent_was_focused =
+        cockpit_attached_terminal_focused(app, *attach_state.attached_session_id);
     let search_was_active = app.search_mode;
     let viewport_height = terminal
         .terminal
@@ -1047,42 +1075,42 @@ async fn handle_cockpit_key(
             )
             .await?;
         }
-        KeyAction::ScrollUp if agent_was_focused => {
+        KeyAction::ScrollUp if attached_agent_was_focused => {
             attach_state.emulator.scroll_up(1);
             app.update_agent_terminal_view(
                 attach_state.emulator.snapshot(),
                 attach_state.emulator.is_following(),
             );
         }
-        KeyAction::ScrollDown if agent_was_focused => {
+        KeyAction::ScrollDown if attached_agent_was_focused => {
             attach_state.emulator.scroll_down(1);
             app.update_agent_terminal_view(
                 attach_state.emulator.snapshot(),
                 attach_state.emulator.is_following(),
             );
         }
-        KeyAction::PageUp if agent_was_focused => {
+        KeyAction::PageUp if attached_agent_was_focused => {
             attach_state.emulator.page_up(viewport_height);
             app.update_agent_terminal_view(
                 attach_state.emulator.snapshot(),
                 attach_state.emulator.is_following(),
             );
         }
-        KeyAction::PageDown if agent_was_focused => {
+        KeyAction::PageDown if attached_agent_was_focused => {
             attach_state.emulator.page_down(viewport_height);
             app.update_agent_terminal_view(
                 attach_state.emulator.snapshot(),
                 attach_state.emulator.is_following(),
             );
         }
-        KeyAction::JumpTop if agent_was_focused => {
+        KeyAction::JumpTop if attached_agent_was_focused => {
             attach_state.emulator.jump_top();
             app.update_agent_terminal_view(
                 attach_state.emulator.snapshot(),
                 attach_state.emulator.is_following(),
             );
         }
-        KeyAction::SearchInput(_) | KeyAction::SearchBackspace if agent_was_focused => {
+        KeyAction::SearchInput(_) | KeyAction::SearchBackspace if attached_agent_was_focused => {
             sync_agent_search_from_emulator(
                 app,
                 &mut *attach_state.emulator,
@@ -1090,7 +1118,7 @@ async fn handle_cockpit_key(
                 "search",
             );
         }
-        KeyAction::NextSearch if agent_was_focused => {
+        KeyAction::NextSearch if attached_agent_was_focused => {
             sync_agent_search_from_emulator(
                 app,
                 &mut *attach_state.emulator,
@@ -1098,7 +1126,7 @@ async fn handle_cockpit_key(
                 "search next",
             );
         }
-        KeyAction::PreviousSearch if agent_was_focused => {
+        KeyAction::PreviousSearch if attached_agent_was_focused => {
             sync_agent_search_from_emulator(
                 app,
                 &mut *attach_state.emulator,
@@ -1108,7 +1136,7 @@ async fn handle_cockpit_key(
         }
         KeyAction::Escape if search_was_active => {}
         KeyAction::ExitScrollMode | KeyAction::JumpBottom | KeyAction::Escape => {
-            if agent_was_focused {
+            if attached_agent_was_focused {
                 attach_state.emulator.jump_bottom();
                 app.update_agent_terminal_view(
                     attach_state.emulator.snapshot(),
@@ -1125,12 +1153,16 @@ async fn handle_cockpit_key(
             .await?;
         }
         KeyAction::Input(event) => {
-            if let Some(text) = cockpit_key_input_text(app, event) {
+            if let Some(text) =
+                cockpit_key_input_text_for_attach(app, event, *attach_state.attached_session_id)
+            {
                 attach_state
                     .attach
                     .writer
                     .write_frame(&AttachStreamFrame::Input { text })
                     .await?;
+            } else if !app.focused_attach_matches(*attach_state.attached_session_id) {
+                app.status_message = "input rejected: pane_session_mismatch".to_string();
             }
         }
         _ => {}
@@ -1166,9 +1198,10 @@ async fn handle_cockpit_paste(
     client: &SessionControlClient,
     app: &mut AppModel,
     attach: &mut OpenedAgentAttach,
+    attached_session_id: SessionId,
     text: String,
 ) -> Result<(), CockpitError> {
-    match cockpit_paste_decision(app, &text) {
+    match cockpit_paste_decision_for_attach(app, &text, Some(attached_session_id)) {
         CockpitPasteDecision::Accepted {
             text,
             byte_count,
@@ -1333,6 +1366,10 @@ fn cockpit_accepts_agent_text_input(app: &AppModel) -> bool {
         && app.agent_terminal_can_accept_input()
 }
 
+fn cockpit_attached_terminal_focused(app: &AppModel, attached_session_id: SessionId) -> bool {
+    app.focused_attach_matches(attached_session_id)
+}
+
 fn cockpit_overlay_accepts_input(app: &AppModel) -> bool {
     app.daemon_switcher.open
         || app.command_palette.open
@@ -1346,6 +1383,16 @@ fn cockpit_key_input_text(app: &AppModel, event: KeyEvent) -> Option<String> {
         .flatten()
 }
 
+fn cockpit_key_input_text_for_attach(
+    app: &AppModel,
+    event: KeyEvent,
+    attached_session_id: SessionId,
+) -> Option<String> {
+    app.focused_attach_matches(attached_session_id)
+        .then(|| cockpit_key_input_text(app, event))
+        .flatten()
+}
+
 #[cfg(test)]
 fn cockpit_paste_input_text(app: &AppModel, text: &str) -> Option<String> {
     match cockpit_paste_decision(app, text) {
@@ -1354,7 +1401,16 @@ fn cockpit_paste_input_text(app: &AppModel, text: &str) -> Option<String> {
     }
 }
 
+#[cfg(test)]
 fn cockpit_paste_decision(app: &AppModel, text: &str) -> CockpitPasteDecision {
+    cockpit_paste_decision_for_attach(app, text, None)
+}
+
+fn cockpit_paste_decision_for_attach(
+    app: &AppModel,
+    text: &str,
+    attached_session_id: Option<SessionId>,
+) -> CockpitPasteDecision {
     let byte_count = text.len();
     let bracketed = paste_event_is_bracketed_or_multiline(text);
     if byte_count > MAX_COCKPIT_PASTE_BYTES {
@@ -1385,6 +1441,13 @@ fn cockpit_paste_decision(app: &AppModel, text: &str) -> CockpitPasteDecision {
             bracketed,
         };
     }
+    if attached_session_id.is_some_and(|session_id| !app.focused_attach_matches(session_id)) {
+        return CockpitPasteDecision::Rejected {
+            reason: CockpitPasteRejectReason::PaneSessionMismatch,
+            byte_count,
+            bracketed,
+        };
+    }
 
     CockpitPasteDecision::Accepted {
         text: paste_event_to_text(text),
@@ -1410,7 +1473,7 @@ fn input_audit_fields(
         ("accepted".to_string(), accepted.to_string()),
         ("bracketed".to_string(), bracketed.to_string()),
     ]);
-    if let Some(session_id) = app.agent_session_id {
+    if let Some(session_id) = app.focused_attach_session_id().or(app.agent_session_id) {
         fields.insert("target_session_id".to_string(), session_id.to_string());
     }
     if let Some(pane_id) = app.active_pane_id {
@@ -1485,6 +1548,7 @@ enum CockpitPasteRejectReason {
     OverlayActive,
     AgentUnfocused,
     ReadOnly,
+    PaneSessionMismatch,
     TooLarge,
 }
 
@@ -1494,6 +1558,7 @@ impl CockpitPasteRejectReason {
             Self::OverlayActive => "overlay_active",
             Self::AgentUnfocused => "agent_unfocused",
             Self::ReadOnly => "read_only",
+            Self::PaneSessionMismatch => "pane_session_mismatch",
             Self::TooLarge => "too_large",
         }
     }
@@ -1553,6 +1618,8 @@ fn absolute_path(path: &Path) -> PathBuf {
 
 #[cfg(test)]
 mod tests {
+    use millrace_sessions_core::state::{UiPaneView, UiPaneViewKind};
+
     use super::*;
 
     #[test]
@@ -1874,6 +1941,79 @@ mod tests {
                 bracketed: false,
             }
         );
+    }
+
+    #[test]
+    fn cockpit_paste_rejects_when_focused_pane_does_not_match_open_attach() {
+        let mut app = cockpit_input_app(true, false);
+        let attached_session_id = app.agent_session_id.expect("initial agent");
+        let second_agent = session_summary("agent-two", SessionRole::Agent);
+        let second_agent_id = second_agent.session_id;
+        let mut sessions = app.workspace_sessions.clone();
+        sessions.push(second_agent);
+        app.replace_workspace_sessions(sessions);
+        let pane_id = app.active_pane_id.expect("active terminal pane");
+        assert!(app.assign_pane_view(
+            pane_id,
+            UiPaneView::new(UiPaneViewKind::SessionTerminal, Some(second_agent_id))
+        ));
+
+        assert_eq!(
+            cockpit_paste_decision_for_attach(&app, "blocked", Some(attached_session_id)),
+            CockpitPasteDecision::Rejected {
+                reason: CockpitPasteRejectReason::PaneSessionMismatch,
+                byte_count: "blocked".len(),
+                bracketed: false,
+            }
+        );
+    }
+
+    #[test]
+    fn cockpit_key_input_rejects_when_focused_pane_does_not_match_open_attach() {
+        let mut app = cockpit_input_app(true, false);
+        let attached_session_id = app.agent_session_id.expect("initial agent");
+        let second_agent = session_summary("agent-two", SessionRole::Agent);
+        let second_agent_id = second_agent.session_id;
+        let mut sessions = app.workspace_sessions.clone();
+        sessions.push(second_agent);
+        app.replace_workspace_sessions(sessions);
+        let pane_id = app.active_pane_id.expect("active terminal pane");
+        assert!(app.assign_pane_view(
+            pane_id,
+            UiPaneView::new(UiPaneViewKind::SessionTerminal, Some(second_agent_id))
+        ));
+
+        assert_eq!(
+            cockpit_key_input_text_for_attach(
+                &app,
+                key(KeyCode::Char('x'), KeyModifiers::NONE),
+                attached_session_id
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn cockpit_emulator_actions_require_focused_attached_terminal() {
+        let mut app = cockpit_input_app(true, false);
+        let attached_session_id = app.agent_session_id.expect("initial agent");
+        assert!(cockpit_attached_terminal_focused(&app, attached_session_id));
+
+        let second_agent = session_summary("agent-two", SessionRole::Agent);
+        let second_agent_id = second_agent.session_id;
+        let mut sessions = app.workspace_sessions.clone();
+        sessions.push(second_agent);
+        app.replace_workspace_sessions(sessions);
+        let pane_id = app.active_pane_id.expect("active terminal pane");
+        assert!(app.assign_pane_view(
+            pane_id,
+            UiPaneView::new(UiPaneViewKind::SessionTerminal, Some(second_agent_id))
+        ));
+
+        assert!(!cockpit_attached_terminal_focused(
+            &app,
+            attached_session_id
+        ));
     }
 
     #[test]

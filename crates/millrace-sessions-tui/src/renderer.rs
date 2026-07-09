@@ -12,7 +12,7 @@ use ratatui::{
 use crate::{
     app::{AppModel, HostConnectionState},
     pane::{
-        AgentCockpitLayout, CommandOutputState, DaemonConsoleLayout, PaneKind,
+        AgentCockpitLayout, CommandOutputState, DaemonConsoleLayout, Pane, PaneKind,
         COCKPIT_SESSION_LIST_HEIGHT,
     },
     terminal::{TerminalCell, TerminalColor},
@@ -51,7 +51,9 @@ fn render_body(frame: &mut ratatui::Frame<'_>, area: Rect, app: &AppModel) {
         HostConnectionState::Connected => {}
     }
 
-    if app.command_output.is_visible() {
+    let command_output_outside_pane = app.command_output.is_visible()
+        && app.mode != millrace_sessions_core::state::UiMode::AgentCockpit;
+    if command_output_outside_pane {
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([Constraint::Min(3), Constraint::Length(5)])
@@ -96,59 +98,119 @@ fn render_console(frame: &mut ratatui::Frame<'_>, area: Rect, app: &AppModel) {
 }
 
 fn render_cockpit(frame: &mut ratatui::Frame<'_>, area: Rect, app: &AppModel) {
-    let (session_area, content_area) = cockpit_session_list_split(area, app);
-    render_workspace_session_list(frame, session_area, app);
+    let session_list = app
+        .panes
+        .iter()
+        .find(|pane| !pane.stale && pane.kind == PaneKind::SessionList);
+    let (session_area, content_area) = if session_list.is_some() {
+        cockpit_session_list_split(area, app)
+    } else {
+        (Rect::default(), area)
+    };
+    if session_list.is_some() {
+        render_workspace_session_list(frame, session_area, app);
+    }
+
+    let content_panes = app
+        .panes
+        .iter()
+        .filter(|pane| {
+            !pane.stale
+                && pane.kind != PaneKind::SessionList
+                && (pane.kind != PaneKind::CommandOutput || app.command_output.is_visible())
+        })
+        .collect::<Vec<_>>();
+    render_cockpit_content_panes(frame, content_area, app, &content_panes);
+}
+
+fn render_cockpit_content_panes(
+    frame: &mut ratatui::Frame<'_>,
+    area: Rect,
+    app: &AppModel,
+    panes: &[&Pane],
+) {
+    if panes.is_empty() {
+        frame.render_widget(Paragraph::new("No visible cockpit panes"), area);
+        return;
+    }
+
+    if app.cockpit_layout == AgentCockpitLayout::Focus {
+        let pane = app
+            .active_pane_id
+            .and_then(|pane_id| panes.iter().find(|pane| pane.id == pane_id).copied())
+            .unwrap_or(panes[0]);
+        render_cockpit_pane(frame, area, app, pane);
+        return;
+    }
+
+    if panes.len() == 1 {
+        render_cockpit_pane(frame, area, app, panes[0]);
+        return;
+    }
+
     match app.cockpit_layout {
         AgentCockpitLayout::Right => {
-            if content_area.width >= 64 {
-                let chunks = Layout::default()
-                    .direction(Direction::Horizontal)
-                    .constraints([Constraint::Percentage(55), Constraint::Percentage(45)])
-                    .split(content_area);
-                render_agent_terminal(frame, chunks[0], app);
-                render_log(
-                    frame,
-                    chunks[1],
-                    app,
-                    app.active_daemon_session_id,
-                    "Daemon Monitor",
-                    pane_focused(app, PaneKind::DaemonMonitor),
-                );
+            if area.width >= 64 {
+                render_cockpit_split_panes(frame, area, app, panes, Direction::Horizontal, 55);
             } else {
-                render_cockpit_bottom(frame, content_area, app, 60);
+                render_cockpit_split_panes(frame, area, app, panes, Direction::Vertical, 60);
             }
         }
-        AgentCockpitLayout::Bottom => render_cockpit_bottom(frame, content_area, app, 60),
+        AgentCockpitLayout::Bottom => {
+            render_cockpit_split_panes(frame, area, app, panes, Direction::Vertical, 60)
+        }
         AgentCockpitLayout::Wide => {
-            if content_area.width >= 64 {
-                let chunks = Layout::default()
-                    .direction(Direction::Horizontal)
-                    .constraints([Constraint::Percentage(65), Constraint::Percentage(35)])
-                    .split(content_area);
-                render_agent_terminal(frame, chunks[0], app);
-                render_log(
-                    frame,
-                    chunks[1],
-                    app,
-                    app.active_daemon_session_id,
-                    "Daemon Monitor",
-                    pane_focused(app, PaneKind::DaemonMonitor),
-                );
+            if area.width >= 64 {
+                render_cockpit_split_panes(frame, area, app, panes, Direction::Horizontal, 65);
             } else {
-                render_cockpit_bottom(frame, content_area, app, 65);
+                render_cockpit_split_panes(frame, area, app, panes, Direction::Vertical, 65);
             }
         }
-        AgentCockpitLayout::Focus => match app.focused_pane_kind() {
-            Some(PaneKind::DaemonMonitor) => render_log(
-                frame,
-                content_area,
-                app,
-                app.active_daemon_session_id,
-                "Daemon Monitor",
-                true,
-            ),
-            _ => render_agent_terminal(frame, content_area, app),
-        },
+        AgentCockpitLayout::Focus => unreachable!("focus layout handled before split"),
+    }
+}
+
+fn render_cockpit_split_panes(
+    frame: &mut ratatui::Frame<'_>,
+    area: Rect,
+    app: &AppModel,
+    panes: &[&Pane],
+    direction: Direction,
+    first_percent: u16,
+) {
+    let constraints = if panes.len() == 2 {
+        vec![
+            Constraint::Percentage(first_percent),
+            Constraint::Percentage(100 - first_percent),
+        ]
+    } else {
+        vec![Constraint::Percentage(100 / panes.len() as u16); panes.len()]
+    };
+    let chunks = Layout::default()
+        .direction(direction)
+        .constraints(constraints)
+        .split(area);
+    for (index, pane) in panes.iter().enumerate() {
+        render_cockpit_pane(frame, chunks[index], app, pane);
+    }
+}
+
+fn render_cockpit_pane(frame: &mut ratatui::Frame<'_>, area: Rect, app: &AppModel, pane: &Pane) {
+    let focused = Some(pane.id) == app.active_pane_id;
+    match pane.kind {
+        PaneKind::AgentTerminal => {
+            render_agent_terminal_view(frame, area, app, pane.session_id, &pane.title, focused)
+        }
+        PaneKind::DaemonMonitor => {
+            render_log(frame, area, app, pane.session_id, &pane.title, focused)
+        }
+        PaneKind::SessionList | PaneKind::DaemonList => {
+            render_workspace_session_list(frame, area, app)
+        }
+        PaneKind::CommandOutput => render_command_output(frame, area, app),
+        PaneKind::StatusBar | PaneKind::HelpOverlay | PaneKind::CommandPalette => {
+            frame.render_widget(Paragraph::new(pane.title.as_str()), area);
+        }
     }
 }
 
@@ -166,34 +228,29 @@ fn cockpit_session_list_split(area: Rect, app: &AppModel) -> (Rect, Rect) {
     (chunks[0], chunks[1])
 }
 
-fn render_cockpit_bottom(
+fn render_agent_terminal_view(
     frame: &mut ratatui::Frame<'_>,
     area: Rect,
     app: &AppModel,
-    agent_percent: u16,
+    session_id: Option<SessionId>,
+    title: &str,
+    focused: bool,
 ) {
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Percentage(agent_percent),
-            Constraint::Percentage(100 - agent_percent),
-        ])
-        .split(area);
-    render_agent_terminal(frame, chunks[0], app);
-    render_log(
-        frame,
-        chunks[1],
-        app,
-        app.active_daemon_session_id,
-        "Daemon Monitor",
-        pane_focused(app, PaneKind::DaemonMonitor),
-    );
-}
-
-fn render_agent_terminal(frame: &mut ratatui::Frame<'_>, area: Rect, app: &AppModel) {
-    let focused = pane_focused(app, PaneKind::AgentTerminal);
+    if session_id != app.agent_session_id {
+        let label = session_id
+            .map(|session_id| session_id.to_string())
+            .unwrap_or_else(|| "unassigned".to_string());
+        frame.render_widget(
+            Paragraph::new(format!(
+                "{title} | session={label} not attached{}",
+                focus_suffix(focused)
+            )),
+            area,
+        );
+        return;
+    }
     let Some(terminal) = &app.agent_terminal else {
-        frame.render_widget(Paragraph::new("Agent Terminal | no session"), area);
+        frame.render_widget(Paragraph::new(format!("{title} | no session")), area);
         return;
     };
     let input = if terminal.input_owner && !terminal.read_only {
@@ -217,7 +274,7 @@ fn render_agent_terminal(frame: &mut ratatui::Frame<'_>, area: Rect, app: &AppMo
     };
     let mut lines = vec![Line::from(vec![Span::styled(
         format!(
-            "Agent Terminal | {input} {view}{screen} cur={},{}{}",
+            "{title} | {input} {view}{screen} cur={},{}{}",
             terminal.snapshot.cursor_row,
             terminal.snapshot.cursor_col,
             focus_suffix(focused)
@@ -379,8 +436,9 @@ fn render_daemon_list(frame: &mut ratatui::Frame<'_>, area: Rect, app: &AppModel
 
 fn render_workspace_session_list(frame: &mut ratatui::Frame<'_>, area: Rect, app: &AppModel) {
     let rows = app.workspace_session_rows();
+    let focused = pane_focused(app, PaneKind::SessionList);
     let mut lines = vec![Line::from(vec![Span::styled(
-        format!("Sessions | count={}", rows.len()),
+        format!("Sessions | count={}{}", rows.len(), focus_suffix(focused)),
         Style::default()
             .fg(Color::Green)
             .add_modifier(Modifier::BOLD),

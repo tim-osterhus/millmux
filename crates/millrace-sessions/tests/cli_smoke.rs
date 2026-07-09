@@ -777,6 +777,35 @@ exit 1
         context["context"]["focused_pane_kind"].as_str(),
         Some("agent_terminal")
     );
+    let active_pane_id = context["context"]["active_pane_id"]
+        .as_str()
+        .expect("active pane id");
+    let panes = context["context"]["panes"]
+        .as_array()
+        .expect("pane contexts");
+    assert!(
+        panes.iter().any(|pane| {
+            pane["id"].as_str() == Some(active_pane_id)
+                && pane["view"]["kind"].as_str() == Some("session_terminal")
+                && pane["view"]["session_id"].as_str() == Some(agent_session_id)
+                && pane["focused"].as_bool() == Some(true)
+                && pane["stale"].as_bool() == Some(false)
+        }),
+        "{panes:?}"
+    );
+    assert!(
+        panes.iter().any(|pane| {
+            pane["view"]["kind"].as_str() == Some("daemon_monitor")
+                && pane["view"]["session_id"].as_str() == Some(active_daemon_session_id)
+        }),
+        "{panes:?}"
+    );
+    assert!(
+        panes
+            .iter()
+            .any(|pane| pane["view"]["kind"].as_str() == Some("session_list")),
+        "{panes:?}"
+    );
     assert_eq!(context["context"]["monitor_profile"], "raw");
     let managed_sessions = context["context"]["managed_session_ids"]
         .as_array()

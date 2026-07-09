@@ -6,10 +6,12 @@ use millrace_sessions_core::{
     protocol::SessionSummary,
     state::{
         AttentionState, LivenessState, MonitorProfile, ProcessState, SessionRole, UiContext,
-        UiDaemonHealth, UiDaemonRecoveryAction, UiMode,
+        UiDaemonHealth, UiDaemonRecoveryAction, UiMode, UiPaneContext, UiPaneView, UiPaneViewKind,
+        UiPaneViewMode,
     },
     workspace::{GitWorktreeIdentity, WorkspaceIdentity},
 };
+use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use time::OffsetDateTime;
 
 use crate::{
@@ -230,7 +232,12 @@ impl AppModel {
             ui_id,
             mode: UiMode::AgentCockpit,
             monitor_profile,
-            panes: vec![agent_pane, daemon_pane, Pane::command_output()],
+            panes: vec![
+                agent_pane,
+                daemon_pane,
+                Pane::session_list(),
+                Pane::command_output(),
+            ],
             workspace_worktrees: worktrees_for_sessions(&workspace_sessions),
             workspace_sessions,
             daemon_sessions: daemon_sessions.clone(),
@@ -312,35 +319,31 @@ impl AppModel {
         self.scroll_mode = false;
         self.search_mode = false;
         self.search_query.clear();
-        if self.focused_agent_terminal() {
-            self.set_agent_terminal_following(true);
-        } else {
-            self.jump_active_log_bottom();
+        match self.active_view_kind() {
+            Some(UiPaneViewKind::SessionTerminal) => self.set_agent_terminal_following(true),
+            Some(UiPaneViewKind::DaemonMonitor) => self.jump_active_log_bottom(),
+            Some(UiPaneViewKind::SessionList | UiPaneViewKind::CommandOutput) | None => {}
         }
         self.status_message = "live".to_string();
     }
 
     pub fn switch_focus(&mut self) {
-        if self.panes.is_empty() {
+        let focusable = self.focusable_pane_indices();
+        if focusable.is_empty() {
             self.active_pane_id = None;
             return;
         }
 
         let current = self
             .active_pane_id
-            .and_then(|id| self.panes.iter().position(|pane| pane.id == id))
+            .and_then(|id| {
+                focusable
+                    .iter()
+                    .position(|index| self.panes[*index].id == id)
+            })
             .unwrap_or(0);
-        let next = (current + 1) % self.panes.len();
-        for (index, pane) in self.panes.iter_mut().enumerate() {
-            pane.focused = index == next;
-        }
-        self.active_pane_id = Some(self.panes[next].id);
-        if self.panes[next].kind == PaneKind::DaemonMonitor {
-            if let Some(session_id) = self.panes[next].session_id {
-                self.select_daemon(session_id);
-            }
-        }
-        self.update_selected_session_from_focus();
+        let next = focusable[(current + 1) % focusable.len()];
+        let _ = self.focus_pane_index(next);
     }
 
     pub fn focused_pane_kind(&self) -> Option<PaneKind> {
@@ -360,6 +363,7 @@ impl AppModel {
             PaneKind::AgentTerminal => "agent_terminal",
             PaneKind::DaemonMonitor => "daemon_monitor",
             PaneKind::DaemonList => "daemon_list",
+            PaneKind::SessionList => "session_list",
             PaneKind::CommandOutput => "command_output",
             PaneKind::StatusBar => "status_bar",
             PaneKind::HelpOverlay => "help_overlay",
@@ -367,26 +371,94 @@ impl AppModel {
         })
     }
 
+    pub fn active_pane(&self) -> Option<&Pane> {
+        let active = self.active_pane_id?;
+        self.panes.iter().find(|pane| pane.id == active)
+    }
+
+    fn active_view_kind(&self) -> Option<UiPaneViewKind> {
+        self.active_pane()
+            .filter(|pane| !pane.stale)
+            .map(|pane| pane.view.kind)
+    }
+
+    fn target_pane_id_for_kind(&self, kind: PaneKind) -> Option<PaneId> {
+        self.active_pane()
+            .filter(|pane| pane.kind == kind && !pane.stale)
+            .map(|pane| pane.id)
+            .or_else(|| {
+                self.panes
+                    .iter()
+                    .find(|pane| pane.kind == kind && !pane.stale)
+                    .map(|pane| pane.id)
+            })
+    }
+
+    fn pane_id_for_view_session(
+        &self,
+        kind: UiPaneViewKind,
+        session_id: SessionId,
+    ) -> Option<PaneId> {
+        self.panes
+            .iter()
+            .find(|pane| {
+                pane.view.kind == kind && pane.view.session_id == Some(session_id) && !pane.stale
+            })
+            .map(|pane| pane.id)
+    }
+
     pub fn focused_session_id(&self) -> Option<SessionId> {
-        match self.focused_pane_kind()? {
-            PaneKind::AgentTerminal => self.agent_session_id,
-            PaneKind::DaemonMonitor => self.active_daemon_session_id,
-            _ => None,
-        }
+        let pane = self.active_pane()?;
+        (!pane.stale).then_some(pane.view.session_id).flatten()
     }
 
     pub fn active_attach_session_id(&self) -> Option<SessionId> {
         self.agent_session_id
     }
 
+    pub fn focused_attach_session_id(&self) -> Option<SessionId> {
+        let pane = self.active_pane()?;
+        (!pane.stale && pane.view.kind == UiPaneViewKind::SessionTerminal)
+            .then_some(pane.view.session_id)
+            .flatten()
+    }
+
+    pub fn focused_attach_matches(&self, attached_session_id: SessionId) -> bool {
+        self.focused_attach_session_id() == Some(attached_session_id)
+    }
+
     pub fn focus_pane_kind(&mut self, kind: PaneKind) -> bool {
-        let Some(index) = self.panes.iter().position(|pane| pane.kind == kind) else {
+        let Some(index) = self
+            .panes
+            .iter()
+            .position(|pane| pane.kind == kind && !pane.stale)
+        else {
             return false;
         };
+        self.focus_pane_index(index)
+    }
+
+    pub fn focus_pane_id(&mut self, pane_id: PaneId) -> bool {
+        let Some(index) = self
+            .panes
+            .iter()
+            .position(|pane| pane.id == pane_id && !pane.stale)
+        else {
+            return false;
+        };
+        self.focus_pane_index(index)
+    }
+
+    fn focus_pane_index(&mut self, index: usize) -> bool {
         for (pane_index, pane) in self.panes.iter_mut().enumerate() {
             pane.focused = pane_index == index;
         }
         self.active_pane_id = Some(self.panes[index].id);
+        if self.panes[index].view.kind == UiPaneViewKind::DaemonMonitor {
+            if let Some(session_id) = self.panes[index].view.session_id {
+                let _ = self.select_daemon(session_id);
+            }
+        }
         self.update_selected_session_from_focus();
         true
     }
@@ -521,16 +593,22 @@ impl AppModel {
         }
 
         let query = self.search_query.clone();
-        let found = if self.focused_agent_terminal() {
-            self.agent_terminal
+        let found = match self.active_view_kind() {
+            Some(UiPaneViewKind::SessionTerminal) => self
+                .agent_terminal
                 .as_mut()
-                .and_then(|terminal| terminal.search(query.clone()))
-        } else {
-            let result = self.line_log.search(query.clone());
-            if let Some(log) = self.active_daemon_log_mut() {
-                let _ = log.search(query.clone());
+                .and_then(|terminal| terminal.search(query.clone())),
+            Some(UiPaneViewKind::DaemonMonitor) => {
+                let result = self.line_log.search(query.clone());
+                if let Some(log) = self.active_daemon_log_mut() {
+                    let _ = log.search(query.clone());
+                }
+                result
             }
-            result
+            Some(UiPaneViewKind::SessionList | UiPaneViewKind::CommandOutput) | None => {
+                self.status_message = "search: view not searchable".to_string();
+                return;
+            }
         };
         self.status_message = match found {
             Some(found) => format!("search: {} line {}", query, found.index + 1),
@@ -539,16 +617,19 @@ impl AppModel {
     }
 
     fn next_search_match(&mut self) {
-        let found = if self.focused_agent_terminal() {
-            self.agent_terminal
+        let found = match self.active_view_kind() {
+            Some(UiPaneViewKind::SessionTerminal) => self
+                .agent_terminal
                 .as_mut()
-                .and_then(AgentTerminalPane::next_match)
-        } else {
-            let result = self.line_log.next_match();
-            if let Some(log) = self.active_daemon_log_mut() {
-                let _ = log.next_match();
+                .and_then(AgentTerminalPane::next_match),
+            Some(UiPaneViewKind::DaemonMonitor) => {
+                let result = self.line_log.next_match();
+                if let Some(log) = self.active_daemon_log_mut() {
+                    let _ = log.next_match();
+                }
+                result
             }
-            result
+            Some(UiPaneViewKind::SessionList | UiPaneViewKind::CommandOutput) | None => None,
         };
         self.status_message = match found {
             Some(found) => format!("search next: line {}", found.index + 1),
@@ -557,16 +638,19 @@ impl AppModel {
     }
 
     fn previous_search_match(&mut self) {
-        let found = if self.focused_agent_terminal() {
-            self.agent_terminal
+        let found = match self.active_view_kind() {
+            Some(UiPaneViewKind::SessionTerminal) => self
+                .agent_terminal
                 .as_mut()
-                .and_then(AgentTerminalPane::previous_match)
-        } else {
-            let result = self.line_log.previous_match();
-            if let Some(log) = self.active_daemon_log_mut() {
-                let _ = log.previous_match();
+                .and_then(AgentTerminalPane::previous_match),
+            Some(UiPaneViewKind::DaemonMonitor) => {
+                let result = self.line_log.previous_match();
+                if let Some(log) = self.active_daemon_log_mut() {
+                    let _ = log.previous_match();
+                }
+                result
             }
-            result
+            Some(UiPaneViewKind::SessionList | UiPaneViewKind::CommandOutput) | None => None,
         };
         self.status_message = match found {
             Some(found) => format!("search previous: line {}", found.index + 1),
@@ -575,12 +659,13 @@ impl AppModel {
     }
 
     fn copy_current_search_match(&mut self) {
-        let found = if self.focused_agent_terminal() {
-            self.agent_terminal
+        let found = match self.active_view_kind() {
+            Some(UiPaneViewKind::SessionTerminal) => self
+                .agent_terminal
                 .as_ref()
-                .and_then(AgentTerminalPane::current_match)
-        } else {
-            self.line_log.current_match()
+                .and_then(AgentTerminalPane::current_match),
+            Some(UiPaneViewKind::DaemonMonitor) => self.line_log.current_match(),
+            Some(UiPaneViewKind::SessionList | UiPaneViewKind::CommandOutput) | None => None,
         };
         match found {
             Some(found) => {
@@ -613,33 +698,12 @@ impl AppModel {
             return None;
         }
         let body_height = height.saturating_sub(1).max(1);
-        let (width, body_height) =
-            cockpit_content_size(width, body_height, self.workspace_sessions.len());
-        let (pane_width, pane_height) = match self.cockpit_layout {
-            AgentCockpitLayout::Right => {
-                if width >= 64 {
-                    (width.saturating_mul(55) / 100, body_height)
-                } else {
-                    (width, body_height.saturating_mul(60) / 100)
-                }
-            }
-            AgentCockpitLayout::Bottom => (width, body_height.saturating_mul(60) / 100),
-            AgentCockpitLayout::Wide => {
-                if width >= 64 {
-                    (width.saturating_mul(65) / 100, body_height)
-                } else {
-                    (width, body_height.saturating_mul(65) / 100)
-                }
-            }
-            AgentCockpitLayout::Focus => {
-                if self.focused_agent_terminal() {
-                    (width, body_height)
-                } else {
-                    (width, body_height.saturating_mul(40) / 100)
-                }
-            }
-        };
-        Some((pane_height.saturating_sub(1).max(1), pane_width.max(1)))
+        let body = Rect::new(0, 0, width, body_height);
+        let (_, terminal_area) = self.agent_terminal_rect_for(body)?;
+        Some((
+            terminal_area.height.saturating_sub(1).max(1),
+            terminal_area.width.max(1),
+        ))
     }
 
     pub fn select_daemon_by_offset(&mut self, delta: isize) -> bool {
@@ -674,9 +738,19 @@ impl AppModel {
         if let Some(log) = self.daemon_logs.get(&session_id).cloned() {
             self.line_log = log;
         }
+        let has_selected_pane = self.panes.iter().any(|pane| {
+            pane.kind == PaneKind::DaemonMonitor
+                && pane.session_id == Some(session_id)
+                && !pane.stale
+        });
+        let target_pane_id = (!has_selected_pane)
+            .then(|| self.target_pane_id_for_kind(PaneKind::DaemonMonitor))
+            .flatten();
         for pane in &mut self.panes {
-            if pane.kind == PaneKind::DaemonMonitor {
+            if pane.kind == PaneKind::DaemonMonitor && Some(pane.id) == target_pane_id {
                 pane.session_id = Some(session_id);
+                pane.view.session_id = Some(session_id);
+                pane.stale = false;
             }
             pane.focused = pane.session_id == Some(session_id)
                 && pane.kind == PaneKind::DaemonMonitor
@@ -729,7 +803,13 @@ impl AppModel {
         self.selected_session_id = Some(session_id);
         if session.role == SessionRole::MillraceDaemon {
             if self.select_daemon(session_id) {
-                self.focus_pane_kind(PaneKind::DaemonMonitor);
+                if let Some(pane_id) =
+                    self.pane_id_for_view_session(UiPaneViewKind::DaemonMonitor, session_id)
+                {
+                    let _ = self.focus_pane_id(pane_id);
+                } else {
+                    let _ = self.focus_pane_kind(PaneKind::DaemonMonitor);
+                }
                 self.selected_session_id = Some(session_id);
                 self.status_message = format!(
                     "daemon selected {}",
@@ -741,12 +821,19 @@ impl AppModel {
         }
 
         self.agent_session_id = Some(session_id);
+        let target_pane_id = self.target_pane_id_for_kind(PaneKind::AgentTerminal);
         for pane in &mut self.panes {
-            if pane.kind == PaneKind::AgentTerminal {
+            if Some(pane.id) == target_pane_id {
                 pane.session_id = Some(session_id);
+                pane.view.session_id = Some(session_id);
+                pane.stale = false;
             }
         }
-        self.focus_pane_kind(PaneKind::AgentTerminal);
+        if let Some(pane_id) = target_pane_id {
+            let _ = self.focus_pane_id(pane_id);
+        } else {
+            let _ = self.focus_pane_kind(PaneKind::AgentTerminal);
+        }
         self.selected_session_id = Some(session_id);
         self.status_message = format!(
             "session selected {}",
@@ -805,9 +892,19 @@ impl AppModel {
             if let Some(log) = self.daemon_logs.get(&session_id).cloned() {
                 self.line_log = log;
             }
+            let has_selected_pane = self.panes.iter().any(|pane| {
+                pane.kind == PaneKind::DaemonMonitor
+                    && pane.session_id == Some(session_id)
+                    && !pane.stale
+            });
+            let target_pane_id = (!has_selected_pane)
+                .then(|| self.target_pane_id_for_kind(PaneKind::DaemonMonitor))
+                .flatten();
             for pane in &mut self.panes {
-                if pane.kind == PaneKind::DaemonMonitor {
+                if Some(pane.id) == target_pane_id {
                     pane.session_id = Some(session_id);
+                    pane.view.session_id = Some(session_id);
+                    pane.stale = false;
                 }
             }
         } else {
@@ -846,9 +943,12 @@ impl AppModel {
                     session.role != SessionRole::MillraceDaemon && session.capabilities.attach
                 })
                 .map(|session| session.session_id);
+            let target_pane_id = self.target_pane_id_for_kind(PaneKind::AgentTerminal);
             for pane in &mut self.panes {
-                if pane.kind == PaneKind::AgentTerminal {
+                if Some(pane.id) == target_pane_id {
                     pane.session_id = self.agent_session_id;
+                    pane.view.session_id = self.agent_session_id;
+                    pane.stale = false;
                 }
             }
         }
@@ -976,7 +1076,91 @@ impl AppModel {
             .collect()
     }
 
+    pub fn pane_contexts(&self) -> Vec<UiPaneContext> {
+        self.panes
+            .iter()
+            .map(|pane| {
+                let mut context = pane.to_context();
+                context.focused = Some(pane.id) == self.active_pane_id;
+                context.view.view_mode = self.view_mode_for_pane(pane);
+                context
+            })
+            .collect()
+    }
+
+    pub fn assign_pane_view(&mut self, pane_id: PaneId, view: UiPaneView) -> bool {
+        let Some(index) = self.panes.iter().position(|pane| pane.id == pane_id) else {
+            return false;
+        };
+        let stale = self.pane_view_is_stale(&view);
+        self.panes[index].set_view(view.clone());
+        self.panes[index].stale = stale;
+        if stale {
+            self.status_message = "pane assignment stale; focus kept safe".to_string();
+            if Some(pane_id) == self.active_pane_id {
+                self.focus_safe_fallback();
+            }
+            return true;
+        }
+
+        match view.kind {
+            UiPaneViewKind::SessionTerminal => {
+                self.agent_session_id = view.session_id;
+                self.selected_session_id = view.session_id;
+            }
+            UiPaneViewKind::DaemonMonitor => {
+                if let Some(session_id) = view.session_id {
+                    let _ = self.select_daemon(session_id);
+                }
+            }
+            UiPaneViewKind::SessionList | UiPaneViewKind::CommandOutput => {}
+        }
+        if Some(pane_id) == self.active_pane_id {
+            self.update_selected_session_from_focus();
+        }
+        true
+    }
+
+    pub fn split_pane_with_view(
+        &mut self,
+        target_pane_id: PaneId,
+        view: UiPaneView,
+    ) -> Option<PaneId> {
+        let target_index = self
+            .panes
+            .iter()
+            .position(|pane| pane.id == target_pane_id)?;
+        let mut pane = pane_for_view(view);
+        pane.stale = self.pane_view_is_stale(&pane.view);
+        let pane_id = pane.id;
+        self.panes.insert(target_index + 1, pane);
+        Some(pane_id)
+    }
+
+    pub fn close_pane(&mut self, pane_id: PaneId) -> bool {
+        let Some(index) = self.panes.iter().position(|pane| pane.id == pane_id) else {
+            return false;
+        };
+        if self
+            .focusable_pane_indices()
+            .into_iter()
+            .filter(|candidate| self.panes[*candidate].id != pane_id)
+            .count()
+            == 0
+        {
+            self.status_message = "cannot close last pane".to_string();
+            return false;
+        }
+        self.panes.remove(index);
+        if self.active_pane_id == Some(pane_id) {
+            self.focus_safe_fallback();
+        }
+        true
+    }
+
     pub fn restore_ui_context_selection(&mut self, context: &UiContext) {
+        self.restore_pane_contexts(context);
+
         if let Some(session_id) = context.active_daemon_session_id {
             let _ = self.select_daemon(session_id);
         }
@@ -987,11 +1171,6 @@ impl AppModel {
                 WorkspaceSessionSelection::AttachSelected(_)
             ) {
                 self.agent_session_id = Some(session_id);
-                for pane in &mut self.panes {
-                    if pane.kind == PaneKind::AgentTerminal {
-                        pane.session_id = Some(session_id);
-                    }
-                }
             }
         }
 
@@ -1006,6 +1185,74 @@ impl AppModel {
             self.selected_session_id = Some(session_id);
         }
 
+        if context
+            .active_pane_id
+            .is_some_and(|pane_id| self.focus_pane_id(pane_id))
+        {
+            self.apply_restored_view_modes(context);
+            if self.panes.iter().any(|pane| pane.stale) {
+                self.status_message = "stale pane recovered; focus moved".to_string();
+            }
+            return;
+        }
+
+        if context.panes.is_empty() {
+            self.restore_legacy_focus(context);
+        } else {
+            self.focus_safe_fallback();
+        }
+        self.apply_restored_view_modes(context);
+        if self.panes.iter().any(|pane| pane.stale) {
+            self.status_message = "stale pane recovered; focus moved".to_string();
+        }
+    }
+
+    fn restore_pane_contexts(&mut self, context: &UiContext) {
+        if context.panes.is_empty() {
+            return;
+        }
+
+        let default_panes = std::mem::take(&mut self.panes);
+        self.panes = context
+            .panes
+            .iter()
+            .map(|pane_context| {
+                let stale = self.pane_view_is_stale(&pane_context.view);
+                Pane::from_context(pane_context, stale)
+            })
+            .collect::<Vec<_>>();
+
+        for index in 0..self.panes.len() {
+            let stale = self.pane_view_is_stale(&self.panes[index].view);
+            self.panes[index].stale = stale;
+            if stale {
+                self.panes[index].focused = false;
+            }
+        }
+
+        if self.focusable_pane_indices().is_empty() {
+            if let Some(mut fallback) = default_panes
+                .into_iter()
+                .find(|pane| !self.pane_view_is_stale(&pane.view))
+            {
+                fallback.focused = false;
+                fallback.stale = false;
+                self.panes.push(fallback);
+            }
+        }
+
+        self.active_pane_id = None;
+        if let Some(active_pane_id) = context.active_pane_id {
+            if !self.focus_pane_id(active_pane_id) {
+                self.status_message = "stale pane recovered; focus moved".to_string();
+                self.focus_safe_fallback();
+            }
+        } else {
+            self.focus_safe_fallback();
+        }
+    }
+
+    fn restore_legacy_focus(&mut self, context: &UiContext) {
         match context.focused_pane_kind.as_deref() {
             Some("daemon_monitor") => {
                 if let Some(session_id) = context
@@ -1029,16 +1276,106 @@ impl AppModel {
                     })
                 {
                     self.agent_session_id = Some(session_id);
+                    let target_pane_id = self.target_pane_id_for_kind(PaneKind::AgentTerminal);
                     for pane in &mut self.panes {
-                        if pane.kind == PaneKind::AgentTerminal {
+                        if Some(pane.id) == target_pane_id {
                             pane.session_id = Some(session_id);
+                            pane.view.session_id = Some(session_id);
+                            pane.stale = false;
                         }
                     }
                     let _ = self.focus_pane_kind(PaneKind::AgentTerminal);
                     self.selected_session_id = Some(session_id);
                 }
             }
-            _ => {}
+            _ => self.focus_safe_fallback(),
+        }
+    }
+
+    fn apply_restored_view_modes(&mut self, context: &UiContext) {
+        for pane_context in &context.panes {
+            let follow = pane_context.view.view_mode == UiPaneViewMode::Live;
+            match pane_context.view.kind {
+                UiPaneViewKind::SessionTerminal if Some(pane_context.id) == self.active_pane_id => {
+                    self.set_agent_terminal_following(follow);
+                }
+                UiPaneViewKind::DaemonMonitor => {
+                    if Some(pane_context.view.session_id).flatten() == self.active_daemon_session_id
+                    {
+                        self.line_log.set_following(follow);
+                        if let Some(log) = self.active_daemon_log_mut() {
+                            log.set_following(follow);
+                        }
+                    }
+                }
+                UiPaneViewKind::SessionList
+                | UiPaneViewKind::CommandOutput
+                | UiPaneViewKind::SessionTerminal => {}
+            }
+        }
+    }
+
+    fn focus_safe_fallback(&mut self) {
+        let fallback = self
+            .focusable_pane_indices()
+            .into_iter()
+            .find(|index| self.panes[*index].view.kind == UiPaneViewKind::SessionTerminal)
+            .or_else(|| {
+                self.focusable_pane_indices()
+                    .into_iter()
+                    .find(|index| self.panes[*index].view.kind == UiPaneViewKind::DaemonMonitor)
+            })
+            .or_else(|| self.focusable_pane_indices().into_iter().next());
+        if let Some(index) = fallback {
+            let _ = self.focus_pane_index(index);
+        } else {
+            self.active_pane_id = None;
+        }
+    }
+
+    fn focusable_pane_indices(&self) -> Vec<usize> {
+        self.panes
+            .iter()
+            .enumerate()
+            .filter_map(|(index, pane)| {
+                (!pane.stale
+                    && (pane.kind != PaneKind::CommandOutput || self.command_output.is_visible()))
+                .then_some(index)
+            })
+            .collect()
+    }
+
+    fn pane_view_is_stale(&self, view: &UiPaneView) -> bool {
+        match view.kind {
+            UiPaneViewKind::SessionTerminal => match view.session_id {
+                Some(session_id) => !matches!(
+                    self.workspace_session_selection(session_id),
+                    WorkspaceSessionSelection::AttachSelected(_)
+                ),
+                None => true,
+            },
+            UiPaneViewKind::DaemonMonitor => match view.session_id {
+                Some(session_id) => !self.daemon_session_exists(session_id),
+                None => true,
+            },
+            UiPaneViewKind::SessionList | UiPaneViewKind::CommandOutput => false,
+        }
+    }
+
+    fn view_mode_for_pane(&self, pane: &Pane) -> UiPaneViewMode {
+        let following = match pane.view.kind {
+            UiPaneViewKind::SessionTerminal => self.agent_terminal_is_following(),
+            UiPaneViewKind::DaemonMonitor => pane
+                .view
+                .session_id
+                .and_then(|session_id| self.daemon_logs.get(&session_id))
+                .map_or_else(|| self.line_log.is_following(), LineLogPane::is_following),
+            UiPaneViewKind::SessionList | UiPaneViewKind::CommandOutput => true,
+        };
+        if following {
+            UiPaneViewMode::Live
+        } else {
+            UiPaneViewMode::Scrollback
         }
     }
 
@@ -1102,6 +1439,7 @@ impl AppModel {
             ui_id: self.ui_id,
             mode: self.mode.clone(),
             active_pane_id: self.active_pane_id,
+            panes: self.pane_contexts(),
             selected_session_id: self.selected_session_id,
             focused_session_id: self.focused_session_id(),
             focused_pane_kind: self.focused_pane_kind_label().map(str::to_string),
@@ -1186,51 +1524,65 @@ impl AppModel {
     }
 
     fn scroll_active_view_up(&mut self, viewport_height: u16, lines: usize) {
-        if self.focused_agent_terminal() {
-            self.set_agent_terminal_following(false);
-            return;
+        match self.active_view_kind() {
+            Some(UiPaneViewKind::SessionTerminal) => self.set_agent_terminal_following(false),
+            Some(UiPaneViewKind::DaemonMonitor) => {
+                self.scroll_active_log_up(viewport_height, lines)
+            }
+            Some(UiPaneViewKind::SessionList | UiPaneViewKind::CommandOutput) | None => {
+                self.status_message = "scroll unavailable for view".to_string();
+            }
         }
-        self.scroll_active_log_up(viewport_height, lines);
     }
 
     fn scroll_active_view_down(&mut self, lines: usize) {
-        if self.focused_agent_terminal() {
-            self.set_agent_terminal_following(false);
-            return;
+        match self.active_view_kind() {
+            Some(UiPaneViewKind::SessionTerminal) => self.set_agent_terminal_following(false),
+            Some(UiPaneViewKind::DaemonMonitor) => self.scroll_active_log_down(lines),
+            Some(UiPaneViewKind::SessionList | UiPaneViewKind::CommandOutput) | None => {
+                self.status_message = "scroll unavailable for view".to_string();
+            }
         }
-        self.scroll_active_log_down(lines);
     }
 
     fn page_active_view_up(&mut self, viewport_height: u16) {
-        if self.focused_agent_terminal() {
-            self.set_agent_terminal_following(false);
-            return;
+        match self.active_view_kind() {
+            Some(UiPaneViewKind::SessionTerminal) => self.set_agent_terminal_following(false),
+            Some(UiPaneViewKind::DaemonMonitor) => self.page_active_log_up(viewport_height),
+            Some(UiPaneViewKind::SessionList | UiPaneViewKind::CommandOutput) | None => {
+                self.status_message = "scroll unavailable for view".to_string();
+            }
         }
-        self.page_active_log_up(viewport_height);
     }
 
     fn page_active_view_down(&mut self, viewport_height: u16) {
-        if self.focused_agent_terminal() {
-            self.set_agent_terminal_following(false);
-            return;
+        match self.active_view_kind() {
+            Some(UiPaneViewKind::SessionTerminal) => self.set_agent_terminal_following(false),
+            Some(UiPaneViewKind::DaemonMonitor) => self.page_active_log_down(viewport_height),
+            Some(UiPaneViewKind::SessionList | UiPaneViewKind::CommandOutput) | None => {
+                self.status_message = "scroll unavailable for view".to_string();
+            }
         }
-        self.page_active_log_down(viewport_height);
     }
 
     fn jump_active_view_top(&mut self, viewport_height: u16) {
-        if self.focused_agent_terminal() {
-            self.set_agent_terminal_following(false);
-            return;
+        match self.active_view_kind() {
+            Some(UiPaneViewKind::SessionTerminal) => self.set_agent_terminal_following(false),
+            Some(UiPaneViewKind::DaemonMonitor) => self.jump_active_log_top(viewport_height),
+            Some(UiPaneViewKind::SessionList | UiPaneViewKind::CommandOutput) | None => {
+                self.status_message = "scroll unavailable for view".to_string();
+            }
         }
-        self.jump_active_log_top(viewport_height);
     }
 
     fn jump_active_view_bottom(&mut self) {
-        if self.focused_agent_terminal() {
-            self.set_agent_terminal_following(true);
-            return;
+        match self.active_view_kind() {
+            Some(UiPaneViewKind::SessionTerminal) => self.set_agent_terminal_following(true),
+            Some(UiPaneViewKind::DaemonMonitor) => self.jump_active_log_bottom(),
+            Some(UiPaneViewKind::SessionList | UiPaneViewKind::CommandOutput) | None => {
+                self.status_message = "scroll unavailable for view".to_string();
+            }
         }
-        self.jump_active_log_bottom();
     }
 
     fn scroll_active_log_up(&mut self, viewport_height: u16, lines: usize) {
@@ -1299,14 +1651,137 @@ impl AppModel {
             self.selected_session_id = Some(session_id);
         }
     }
+
+    fn agent_terminal_rect_for(&self, area: Rect) -> Option<(PaneId, Rect)> {
+        let (_, content_area) = if self.cockpit_session_list_visible() {
+            cockpit_session_list_split(area, self.workspace_sessions.len())
+        } else {
+            (Rect::default(), area)
+        };
+        let panes = self.cockpit_visible_content_panes();
+        if panes.is_empty() {
+            return None;
+        }
+
+        let pane_id = self.agent_terminal_pane_id_for_geometry()?;
+        let pane_index = panes.iter().position(|pane| pane.id == pane_id)?;
+        let pane_area = cockpit_content_pane_rect(
+            content_area,
+            self.cockpit_layout,
+            panes.len(),
+            pane_index,
+            self.active_pane_id,
+            panes.iter().map(|pane| pane.id),
+        )?;
+        Some((pane_id, pane_area))
+    }
+
+    fn cockpit_session_list_visible(&self) -> bool {
+        self.panes
+            .iter()
+            .any(|pane| !pane.stale && pane.kind == PaneKind::SessionList)
+    }
+
+    fn cockpit_visible_content_panes(&self) -> Vec<&Pane> {
+        self.panes
+            .iter()
+            .filter(|pane| {
+                !pane.stale
+                    && pane.kind != PaneKind::SessionList
+                    && (pane.kind != PaneKind::CommandOutput || self.command_output.is_visible())
+            })
+            .collect()
+    }
+
+    fn agent_terminal_pane_id_for_geometry(&self) -> Option<PaneId> {
+        let agent_session_id = self.agent_session_id;
+        self.active_pane()
+            .filter(|pane| {
+                !pane.stale
+                    && pane.kind == PaneKind::AgentTerminal
+                    && pane.session_id == agent_session_id
+            })
+            .map(|pane| pane.id)
+            .or_else(|| {
+                self.panes
+                    .iter()
+                    .find(|pane| {
+                        !pane.stale
+                            && pane.kind == PaneKind::AgentTerminal
+                            && pane.session_id == agent_session_id
+                    })
+                    .map(|pane| pane.id)
+            })
+    }
 }
 
-fn cockpit_content_size(width: u16, body_height: u16, session_count: usize) -> (u16, u16) {
+fn cockpit_session_list_split(area: Rect, session_count: usize) -> (Rect, Rect) {
     let session_rows = session_count.clamp(1, 3) as u16;
     let desired = 1 + session_rows.saturating_mul(2);
-    let max_height = COCKPIT_SESSION_LIST_HEIGHT.min(body_height.saturating_sub(2));
-    let list_height = desired.min(max_height).max(1);
-    (width, body_height.saturating_sub(list_height))
+    let list_height = desired
+        .min(COCKPIT_SESSION_LIST_HEIGHT)
+        .min(area.height.saturating_sub(2))
+        .max(1);
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(list_height), Constraint::Min(1)])
+        .split(area);
+    (chunks[0], chunks[1])
+}
+
+fn cockpit_content_pane_rect(
+    area: Rect,
+    layout: AgentCockpitLayout,
+    pane_count: usize,
+    pane_index: usize,
+    active_pane_id: Option<PaneId>,
+    pane_ids: impl IntoIterator<Item = PaneId>,
+) -> Option<Rect> {
+    if pane_count == 0 || pane_index >= pane_count {
+        return None;
+    }
+    if layout == AgentCockpitLayout::Focus {
+        let ids = pane_ids.into_iter().collect::<Vec<_>>();
+        let focused_index = active_pane_id
+            .and_then(|pane_id| ids.iter().position(|id| *id == pane_id))
+            .unwrap_or(0);
+        return (pane_index == focused_index).then_some(area);
+    }
+    if pane_count == 1 {
+        return Some(area);
+    }
+
+    let (direction, first_percent) = match layout {
+        AgentCockpitLayout::Right => {
+            if area.width >= 64 {
+                (Direction::Horizontal, 55)
+            } else {
+                (Direction::Vertical, 60)
+            }
+        }
+        AgentCockpitLayout::Bottom => (Direction::Vertical, 60),
+        AgentCockpitLayout::Wide => {
+            if area.width >= 64 {
+                (Direction::Horizontal, 65)
+            } else {
+                (Direction::Vertical, 65)
+            }
+        }
+        AgentCockpitLayout::Focus => unreachable!("focus layout handled before split"),
+    };
+    let constraints = if pane_count == 2 {
+        vec![
+            Constraint::Percentage(first_percent),
+            Constraint::Percentage(100 - first_percent),
+        ]
+    } else {
+        vec![Constraint::Percentage(100 / pane_count as u16); pane_count]
+    };
+    let chunks = Layout::default()
+        .direction(direction)
+        .constraints(constraints)
+        .split(area);
+    Some(chunks[pane_index])
 }
 
 fn panes_for_layout(
@@ -1555,6 +2030,24 @@ fn monitor_pane_for(session: &SessionSummary, focused: bool) -> Pane {
         .unwrap_or_else(|| session.session_id.to_string());
     let mut pane = Pane::daemon_monitor(title, Some(session.session_id));
     pane.focused = focused;
+    pane
+}
+
+fn pane_for_view(view: UiPaneView) -> Pane {
+    let title = match view.kind {
+        UiPaneViewKind::SessionTerminal => "Session Terminal",
+        UiPaneViewKind::DaemonMonitor => "Daemon Monitor",
+        UiPaneViewKind::SessionList => "Session List",
+        UiPaneViewKind::CommandOutput => "Command Output",
+    };
+    let mut pane = match view.kind {
+        UiPaneViewKind::SessionTerminal => Pane::agent_terminal(title, view.session_id),
+        UiPaneViewKind::DaemonMonitor => Pane::daemon_monitor(title, view.session_id),
+        UiPaneViewKind::SessionList => Pane::session_list(),
+        UiPaneViewKind::CommandOutput => Pane::command_output(),
+    };
+    pane.set_view(view);
+    pane.focused = false;
     pane
 }
 
@@ -1922,6 +2415,13 @@ mod tests {
             ui_id: app.ui_id,
             mode: UiMode::AgentCockpit,
             active_pane_id: app.active_pane_id,
+            panes: vec![UiPaneContext {
+                id: app.active_pane_id.expect("active pane"),
+                title: "Agent Terminal".to_string(),
+                view: UiPaneView::new(UiPaneViewKind::SessionTerminal, Some(second_agent_id)),
+                focused: true,
+                stale: false,
+            }],
             selected_session_id: Some(second_agent_id),
             focused_session_id: Some(second_agent_id),
             focused_pane_kind: Some("agent_terminal".to_string()),
@@ -2053,6 +2553,76 @@ mod tests {
         assert_eq!(app.agent_terminal_size_for(120, 30), Some((23, 78)));
         assert!(app.resize_agent_terminal(23, 78));
         assert!(!app.resize_agent_terminal(23, 78));
+    }
+
+    #[test]
+    fn agent_cockpit_resize_uses_rendered_three_pane_terminal_rect() {
+        let daemon = summary("daemon");
+        let daemon_id = daemon.session_id;
+        let mut agent = summary("agent");
+        agent.role = SessionRole::Agent;
+        let mut shell = summary("shell");
+        shell.role = SessionRole::Shell;
+        let shell_id = shell.session_id;
+        let mut app = AppModel::agent_cockpit(
+            UiId::new(),
+            agent.clone(),
+            vec![daemon.clone()],
+            Some(daemon_id),
+            BTreeMap::new(),
+            AgentTerminalPane::new(10, 40, true, false),
+            AgentCockpitLayout::Right,
+            MonitorProfile::Basic,
+        );
+        app.replace_workspace_sessions(vec![daemon, agent, shell]);
+        let agent_pane_id = app.active_pane_id.expect("active pane");
+        assert!(app
+            .split_pane_with_view(
+                agent_pane_id,
+                UiPaneView::new(UiPaneViewKind::SessionTerminal, Some(shell_id)),
+            )
+            .is_some());
+
+        assert_eq!(app.agent_terminal_size_for(120, 30), Some((21, 40)));
+    }
+
+    #[test]
+    fn agent_cockpit_resize_tracks_removed_session_list() {
+        let daemon = summary("daemon");
+        let daemon_id = daemon.session_id;
+        let mut agent = summary("agent");
+        agent.role = SessionRole::Agent;
+        let mut shell = summary("shell");
+        shell.role = SessionRole::Shell;
+        let shell_id = shell.session_id;
+        let mut app = AppModel::agent_cockpit(
+            UiId::new(),
+            agent.clone(),
+            vec![daemon.clone()],
+            Some(daemon_id),
+            BTreeMap::new(),
+            AgentTerminalPane::new(10, 40, true, false),
+            AgentCockpitLayout::Right,
+            MonitorProfile::Basic,
+        );
+        app.replace_workspace_sessions(vec![daemon, agent, shell]);
+        let agent_pane_id = app.active_pane_id.expect("active pane");
+        assert!(app
+            .split_pane_with_view(
+                agent_pane_id,
+                UiPaneView::new(UiPaneViewKind::SessionTerminal, Some(shell_id)),
+            )
+            .is_some());
+        let session_list_pane_id = app
+            .panes
+            .iter()
+            .find(|pane| pane.kind == PaneKind::SessionList)
+            .map(|pane| pane.id)
+            .expect("session list pane");
+
+        assert!(app.close_pane(session_list_pane_id));
+
+        assert_eq!(app.agent_terminal_size_for(120, 30), Some((28, 40)));
     }
 
     #[test]
@@ -2192,6 +2762,602 @@ mod tests {
             context.monitor_profile,
             MonitorProfile::Other("future".to_string())
         );
+    }
+
+    #[test]
+    fn agent_cockpit_pane_ids_are_stable_across_redraw() {
+        let daemon = summary("daemon");
+        let mut agent = summary("agent");
+        agent.role = SessionRole::Agent;
+        let app = AppModel::agent_cockpit(
+            UiId::new(),
+            agent,
+            vec![daemon],
+            None,
+            BTreeMap::new(),
+            AgentTerminalPane::new(10, 40, true, false),
+            AgentCockpitLayout::Right,
+            MonitorProfile::Basic,
+        );
+        let before = app
+            .pane_contexts()
+            .into_iter()
+            .map(|pane| pane.id)
+            .collect::<Vec<_>>();
+
+        let _ = crate::renderer::render_to_string(&app, 120, 30);
+
+        let after = app
+            .pane_contexts()
+            .into_iter()
+            .map(|pane| pane.id)
+            .collect::<Vec<_>>();
+        assert_eq!(before, after);
+    }
+
+    #[test]
+    fn agent_cockpit_view_assignment_does_not_mutate_session_identity() {
+        let daemon = summary("daemon");
+        let daemon_id = daemon.session_id;
+        let mut agent = summary("agent");
+        agent.role = SessionRole::Agent;
+        let agent_id = agent.session_id;
+        let mut shell = summary("shell");
+        shell.role = SessionRole::Shell;
+        shell.name = Some("shell".to_string());
+        let shell_id = shell.session_id;
+        let mut app = AppModel::agent_cockpit(
+            UiId::new(),
+            agent.clone(),
+            vec![daemon.clone()],
+            Some(daemon_id),
+            BTreeMap::new(),
+            AgentTerminalPane::new(10, 40, true, false),
+            AgentCockpitLayout::Right,
+            MonitorProfile::Basic,
+        );
+        app.replace_workspace_sessions(vec![daemon, agent, shell]);
+        let ids_before = app
+            .workspace_sessions
+            .iter()
+            .map(|session| session.session_id)
+            .collect::<Vec<_>>();
+        let pane_id = app.active_pane_id.expect("active pane");
+
+        assert!(app.assign_pane_view(
+            pane_id,
+            UiPaneView::new(UiPaneViewKind::SessionTerminal, Some(shell_id))
+        ));
+
+        let ids_after = app
+            .workspace_sessions
+            .iter()
+            .map(|session| session.session_id)
+            .collect::<Vec<_>>();
+        assert_eq!(ids_before, ids_after);
+        assert!(ids_after.contains(&agent_id));
+        assert_eq!(app.agent_session_id, Some(shell_id));
+        assert_eq!(app.focused_attach_session_id(), Some(shell_id));
+    }
+
+    #[test]
+    fn agent_cockpit_session_switch_keeps_focus_on_assigned_terminal_pane() {
+        let daemon = summary("daemon");
+        let daemon_id = daemon.session_id;
+        let mut agent = summary("agent");
+        agent.role = SessionRole::Agent;
+        let agent_id = agent.session_id;
+        let mut shell = summary("shell");
+        shell.role = SessionRole::Shell;
+        let shell_id = shell.session_id;
+        let mut worker = summary("worker");
+        worker.role = SessionRole::Agent;
+        let worker_id = worker.session_id;
+        let mut app = AppModel::agent_cockpit(
+            UiId::new(),
+            agent.clone(),
+            vec![daemon.clone()],
+            Some(daemon_id),
+            BTreeMap::new(),
+            AgentTerminalPane::new(10, 40, true, false),
+            AgentCockpitLayout::Right,
+            MonitorProfile::Basic,
+        );
+        app.replace_workspace_sessions(vec![daemon, agent, shell, worker]);
+        let first_terminal_pane_id = app.active_pane_id.expect("active pane");
+        let shell_pane_id = app
+            .split_pane_with_view(
+                first_terminal_pane_id,
+                UiPaneView::new(UiPaneViewKind::SessionTerminal, Some(shell_id)),
+            )
+            .expect("shell pane");
+        assert!(app.focus_pane_id(shell_pane_id));
+
+        let selection = app.select_workspace_session(worker_id);
+
+        assert_eq!(
+            selection,
+            WorkspaceSessionSelection::AttachSelected(worker_id)
+        );
+        assert_eq!(app.active_pane_id, Some(shell_pane_id));
+        assert_eq!(app.agent_session_id, Some(worker_id));
+        assert_eq!(app.focused_attach_session_id(), Some(worker_id));
+        assert_ne!(app.focused_attach_session_id(), Some(agent_id));
+    }
+
+    #[test]
+    fn agent_cockpit_split_focus_assign_and_close_have_safe_fallback() {
+        let daemon = summary("daemon");
+        let daemon_id = daemon.session_id;
+        let mut agent = summary("agent");
+        agent.role = SessionRole::Agent;
+        let agent_id = agent.session_id;
+        let mut app = AppModel::agent_cockpit(
+            UiId::new(),
+            agent,
+            vec![daemon],
+            Some(daemon_id),
+            BTreeMap::new(),
+            AgentTerminalPane::new(10, 40, true, false),
+            AgentCockpitLayout::Right,
+            MonitorProfile::Basic,
+        );
+        let agent_pane_id = app.active_pane_id.expect("active pane");
+        let new_pane_id = app
+            .split_pane_with_view(
+                agent_pane_id,
+                UiPaneView::new(UiPaneViewKind::DaemonMonitor, Some(daemon_id)),
+            )
+            .expect("pane split");
+
+        assert!(app.focus_pane_id(new_pane_id));
+        assert_eq!(app.focused_session_id(), Some(daemon_id));
+        assert!(app.close_pane(new_pane_id));
+
+        assert_ne!(app.active_pane_id, Some(new_pane_id));
+        assert_eq!(app.focused_attach_session_id(), Some(agent_id));
+    }
+
+    #[test]
+    fn agent_cockpit_restore_marks_stale_pane_and_falls_back_safely() {
+        let daemon = summary("daemon");
+        let daemon_id = daemon.session_id;
+        let mut agent = summary("agent");
+        agent.role = SessionRole::Agent;
+        let agent_id = agent.session_id;
+        let stale_session_id = SessionId::new();
+        let stale_pane_id = PaneId::new();
+        let mut app = AppModel::agent_cockpit(
+            UiId::new(),
+            agent,
+            vec![daemon],
+            Some(daemon_id),
+            BTreeMap::new(),
+            AgentTerminalPane::new(10, 40, true, false),
+            AgentCockpitLayout::Right,
+            MonitorProfile::Basic,
+        );
+        let context = UiContext {
+            schema_version: 1,
+            ui_id: app.ui_id,
+            mode: UiMode::AgentCockpit,
+            active_pane_id: Some(stale_pane_id),
+            panes: vec![UiPaneContext {
+                id: stale_pane_id,
+                title: "Former Agent".to_string(),
+                view: UiPaneView::new(UiPaneViewKind::SessionTerminal, Some(stale_session_id)),
+                focused: true,
+                stale: false,
+            }],
+            selected_session_id: Some(stale_session_id),
+            focused_session_id: Some(stale_session_id),
+            focused_pane_kind: Some("agent_terminal".to_string()),
+            active_daemon_session_id: Some(daemon_id),
+            active_workspace: app.active_workspace.clone(),
+            agent_session_id: Some(stale_session_id),
+            managed_session_ids: vec![daemon_id, stale_session_id],
+            managed_daemon_session_ids: vec![daemon_id],
+            monitor_profile: MonitorProfile::Basic,
+            daemon_health: Vec::new(),
+            updated_at: OffsetDateTime::now_utc(),
+        };
+
+        app.restore_ui_context_selection(&context);
+
+        assert!(app
+            .pane_contexts()
+            .iter()
+            .any(|pane| pane.id == stale_pane_id && pane.stale));
+        assert_ne!(app.active_pane_id, Some(stale_pane_id));
+        assert_eq!(app.focused_attach_session_id(), Some(agent_id));
+        assert!(app.status_message.contains("stale pane"));
+    }
+
+    #[test]
+    fn agent_cockpit_restore_preserves_valid_extra_panes() {
+        let first_daemon = summary("daemon-one");
+        let first_daemon_id = first_daemon.session_id;
+        let second_daemon = summary("daemon-two");
+        let second_daemon_id = second_daemon.session_id;
+        let mut agent = summary("agent");
+        agent.role = SessionRole::Agent;
+        let agent_id = agent.session_id;
+        let mut shell = summary("shell");
+        shell.role = SessionRole::Shell;
+        let shell_id = shell.session_id;
+        let agent_pane_id = PaneId::new();
+        let shell_pane_id = PaneId::new();
+        let daemon_pane_id = PaneId::new();
+        let mut app = AppModel::agent_cockpit(
+            UiId::new(),
+            agent.clone(),
+            vec![first_daemon.clone()],
+            Some(first_daemon_id),
+            BTreeMap::new(),
+            AgentTerminalPane::new(10, 40, true, false),
+            AgentCockpitLayout::Right,
+            MonitorProfile::Basic,
+        );
+        app.replace_workspace_sessions(vec![first_daemon, second_daemon, agent, shell]);
+        let context = UiContext {
+            schema_version: 1,
+            ui_id: app.ui_id,
+            mode: UiMode::AgentCockpit,
+            active_pane_id: Some(shell_pane_id),
+            panes: vec![
+                UiPaneContext {
+                    id: agent_pane_id,
+                    title: "Agent".to_string(),
+                    view: UiPaneView::new(UiPaneViewKind::SessionTerminal, Some(agent_id)),
+                    focused: false,
+                    stale: false,
+                },
+                UiPaneContext {
+                    id: shell_pane_id,
+                    title: "Shell".to_string(),
+                    view: UiPaneView::new(UiPaneViewKind::SessionTerminal, Some(shell_id)),
+                    focused: true,
+                    stale: false,
+                },
+                UiPaneContext {
+                    id: daemon_pane_id,
+                    title: "Second Monitor".to_string(),
+                    view: UiPaneView::new(UiPaneViewKind::DaemonMonitor, Some(second_daemon_id)),
+                    focused: false,
+                    stale: false,
+                },
+            ],
+            selected_session_id: Some(shell_id),
+            focused_session_id: Some(shell_id),
+            focused_pane_kind: Some("agent_terminal".to_string()),
+            active_daemon_session_id: Some(second_daemon_id),
+            active_workspace: app.active_workspace.clone(),
+            agent_session_id: Some(shell_id),
+            managed_session_ids: vec![first_daemon_id, second_daemon_id, agent_id, shell_id],
+            managed_daemon_session_ids: vec![first_daemon_id, second_daemon_id],
+            monitor_profile: MonitorProfile::Basic,
+            daemon_health: Vec::new(),
+            updated_at: OffsetDateTime::now_utc(),
+        };
+
+        app.restore_ui_context_selection(&context);
+
+        let panes = app.pane_contexts();
+        assert!(panes
+            .iter()
+            .any(|pane| pane.id == agent_pane_id && !pane.stale));
+        assert!(panes
+            .iter()
+            .any(|pane| pane.id == shell_pane_id && !pane.stale));
+        assert!(panes
+            .iter()
+            .any(|pane| pane.id == daemon_pane_id && !pane.stale));
+        assert_eq!(app.active_pane_id, Some(shell_pane_id));
+        assert_eq!(app.focused_attach_session_id(), Some(shell_id));
+    }
+
+    #[test]
+    fn agent_cockpit_restore_active_daemon_does_not_rewrite_terminal_panes() {
+        let daemon = summary("daemon");
+        let daemon_id = daemon.session_id;
+        let mut agent = summary("agent");
+        agent.role = SessionRole::Agent;
+        let agent_id = agent.session_id;
+        let mut shell = summary("shell");
+        shell.role = SessionRole::Shell;
+        let shell_id = shell.session_id;
+        let agent_pane_id = PaneId::new();
+        let shell_pane_id = PaneId::new();
+        let daemon_pane_id = PaneId::new();
+        let mut app = AppModel::agent_cockpit(
+            UiId::new(),
+            agent.clone(),
+            vec![daemon.clone()],
+            Some(daemon_id),
+            BTreeMap::new(),
+            AgentTerminalPane::new(10, 40, true, false),
+            AgentCockpitLayout::Right,
+            MonitorProfile::Basic,
+        );
+        app.replace_workspace_sessions(vec![daemon, agent, shell]);
+        let context = UiContext {
+            schema_version: 1,
+            ui_id: app.ui_id,
+            mode: UiMode::AgentCockpit,
+            active_pane_id: Some(daemon_pane_id),
+            panes: vec![
+                UiPaneContext {
+                    id: agent_pane_id,
+                    title: "Agent".to_string(),
+                    view: UiPaneView::new(UiPaneViewKind::SessionTerminal, Some(agent_id)),
+                    focused: false,
+                    stale: false,
+                },
+                UiPaneContext {
+                    id: shell_pane_id,
+                    title: "Shell".to_string(),
+                    view: UiPaneView::new(UiPaneViewKind::SessionTerminal, Some(shell_id)),
+                    focused: false,
+                    stale: false,
+                },
+                UiPaneContext {
+                    id: daemon_pane_id,
+                    title: "Daemon".to_string(),
+                    view: UiPaneView::new(UiPaneViewKind::DaemonMonitor, Some(daemon_id)),
+                    focused: true,
+                    stale: false,
+                },
+            ],
+            selected_session_id: Some(daemon_id),
+            focused_session_id: Some(daemon_id),
+            focused_pane_kind: Some("daemon_monitor".to_string()),
+            active_daemon_session_id: Some(daemon_id),
+            active_workspace: app.active_workspace.clone(),
+            agent_session_id: Some(shell_id),
+            managed_session_ids: vec![daemon_id, agent_id, shell_id],
+            managed_daemon_session_ids: vec![daemon_id],
+            monitor_profile: MonitorProfile::Basic,
+            daemon_health: Vec::new(),
+            updated_at: OffsetDateTime::now_utc(),
+        };
+
+        app.restore_ui_context_selection(&context);
+
+        let panes = app.pane_contexts();
+        assert!(panes.iter().any(|pane| {
+            pane.id == agent_pane_id
+                && pane.view.kind == UiPaneViewKind::SessionTerminal
+                && pane.view.session_id == Some(agent_id)
+        }));
+        assert!(panes.iter().any(|pane| {
+            pane.id == shell_pane_id
+                && pane.view.kind == UiPaneViewKind::SessionTerminal
+                && pane.view.session_id == Some(shell_id)
+        }));
+        assert_eq!(app.active_pane_id, Some(daemon_pane_id));
+        assert_eq!(app.focused_session_id(), Some(daemon_id));
+    }
+
+    #[test]
+    fn agent_cockpit_render_respects_closed_panes() {
+        let daemon = summary("daemon");
+        let daemon_id = daemon.session_id;
+        let mut agent = summary("agent");
+        agent.role = SessionRole::Agent;
+        let mut app = AppModel::agent_cockpit(
+            UiId::new(),
+            agent,
+            vec![daemon],
+            Some(daemon_id),
+            BTreeMap::new(),
+            AgentTerminalPane::new(10, 40, true, false),
+            AgentCockpitLayout::Right,
+            MonitorProfile::Basic,
+        );
+        let daemon_pane_id = app
+            .panes
+            .iter()
+            .find(|pane| pane.kind == PaneKind::DaemonMonitor)
+            .map(|pane| pane.id)
+            .expect("daemon pane");
+
+        assert!(app.close_pane(daemon_pane_id));
+
+        let rendered = crate::renderer::render_to_string(&app, 120, 30);
+        assert!(rendered.contains("Agent Terminal"), "{rendered}");
+        assert!(!rendered.contains("Daemon Monitor"), "{rendered}");
+    }
+
+    #[test]
+    fn agent_cockpit_restore_preserves_closed_default_panes() {
+        let daemon = summary("daemon");
+        let daemon_id = daemon.session_id;
+        let mut agent = summary("agent");
+        agent.role = SessionRole::Agent;
+        let mut app = AppModel::agent_cockpit(
+            UiId::new(),
+            agent.clone(),
+            vec![daemon.clone()],
+            Some(daemon_id),
+            BTreeMap::new(),
+            AgentTerminalPane::new(10, 40, true, false),
+            AgentCockpitLayout::Right,
+            MonitorProfile::Basic,
+        );
+        for kind in [
+            PaneKind::DaemonMonitor,
+            PaneKind::SessionList,
+            PaneKind::CommandOutput,
+        ] {
+            let pane_id = app
+                .panes
+                .iter()
+                .find(|pane| pane.kind == kind)
+                .map(|pane| pane.id)
+                .expect("default pane");
+            assert!(app.close_pane(pane_id));
+        }
+        let context = app.ui_context();
+
+        let mut restored = AppModel::agent_cockpit(
+            UiId::new(),
+            agent,
+            vec![daemon],
+            Some(daemon_id),
+            BTreeMap::new(),
+            AgentTerminalPane::new(10, 40, true, false),
+            AgentCockpitLayout::Right,
+            MonitorProfile::Basic,
+        );
+        restored.restore_ui_context_selection(&context);
+
+        assert!(restored
+            .panes
+            .iter()
+            .any(|pane| pane.kind == PaneKind::AgentTerminal));
+        assert!(!restored
+            .panes
+            .iter()
+            .any(|pane| pane.kind == PaneKind::DaemonMonitor));
+        assert!(!restored
+            .panes
+            .iter()
+            .any(|pane| pane.kind == PaneKind::SessionList));
+        assert!(!restored
+            .panes
+            .iter()
+            .any(|pane| pane.kind == PaneKind::CommandOutput));
+    }
+
+    #[test]
+    fn agent_cockpit_command_output_renders_only_when_pane_is_visible() {
+        let daemon = summary("daemon");
+        let daemon_id = daemon.session_id;
+        let mut agent = summary("agent");
+        agent.role = SessionRole::Agent;
+        let mut app = AppModel::agent_cockpit(
+            UiId::new(),
+            agent,
+            vec![daemon],
+            Some(daemon_id),
+            BTreeMap::new(),
+            AgentTerminalPane::new(10, 40, true, false),
+            AgentCockpitLayout::Right,
+            MonitorProfile::Basic,
+        );
+        app.set_command_success(
+            vec!["millmux".to_string(), "status".to_string()],
+            "daemon",
+            vec!["ok".to_string()],
+        );
+        let command_pane_id = app
+            .panes
+            .iter()
+            .find(|pane| pane.kind == PaneKind::CommandOutput)
+            .map(|pane| pane.id)
+            .expect("command output pane");
+
+        assert!(crate::renderer::render_to_string(&app, 120, 30).contains("Command Output"));
+        assert!(app.close_pane(command_pane_id));
+
+        let rendered = crate::renderer::render_to_string(&app, 120, 30);
+        assert!(!rendered.contains("Command Output"), "{rendered}");
+    }
+
+    #[test]
+    fn session_list_scroll_does_not_mutate_daemon_log_view() {
+        let daemon = summary("daemon");
+        let daemon_id = daemon.session_id;
+        let mut agent = summary("agent");
+        agent.role = SessionRole::Agent;
+        let mut app = AppModel::agent_cockpit(
+            UiId::new(),
+            agent,
+            vec![daemon],
+            Some(daemon_id),
+            BTreeMap::from([(daemon_id, vec!["one".to_string(), "two".to_string()])]),
+            AgentTerminalPane::new(10, 40, true, false),
+            AgentCockpitLayout::Right,
+            MonitorProfile::Basic,
+        );
+        assert!(app.focus_pane_kind(PaneKind::SessionList));
+        assert!(app.line_log.is_following());
+
+        app.enter_scroll_mode();
+        assert_eq!(
+            app.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE), 2),
+            KeyAction::ScrollUp
+        );
+
+        assert!(app.line_log.is_following());
+        assert_eq!(app.status_message, "scroll unavailable for view");
+    }
+
+    #[test]
+    fn session_list_exit_scroll_does_not_mutate_daemon_log_view() {
+        let daemon = summary("daemon");
+        let daemon_id = daemon.session_id;
+        let mut agent = summary("agent");
+        agent.role = SessionRole::Agent;
+        let mut app = AppModel::agent_cockpit(
+            UiId::new(),
+            agent,
+            vec![daemon],
+            Some(daemon_id),
+            BTreeMap::from([(daemon_id, vec!["one".to_string(), "two".to_string()])]),
+            AgentTerminalPane::new(10, 40, true, false),
+            AgentCockpitLayout::Right,
+            MonitorProfile::Basic,
+        );
+        assert!(app.focus_pane_kind(PaneKind::DaemonMonitor));
+        app.enter_scroll_mode();
+        app.scroll_active_view_up(1, 1);
+        assert!(app.line_log.is_scrolled());
+        assert!(app.focus_pane_kind(PaneKind::SessionList));
+
+        app.exit_scroll_mode();
+
+        assert!(app.line_log.is_scrolled());
+        assert_eq!(app.status_message, "live");
+    }
+
+    #[test]
+    fn agent_cockpit_context_persists_pane_views_and_follow_state() {
+        let daemon = summary("daemon");
+        let daemon_id = daemon.session_id;
+        let mut agent = summary("agent");
+        agent.role = SessionRole::Agent;
+        let agent_id = agent.session_id;
+        let mut app = AppModel::agent_cockpit(
+            UiId::new(),
+            agent,
+            vec![daemon],
+            Some(daemon_id),
+            BTreeMap::new(),
+            AgentTerminalPane::new(10, 40, true, false),
+            AgentCockpitLayout::Right,
+            MonitorProfile::Basic,
+        );
+        app.set_agent_terminal_following(false);
+
+        let context = app.ui_context();
+        let terminal_pane = context
+            .panes
+            .iter()
+            .find(|pane| pane.view.kind == UiPaneViewKind::SessionTerminal)
+            .expect("terminal pane context");
+        assert_eq!(terminal_pane.view.session_id, Some(agent_id));
+        assert_eq!(terminal_pane.view.view_mode, UiPaneViewMode::Scrollback);
+        assert!(terminal_pane.focused);
+        assert!(context
+            .panes
+            .iter()
+            .any(|pane| pane.view.kind == UiPaneViewKind::DaemonMonitor
+                && pane.view.session_id == Some(daemon_id)));
+        assert!(context
+            .panes
+            .iter()
+            .any(|pane| pane.view.kind == UiPaneViewKind::SessionList));
     }
 
     fn summary(name: &str) -> SessionSummary {

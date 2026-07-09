@@ -163,6 +163,59 @@ pub enum UiMode {
     AgentCockpit,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UiPaneViewKind {
+    SessionTerminal,
+    DaemonMonitor,
+    SessionList,
+    CommandOutput,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UiPaneViewMode {
+    #[default]
+    Live,
+    Scrollback,
+}
+
+impl UiPaneViewMode {
+    pub fn is_live(&self) -> bool {
+        matches!(self, Self::Live)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UiPaneView {
+    pub kind: UiPaneViewKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<SessionId>,
+    #[serde(default, skip_serializing_if = "UiPaneViewMode::is_live")]
+    pub view_mode: UiPaneViewMode,
+}
+
+impl UiPaneView {
+    pub fn new(kind: UiPaneViewKind, session_id: Option<SessionId>) -> Self {
+        Self {
+            kind,
+            session_id,
+            view_mode: UiPaneViewMode::Live,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UiPaneContext {
+    pub id: PaneId,
+    pub title: String,
+    pub view: UiPaneView,
+    #[serde(default)]
+    pub focused: bool,
+    #[serde(default)]
+    pub stale: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum MonitorProfile {
     #[default]
@@ -239,6 +292,8 @@ pub struct UiContext {
     pub ui_id: UiId,
     pub mode: UiMode,
     pub active_pane_id: Option<PaneId>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub panes: Vec<UiPaneContext>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub selected_session_id: Option<SessionId>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -512,6 +567,14 @@ mod tests {
         assert_eq!(
             serde_json::to_string(&UiMode::AgentCockpit).unwrap(),
             "\"agent_cockpit\""
+        );
+        assert_eq!(
+            serde_json::to_string(&UiPaneViewKind::SessionTerminal).unwrap(),
+            "\"session_terminal\""
+        );
+        assert_eq!(
+            serde_json::to_string(&UiPaneViewMode::Scrollback).unwrap(),
+            "\"scrollback\""
         );
         assert_eq!(
             serde_json::to_string(&UiEventKind::ActiveDaemonChanged).unwrap(),

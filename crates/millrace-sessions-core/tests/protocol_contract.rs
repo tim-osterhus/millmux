@@ -17,7 +17,8 @@ use millrace_sessions_core::{
     },
     state::{
         AttentionState, MonitorProfile, ProcessState, SessionRole, SpawnMode, UiContext,
-        UiDaemonHealth, UiDaemonRecoveryAction, UiMode,
+        UiDaemonHealth, UiDaemonRecoveryAction, UiMode, UiPaneContext, UiPaneView, UiPaneViewKind,
+        UiPaneViewMode,
     },
 };
 use serde_json::json;
@@ -1104,6 +1105,17 @@ fn ui_context_matches_m2a_jsonl_contract() {
         ui_id,
         mode: UiMode::DaemonConsole,
         active_pane_id: Some(pane_id),
+        panes: vec![UiPaneContext {
+            id: pane_id,
+            title: "Daemon Monitor".to_string(),
+            view: UiPaneView {
+                kind: UiPaneViewKind::DaemonMonitor,
+                session_id: Some(daemon_id),
+                view_mode: UiPaneViewMode::Live,
+            },
+            focused: true,
+            stale: false,
+        }],
         selected_session_id: Some(daemon_id),
         focused_session_id: Some(daemon_id),
         focused_pane_kind: Some("daemon_monitor".to_string()),
@@ -1155,6 +1167,16 @@ fn ui_context_matches_m2a_jsonl_contract() {
                     "ui_id": "018f5d8d-3e79-4a62-9bc5-51c3c7f4d5c8",
                     "mode": "daemon_console",
                     "active_pane_id": "2d14ac17-d5c9-43aa-a6f2-9414b3c16285",
+                    "panes": [{
+                        "id": "2d14ac17-d5c9-43aa-a6f2-9414b3c16285",
+                        "title": "Daemon Monitor",
+                        "view": {
+                            "kind": "daemon_monitor",
+                            "session_id": "818b61b1-a620-4a57-8e72-4d439d03840f"
+                        },
+                        "focused": true,
+                        "stale": false
+                    }],
                     "selected_session_id": "818b61b1-a620-4a57-8e72-4d439d03840f",
                     "focused_session_id": "818b61b1-a620-4a57-8e72-4d439d03840f",
                     "focused_pane_kind": "daemon_monitor",

@@ -1,6 +1,9 @@
 use std::{collections::VecDeque, fmt, str::FromStr};
 
-use millrace_sessions_core::ids::{PaneId, SessionId};
+use millrace_sessions_core::{
+    ids::{PaneId, SessionId},
+    state::{UiPaneContext, UiPaneView, UiPaneViewKind},
+};
 
 use crate::terminal::TerminalSnapshot;
 
@@ -11,6 +14,7 @@ pub enum PaneKind {
     AgentTerminal,
     DaemonMonitor,
     DaemonList,
+    SessionList,
     CommandOutput,
     StatusBar,
     HelpOverlay,
@@ -109,8 +113,10 @@ pub struct Pane {
     pub id: PaneId,
     pub kind: PaneKind,
     pub title: String,
+    pub view: UiPaneView,
     pub session_id: Option<SessionId>,
     pub focused: bool,
+    pub stale: bool,
 }
 
 impl Pane {
@@ -119,8 +125,10 @@ impl Pane {
             id: PaneId::new(),
             kind: PaneKind::AgentTerminal,
             title: title.into(),
+            view: UiPaneView::new(UiPaneViewKind::SessionTerminal, session_id),
             session_id,
             focused: true,
+            stale: false,
         }
     }
 
@@ -129,8 +137,10 @@ impl Pane {
             id: PaneId::new(),
             kind: PaneKind::DaemonMonitor,
             title: title.into(),
+            view: UiPaneView::new(UiPaneViewKind::DaemonMonitor, session_id),
             session_id,
             focused: true,
+            stale: false,
         }
     }
 
@@ -139,8 +149,10 @@ impl Pane {
             id: PaneId::new(),
             kind: PaneKind::CommandOutput,
             title: "Command Output".to_string(),
+            view: UiPaneView::new(UiPaneViewKind::CommandOutput, None),
             session_id: None,
             focused: false,
+            stale: false,
         }
     }
 
@@ -149,9 +161,64 @@ impl Pane {
             id: PaneId::new(),
             kind: PaneKind::DaemonList,
             title: "Daemon List".to_string(),
+            view: UiPaneView::new(UiPaneViewKind::SessionList, None),
             session_id: None,
             focused: false,
+            stale: false,
         }
+    }
+
+    pub fn session_list() -> Self {
+        Self {
+            id: PaneId::new(),
+            kind: PaneKind::SessionList,
+            title: "Session List".to_string(),
+            view: UiPaneView::new(UiPaneViewKind::SessionList, None),
+            session_id: None,
+            focused: false,
+            stale: false,
+        }
+    }
+
+    pub fn stale_from_context(context: &UiPaneContext) -> Self {
+        Self::from_context(context, true)
+    }
+
+    pub fn from_context(context: &UiPaneContext, stale: bool) -> Self {
+        Self {
+            id: context.id,
+            kind: pane_kind_for_view(context.view.kind),
+            title: context.title.clone(),
+            view: context.view.clone(),
+            session_id: context.view.session_id,
+            focused: false,
+            stale,
+        }
+    }
+
+    pub fn set_view(&mut self, view: UiPaneView) {
+        self.kind = pane_kind_for_view(view.kind);
+        self.session_id = view.session_id;
+        self.view = view;
+    }
+
+    pub fn to_context(&self) -> UiPaneContext {
+        UiPaneContext {
+            id: self.id,
+            title: self.title.clone(),
+            view: self.view.clone(),
+            focused: self.focused,
+            stale: self.stale,
+        }
+    }
+}
+
+fn pane_kind_for_view(kind: UiPaneViewKind) -> PaneKind {
+    match kind {
+        UiPaneViewKind::SessionTerminal => PaneKind::AgentTerminal,
+        UiPaneViewKind::DaemonMonitor => PaneKind::DaemonMonitor,
+        UiPaneViewKind::SessionList => PaneKind::SessionList,
+        UiPaneViewKind::CommandOutput => PaneKind::CommandOutput,
     }
 }
 
@@ -480,6 +547,13 @@ impl LineLogPane {
 
     pub fn is_scrolled(&self) -> bool {
         !self.follow
+    }
+
+    pub fn set_following(&mut self, follow: bool) {
+        self.follow = follow;
+        if follow {
+            self.offset_from_bottom = 0;
+        }
     }
 
     pub fn len(&self) -> usize {
