@@ -1306,9 +1306,18 @@ fn screen_snapshot_initial_replay_frame(
 ) -> (AttachStreamFrame, Vec<u8>, Option<u64>) {
     #[cfg(test)]
     runtime.input_write_sync.pause_snapshot_capture();
-    let (snapshot, suffix, covered_offset) = match runtime.terminal_state.lock() {
+    let (snapshot, suffix, covered_offset, target_size_matches) = match runtime
+        .terminal_state
+        .lock()
+    {
         Ok(terminal_state) => match terminal_state.screen_snapshot_replay() {
-            Some(replay) => replay,
+            Some((snapshot, suffix, covered_offset)) => {
+                let target_size_matches = match requested_terminal_size {
+                    Some(size) => terminal_state.same_size(size.rows, size.cols),
+                    None => true,
+                };
+                (snapshot, suffix, covered_offset, target_size_matches)
+            }
             None => {
                 return (
                     AttachStreamFrame::SnapshotUnavailable {
@@ -1347,7 +1356,12 @@ fn screen_snapshot_initial_replay_frame(
             None,
         );
     }
-    let frame = screen_snapshot_frame(snapshot, requested_terminal_size);
+    let replay_reaches_requested_size = !suffix.is_empty() && target_size_matches;
+    let frame = screen_snapshot_frame(
+        snapshot,
+        requested_terminal_size,
+        replay_reaches_requested_size,
+    );
     if matches!(frame, AttachStreamFrame::ScreenSnapshot { .. }) {
         (frame, suffix, Some(covered_offset))
     } else {
@@ -1358,9 +1372,12 @@ fn screen_snapshot_initial_replay_frame(
 fn screen_snapshot_frame(
     snapshot: ScreenSnapshot,
     requested_terminal_size: Option<TerminalDimensions>,
+    replay_reaches_requested_size: bool,
 ) -> AttachStreamFrame {
     if let Some(size) = requested_terminal_size {
-        if snapshot.rows != size.rows || snapshot.cols != size.cols {
+        if (snapshot.rows != size.rows || snapshot.cols != size.cols)
+            && !replay_reaches_requested_size
+        {
             return AttachStreamFrame::SnapshotUnavailable {
                 reason: SnapshotUnavailableReason::SizeMismatch,
                 details: Some(serde_json::json!({
@@ -2333,6 +2350,7 @@ mod tests {
         let frame = screen_snapshot_frame(
             terminal_state.screen_snapshot(),
             Some(TerminalDimensions { rows: 3, cols: 10 }),
+            false,
         );
 
         assert!(matches!(
@@ -2517,6 +2535,7 @@ mod tests {
         let frame = screen_snapshot_frame(
             terminal_state.screen_snapshot(),
             Some(TerminalDimensions { rows: 4, cols: 10 }),
+            false,
         );
 
         assert!(matches!(
@@ -2534,7 +2553,11 @@ mod tests {
         let mut snapshot = terminal_state.screen_snapshot();
         snapshot.cells[0][0].symbol = "x".repeat(5 * 1024 * 1024);
 
-        let frame = screen_snapshot_frame(snapshot, Some(TerminalDimensions { rows: 1, cols: 1 }));
+        let frame = screen_snapshot_frame(
+            snapshot,
+            Some(TerminalDimensions { rows: 1, cols: 1 }),
+            false,
+        );
 
         assert!(matches!(
             &frame,

@@ -961,7 +961,10 @@ async fn reopen_agent_attach_with_snapshot(
                         "return preview supplied an invalid terminal snapshot: {error:?}"
                     ))
                 })?;
-                if snapshot.rows != rows || snapshot.cols != cols {
+                let snapshot_size_matches = snapshot.rows == rows && snapshot.cols == cols;
+                let replay_reaches_requested_size = !snapshot_size_matches
+                    && snapshot.source.pty_log_offset < snapshot.source.raw_replay_end_offset;
+                if !snapshot_size_matches && !replay_reaches_requested_size {
                     close_attach_stream_interruptible(
                         &mut attach.reader,
                         &mut attach.writer,
@@ -980,6 +983,47 @@ async fn reopen_agent_attach_with_snapshot(
                     )));
                 }
                 emulator.adopt_screen_snapshot(&snapshot);
+                if replay_reaches_requested_size {
+                    let suffix = await_managed_transition(
+                        async {
+                            attach
+                                .reader
+                                .next_frame()
+                                .await
+                                .map_err(|error| error.to_string())
+                        },
+                        deadline,
+                        interrupt,
+                        "return preview terminal suffix",
+                    )
+                    .await
+                    .map_err(CockpitError::Transition)?
+                    .ok_or_else(|| {
+                        CockpitError::Transition(
+                            "return preview closed before its terminal suffix".to_string(),
+                        )
+                    })?;
+                    match suffix {
+                        AttachStreamFrame::RawOutput { data } => {
+                            emulator.process(data.as_slice());
+                            emulator.resize(rows, cols);
+                        }
+                        AttachStreamFrame::StreamLagged {
+                            reason, recover, ..
+                        } => {
+                            let _ = attach.writer.shutdown().await;
+                            return Err(CockpitError::Transition(format!(
+                                "return preview lagged before completing its terminal suffix: {reason:?}; {recover}"
+                            )));
+                        }
+                        frame => {
+                            let _ = attach.writer.shutdown().await;
+                            return Err(CockpitError::Transition(format!(
+                                "return preview supplied an incompatible terminal suffix: {frame:?}"
+                            )));
+                        }
+                    }
+                }
                 return Ok(attach);
             }
             AttachStreamFrame::SnapshotUnavailable { reason, .. } => {

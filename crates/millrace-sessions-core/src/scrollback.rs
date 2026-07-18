@@ -359,6 +359,8 @@ pub struct TerminalStateBuffer {
     raw_replay: RawReplayBuffer,
     pty_log_offset: u64,
     structured_snapshot_frontier: Option<ScreenSnapshot>,
+    structured_snapshot_frontier_is_lossy: bool,
+    physical_scrollback_observed: bool,
 }
 
 impl TerminalStateBuffer {
@@ -368,6 +370,8 @@ impl TerminalStateBuffer {
             raw_replay: RawReplayBuffer::empty(raw_replay_capacity, pty_log_offset),
             pty_log_offset,
             structured_snapshot_frontier: None,
+            structured_snapshot_frontier_is_lossy: false,
+            physical_scrollback_observed: false,
         };
         state.refresh_structured_snapshot_frontier();
         state
@@ -435,7 +439,11 @@ impl TerminalStateBuffer {
             if !restored_from_checkpoint {
                 state.parser.process(state.raw_replay.bytes());
             }
-            if parser_state_is_structured_snapshot_safe(&state.parser, &state.screen_snapshot()) {
+            if parser_state_is_structured_snapshot_safe(
+                &state.parser,
+                &state.screen_snapshot(),
+                false,
+            ) {
                 state.refresh_structured_snapshot_frontier();
             } else if state
                 .structured_snapshot_frontier
@@ -443,6 +451,7 @@ impl TerminalStateBuffer {
                 .is_some_and(|snapshot| snapshot.source.pty_log_offset == current_pty_offset)
             {
                 state.structured_snapshot_frontier = None;
+                state.structured_snapshot_frontier_is_lossy = false;
             }
             return Ok(state);
         }
@@ -539,17 +548,28 @@ impl TerminalStateBuffer {
         rows: u16,
         cols: u16,
     ) -> ScreenSnapshot {
-        let mut parser = vt100::Parser::new(snapshot.rows.max(1), snapshot.cols.max(1), 0);
-        hydrate_terminal_parser_from_snapshot(&mut parser, snapshot);
-        parser.screen_mut().set_size(rows, cols);
-        screen_snapshot_from_parser(
-            &parser,
+        let mut resized_parser = vt100::Parser::new(snapshot.rows.max(1), snapshot.cols.max(1), 0);
+        hydrate_terminal_parser_from_snapshot(&mut resized_parser, snapshot);
+        resized_parser.screen_mut().set_size(rows, cols);
+        let resized_snapshot = screen_snapshot_from_parser(
+            &resized_parser,
             ScreenSnapshotSource {
                 pty_log_offset: snapshot.source.pty_log_offset,
                 raw_replay_start_offset: self.raw_replay.start_offset(),
                 raw_replay_end_offset: self.raw_replay.end_offset(),
             },
-        )
+        );
+
+        let Some(suffix) = self.raw_replay_suffix(snapshot.source.pty_log_offset) else {
+            return snapshot.clone();
+        };
+        if suffix.is_empty()
+            || raw_suffix_is_resize_invariant(snapshot, &resized_snapshot, suffix, rows, cols)
+        {
+            resized_snapshot
+        } else {
+            snapshot.clone()
+        }
     }
 
     pub fn screen_snapshot_replay(&self) -> Option<(ScreenSnapshot, Vec<u8>, u64)> {
@@ -582,10 +602,46 @@ impl TerminalStateBuffer {
     }
 
     fn refresh_structured_snapshot_frontier(&mut self) {
-        let snapshot = self.screen_snapshot();
-        if parser_state_is_structured_snapshot_safe(&self.parser, &snapshot) {
-            self.structured_snapshot_frontier = Some(snapshot);
+        let retained_frontier_is_replayable = self
+            .structured_snapshot_frontier
+            .as_ref()
+            .is_some_and(|frontier| {
+                frontier.source.pty_log_offset >= self.raw_replay.start_offset()
+                    && frontier.source.pty_log_offset <= self.raw_replay.end_offset()
+            });
+        if !self.structured_snapshot_frontier_is_lossy && retained_frontier_is_replayable {
+            if self.physical_scrollback_observed {
+                return;
+            }
+            self.physical_scrollback_observed = parser_has_physical_scrollback(&self.parser);
+            if self.physical_scrollback_observed {
+                return;
+            }
         }
+
+        let snapshot = self.screen_snapshot();
+        if !self.structured_snapshot_frontier_is_lossy
+            && parser_state_is_structured_snapshot_safe(&self.parser, &snapshot, false)
+        {
+            self.structured_snapshot_frontier = Some(snapshot);
+            return;
+        }
+        let lossy_frontier_required =
+            self.structured_snapshot_frontier_is_lossy || !retained_frontier_is_replayable;
+        if lossy_frontier_required
+            && parser_state_is_structured_snapshot_safe(&self.parser, &snapshot, true)
+        {
+            self.structured_snapshot_frontier = Some(snapshot);
+            self.structured_snapshot_frontier_is_lossy = true;
+        }
+    }
+
+    fn raw_replay_suffix(&self, offset: u64) -> Option<&[u8]> {
+        if offset < self.raw_replay.start_offset() || offset > self.raw_replay.end_offset() {
+            return None;
+        }
+        let start = usize::try_from(offset - self.raw_replay.start_offset()).ok()?;
+        self.raw_replay.bytes().get(start..)
     }
 
     pub fn persist(
@@ -639,6 +695,7 @@ fn screen_snapshot_from_parser(
 fn parser_state_is_structured_snapshot_safe(
     parser: &vt100::Parser,
     snapshot: &ScreenSnapshot,
+    allow_physical_scrollback_loss: bool,
 ) -> bool {
     let continuation = parser.continuation();
     if !continuation.pending_utf8.is_empty()
@@ -650,9 +707,29 @@ fn parser_state_is_structured_snapshot_safe(
 
     let mut represented = vt100::Parser::new(snapshot.rows.max(1), snapshot.cols.max(1), 0);
     hydrate_terminal_parser_from_snapshot(&mut represented, snapshot);
-    let represented = represented.continuation();
+    if allow_physical_scrollback_loss {
+        return parser_active_execution_state_matches(
+            &continuation,
+            &represented.continuation(),
+            snapshot,
+        );
+    }
+    !parser_has_physical_scrollback(parser) && parser_execution_states_match(parser, &represented)
+}
+
+fn parser_has_physical_scrollback(parser: &vt100::Parser) -> bool {
+    let mut screen = parser.screen().clone();
+    screen.set_scrollback(usize::MAX);
+    screen.scrollback() != 0
+}
+
+fn parser_active_execution_state_matches(
+    actual: &vt100::ParserContinuation,
+    represented: &vt100::ParserContinuation,
+    snapshot: &ScreenSnapshot,
+) -> bool {
     let (Some(actual_screen), Some(represented_screen)) =
-        (continuation.screen.as_ref(), represented.screen.as_ref())
+        (actual.screen.as_ref(), represented.screen.as_ref())
     else {
         return false;
     };
@@ -667,13 +744,71 @@ fn parser_state_is_structured_snapshot_safe(
         represented_screen.main_grid
     };
 
-    continuation.active_grapheme == represented.active_grapheme
+    actual.active_grapheme == represented.active_grapheme
         && actual_grid == represented_grid
         && actual_screen.attrs == represented_screen.attrs
         && actual_screen.saved_attrs == represented_screen.saved_attrs
         && actual_screen.modes == represented_screen.modes
         && actual_screen.mouse_protocol_mode == represented_screen.mouse_protocol_mode
         && actual_screen.mouse_protocol_encoding == represented_screen.mouse_protocol_encoding
+}
+
+fn raw_suffix_is_resize_invariant(
+    snapshot: &ScreenSnapshot,
+    resized_snapshot: &ScreenSnapshot,
+    suffix: &[u8],
+    rows: u16,
+    cols: u16,
+) -> bool {
+    let mut replay_then_resize = vt100::Parser::new(
+        snapshot.rows.max(1),
+        snapshot.cols.max(1),
+        DEFAULT_SCROLLBACK_CAPACITY,
+    );
+    hydrate_terminal_parser_from_snapshot(&mut replay_then_resize, snapshot);
+    replay_then_resize.process(suffix);
+    replay_then_resize.screen_mut().set_size(rows, cols);
+
+    let mut resize_then_replay =
+        vt100::Parser::new(rows.max(1), cols.max(1), DEFAULT_SCROLLBACK_CAPACITY);
+    hydrate_terminal_parser_from_snapshot(&mut resize_then_replay, resized_snapshot);
+    resize_then_replay.process(suffix);
+
+    parser_states_match(&replay_then_resize, &resize_then_replay)
+}
+
+fn parser_states_match(left: &vt100::Parser, right: &vt100::Parser) -> bool {
+    if !parser_execution_states_match(left, right) {
+        return false;
+    }
+
+    let mut left_screen = left.screen().clone();
+    let mut right_screen = right.screen().clone();
+    left_screen.set_scrollback(usize::MAX);
+    right_screen.set_scrollback(usize::MAX);
+    let max_scrollback = left_screen.scrollback();
+    if max_scrollback != right_screen.scrollback() {
+        return false;
+    }
+    for offset in 0..=max_scrollback {
+        left_screen.set_scrollback(offset);
+        right_screen.set_scrollback(offset);
+        if left_screen.contents_formatted() != right_screen.contents_formatted() {
+            return false;
+        }
+    }
+    true
+}
+
+fn parser_execution_states_match(left: &vt100::Parser, right: &vt100::Parser) -> bool {
+    if left.continuation() != right.continuation()
+        || left.screen().parser_checkpoint_formatted()
+            != right.screen().parser_checkpoint_formatted()
+    {
+        return false;
+    }
+
+    true
 }
 
 pub fn hydrate_terminal_parser_from_snapshot(

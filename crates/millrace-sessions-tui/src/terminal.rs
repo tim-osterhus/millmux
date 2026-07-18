@@ -29,6 +29,7 @@ pub struct TerminalEmulator {
     output_revision: u64,
     active_search: Option<TerminalSearchState>,
     adopted_cursor_boundary: bool,
+    pending_replay_resize: Option<(u16, u16)>,
 }
 
 #[derive(Debug, Clone)]
@@ -54,6 +55,7 @@ impl TerminalEmulator {
             output_revision: 0,
             active_search: None,
             adopted_cursor_boundary: false,
+            pending_replay_resize: None,
         }
     }
 
@@ -63,6 +65,9 @@ impl TerminalEmulator {
         }
         self.parser.process(bytes);
         self.adopted_cursor_boundary = false;
+        if let Some((rows, cols)) = self.pending_replay_resize.take() {
+            self.parser.screen_mut().set_size(rows, cols);
+        }
         self.invalidate_output_dependent_state();
     }
 
@@ -72,6 +77,10 @@ impl TerminalEmulator {
 
     pub fn resize(&mut self, rows: u16, cols: u16) {
         let size = (rows.max(1), cols.max(1));
+        if self.pending_replay_resize.is_some() {
+            self.pending_replay_resize = Some(size);
+            return;
+        }
         if self.parser.screen().size() != size {
             let (cursor_row, cursor_col) = self.parser.screen().cursor_position();
             self.parser.screen_mut().set_size(size.0, size.1);
@@ -176,6 +185,7 @@ impl TerminalEmulator {
     /// Replaces the active screen from a structured snapshot while retaining
     /// parser-owned physical scrollback for subsequent live output.
     pub fn adopt_screen_snapshot(&mut self, snapshot: &ScreenSnapshot) {
+        let replay_target_size = self.parser.screen().size();
         let legacy_snapshot = snapshot.cells.iter().flatten().any(|cell| {
             !cell.occupied && !cell.continuation && !cell.symbol.is_empty() && cell.symbol != " "
         });
@@ -198,6 +208,10 @@ impl TerminalEmulator {
         });
         let snapshot = normalized_snapshot.as_ref().unwrap_or(snapshot);
         let cols = snapshot.cols.max(1);
+        self.pending_replay_resize = (snapshot.source.pty_log_offset
+            < snapshot.source.raw_replay_end_offset
+            && replay_target_size != (snapshot.rows.max(1), cols))
+            .then_some(replay_target_size);
         hydrate_terminal_parser_from_snapshot(&mut self.parser, snapshot);
         self.adopted_cursor_boundary = snapshot.cursor.col == cols;
         self.invalidate_output_dependent_state();
@@ -375,7 +389,7 @@ impl TerminalSnapshot {
     }
 
     pub fn contains_text(&self, needle: &str) -> bool {
-        self.plain_lines().iter().any(|line| line.contains(needle))
+        self.cells.iter().any(|row| row_text(row).contains(needle))
     }
 }
 

@@ -313,9 +313,15 @@ live preview processing.
 
 This is a coherent viewport recovery boundary, not a byte-exact physical-history
 claim.
-Physical scrollback produced only while native raw attach owns the terminal may
-not be reconstructible in the cockpit preview. Physical history already held by
-the cockpit before raw entry remains locally available after return. Snapshot
+Fresh structured hydration can now apply the retained raw suffix at its capture
+geometry before resizing to the requested preview size. The parser-safe frontier
+is retained while physical scrollback remains replayable, so the suffix can
+reconstruct bounded physical history and hidden main-screen state before a later
+alternate-screen exit. An unsafe pre-resize suffix is never relabeled with the
+new dimensions; it is replayed at its capture size first. Physical scrollback
+produced only while native raw attach owns the terminal may still be
+unreconstructible in the cockpit preview. Physical history already held by the
+cockpit before raw entry remains locally available after return. Snapshot
 validation and TUI parser hydration preserve the valid right-margin wrap-pending cursor
 (`cursor.col == cols`) and reject columns beyond that bound. Silent children can
 enter and leave managed raw mode because recovery depends on a valid structured
@@ -356,6 +362,16 @@ rather than matching a stale pane title. Cancellation evidence aborts an actual
 spawned task; it does not merely drop an in-task future.
 
 ## Validation and handoff
+
+The checkpoint terminal-replay closure also passes the three demonstrated
+regressions:
+
+- `fresh_structured_hydration_reconstructs_physical_scrollback_from_suffix`
+  preserves bounded physical history through fresh structured hydration.
+- `structured_suffix_reconstructs_hidden_main_grid_before_alternate_exit`
+  restores the nonempty main grid after alternate-screen exit.
+- `resize_does_not_relabel_unsafe_raw_suffix_with_new_dimensions` preserves
+  capture geometry for an unsafe pre-resize suffix before applying the new size.
 
 Completed Unix/WSL evidence after the baseline-protocol reduction:
 
