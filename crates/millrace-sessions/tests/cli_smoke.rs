@@ -260,6 +260,7 @@ fn seed_screen_session(host: &TempHost) -> String {
         raw_replay_end_offset: 11,
         captured_at: "2026-07-08T00:00:01Z".to_string(),
         structured_screen: Some(structured_screen_fixture(2, 16, 11, &screen)),
+        parser_checkpoint: None,
         screen,
     };
     write_json_atomic(&session_paths.terminal_snapshot, &snapshot).expect("seed terminal snapshot");

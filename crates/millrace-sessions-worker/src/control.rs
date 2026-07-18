@@ -1,16 +1,17 @@
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeSet, VecDeque},
     fs,
-    io::{BufRead, BufReader, Write},
+    io::{self, BufRead, BufReader, Write},
+    net::Shutdown,
     os::unix::net::{UnixListener, UnixStream},
     path::Path,
     sync::{
         atomic::{AtomicBool, Ordering},
         mpsc::{self, SyncSender, TrySendError},
-        Arc, Mutex,
+        Arc, Mutex, TryLockError,
     },
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use millrace_sessions_core::{
@@ -30,15 +31,18 @@ use millrace_sessions_core::{
 };
 use nix::{
     errno::Errno,
+    libc,
     sys::signal::{kill, Signal},
     unistd::Pid,
 };
 use portable_pty::{MasterPty, PtySize};
 
+#[cfg(test)]
+use std::sync::Condvar;
+
 const ATTACH_OBSERVER_QUEUE_CAPACITY: usize = 8;
 const ATTACH_INPUT_QUEUE_CAPACITY: usize = 8;
 const ATTACH_INPUT_MAX_BYTES: usize = 512;
-const ATTACH_INPUT_MAX_TOTAL_BYTES: usize = 1024;
 const ATTACH_INPUT_WRITE_CHUNK: usize = 128;
 const ATTACH_INPUT_DRAIN_TIMEOUT: Duration = Duration::from_secs(1);
 const ATTACH_OBSERVER_CLOSE_AFTER_DROPPED_BYTES: u64 = 16 * 1024 * 1024;
@@ -64,39 +68,18 @@ impl WorkerControlHandle {
         let mut lag_events = Vec::new();
         let mut state = self.state.lock().expect("control state poisoned");
         state.observers.retain_mut(|observer| {
-            if observer.lag_pending && observer.accepts_frame_type(AttachFrameType::StreamLagged) {
-                let notice = observer.lag_notice();
-                match observer
-                    .sender
-                    .try_send(AttachObserverMessage::Lag(notice.clone()))
-                {
-                    Ok(()) => observer.clear_lag(),
-                    Err(TrySendError::Full(_)) => {
-                        lag_events
-                            .push((observer.stream_id.clone(), observer.record_drop(&output)));
-                        if observer.should_close() {
-                            observer.shutdown();
-                            return false;
-                        }
-                        return true;
-                    }
-                    Err(TrySendError::Disconnected(_)) => return false,
-                }
-            }
-
             let Some(output) = observer.trim_output(&output) else {
                 return true;
             };
 
-            match observer
-                .sender
-                .try_send(AttachObserverMessage::Output(output.clone()))
-            {
+            match observer.sender.try_send(output.clone()) {
                 Ok(()) => true,
                 Err(TrySendError::Full(_)) => {
                     let notice = observer.record_drop(&output);
-                    lag_events.push((observer.stream_id.clone(), notice));
-                    if observer.should_close() {
+                    if !observer.snapshot_replay_pending {
+                        lag_events.push((observer.stream_id.clone(), notice));
+                    }
+                    if !observer.snapshot_replay_pending && observer.should_close() {
                         observer.shutdown();
                         return false;
                     }
@@ -146,6 +129,8 @@ pub fn start_control_server(config: WorkerControlConfig) -> MillmuxResult<Worker
         child_pid: config.child_pid,
         child_pgid: config.child_pgid,
         state,
+        #[cfg(test)]
+        input_write_sync: Arc::new(InputWriteTestSync::default()),
     });
 
     thread::spawn(move || {
@@ -178,23 +163,15 @@ struct AttachLagNotice {
     current_pty_log_offset: u64,
 }
 
-#[derive(Debug, Clone)]
-enum AttachObserverMessage {
-    Output(AttachOutput),
-    Lag(AttachLagNotice),
-}
-
 enum AttachInputCommand {
     Input(Vec<u8>),
     Resize { rows: u16, cols: u16 },
-    Close,
 }
 
 struct AttachObserver {
     stream_id: String,
-    sender: SyncSender<AttachObserverMessage>,
+    sender: SyncSender<AttachOutput>,
     shutdown: UnixStream,
-    pending_lag_notice: Arc<Mutex<Option<AttachLagNotice>>>,
     accepted_frame_types: Vec<AttachFrameType>,
     dropped_bytes: u64,
     dropped_from_offset: Option<u64>,
@@ -202,6 +179,7 @@ struct AttachObserver {
     current_pty_log_offset: u64,
     lag_pending: bool,
     live_start_offset: u64,
+    snapshot_replay_pending: bool,
 }
 
 impl AttachObserver {
@@ -219,35 +197,11 @@ impl AttachObserver {
             .dropped_bytes
             .saturating_add(output.end_offset.saturating_sub(output.start_offset));
         self.lag_pending = self.accepts_frame_type(AttachFrameType::StreamLagged);
-        let notice = self.lag_notice();
-        self.store_pending_lag_notice(&notice);
-        notice
-    }
-
-    fn store_pending_lag_notice(&self, notice: &AttachLagNotice) {
-        if !self.accepts_frame_type(AttachFrameType::StreamLagged) {
-            return;
-        }
-        if let Ok(mut pending) = self.pending_lag_notice.lock() {
-            *pending = Some(notice.clone());
-        }
+        self.lag_notice()
     }
 
     fn trim_output(&self, output: &AttachOutput) -> Option<AttachOutput> {
-        if output.end_offset <= self.live_start_offset {
-            return None;
-        }
-        if output.start_offset >= self.live_start_offset {
-            return Some(output.clone());
-        }
-
-        let drop_count = self.live_start_offset.saturating_sub(output.start_offset) as usize;
-        let drop_count = drop_count.min(output.bytes.len());
-        Some(AttachOutput {
-            bytes: output.bytes[drop_count..].to_vec(),
-            start_offset: self.live_start_offset,
-            end_offset: output.end_offset,
-        })
+        trim_attach_output(output, self.live_start_offset)
     }
 
     fn lag_notice(&self) -> AttachLagNotice {
@@ -266,6 +220,27 @@ impl AttachObserver {
         self.lag_pending = false;
     }
 
+    fn reconcile_snapshot_frontier(&mut self, covered_offset: u64) -> Option<AttachLagNotice> {
+        self.live_start_offset = self.live_start_offset.max(covered_offset);
+        let remaining = self
+            .lag_pending
+            .then(|| self.lag_notice())
+            .and_then(|notice| trim_attach_lag_notice(notice, covered_offset));
+        match remaining {
+            Some(notice) => {
+                self.dropped_bytes = notice.dropped_bytes;
+                self.dropped_from_offset = Some(notice.dropped_from_offset);
+                self.dropped_to_offset = notice.dropped_to_offset;
+                self.current_pty_log_offset = notice.current_pty_log_offset;
+                Some(notice)
+            }
+            None => {
+                self.clear_lag();
+                None
+            }
+        }
+    }
+
     fn should_close(&self) -> bool {
         self.dropped_bytes >= ATTACH_OBSERVER_CLOSE_AFTER_DROPPED_BYTES
     }
@@ -273,6 +248,37 @@ impl AttachObserver {
     fn shutdown(&self) {
         let _ = self.shutdown.shutdown(std::net::Shutdown::Both);
     }
+}
+
+fn trim_attach_output(output: &AttachOutput, live_start_offset: u64) -> Option<AttachOutput> {
+    if output.end_offset <= live_start_offset {
+        return None;
+    }
+    if output.start_offset >= live_start_offset {
+        return Some(output.clone());
+    }
+
+    let drop_count = live_start_offset.saturating_sub(output.start_offset) as usize;
+    let drop_count = drop_count.min(output.bytes.len());
+    Some(AttachOutput {
+        bytes: output.bytes[drop_count..].to_vec(),
+        start_offset: live_start_offset,
+        end_offset: output.end_offset,
+    })
+}
+
+fn trim_attach_lag_notice(
+    mut notice: AttachLagNotice,
+    live_start_offset: u64,
+) -> Option<AttachLagNotice> {
+    if notice.dropped_to_offset <= live_start_offset {
+        return None;
+    }
+    if notice.dropped_from_offset < live_start_offset {
+        notice.dropped_from_offset = live_start_offset;
+        notice.dropped_bytes = notice.dropped_to_offset.saturating_sub(live_start_offset);
+    }
+    Some(notice)
 }
 
 #[cfg(unix)]
@@ -295,6 +301,125 @@ struct ControlRuntime {
     child_pid: Option<u32>,
     child_pgid: Option<u32>,
     state: Arc<Mutex<ControlState>>,
+    #[cfg(test)]
+    input_write_sync: Arc<InputWriteTestSync>,
+}
+
+#[cfg(test)]
+#[derive(Default)]
+struct InputWriteTestSync {
+    state: Mutex<InputWriteTestState>,
+    changed: Condvar,
+}
+
+#[cfg(test)]
+#[derive(Default)]
+struct InputWriteTestState {
+    waiting: bool,
+    active: bool,
+    completed: bool,
+    snapshot_capture_armed: bool,
+    snapshot_capture_waiting: bool,
+    snapshot_capture_released: bool,
+    snapshot_reconciled_armed: bool,
+    snapshot_reconciled_waiting: bool,
+    snapshot_reconciled_released: bool,
+}
+
+#[cfg(test)]
+impl InputWriteTestSync {
+    fn mark_waiting(&self) {
+        self.state.lock().unwrap().waiting = true;
+        self.changed.notify_all();
+    }
+
+    fn mark_active(&self) {
+        self.state.lock().unwrap().active = true;
+        self.changed.notify_all();
+    }
+
+    fn mark_completed(&self) {
+        self.state.lock().unwrap().completed = true;
+        self.changed.notify_all();
+    }
+
+    fn wait_for(&self, label: &str, ready: impl Fn(&InputWriteTestState) -> bool) {
+        let (state, _) = self
+            .changed
+            .wait_timeout_while(
+                self.state.lock().unwrap(),
+                ATTACH_INPUT_DRAIN_TIMEOUT,
+                |state| !ready(state),
+            )
+            .unwrap();
+        assert!(ready(&state), "timed out waiting for input writer {label}");
+    }
+
+    fn arm_snapshot_capture(&self) {
+        self.state.lock().unwrap().snapshot_capture_armed = true;
+    }
+
+    fn pause_snapshot_capture(&self) {
+        let mut state = self.state.lock().unwrap();
+        if !state.snapshot_capture_armed {
+            return;
+        }
+        state.snapshot_capture_waiting = true;
+        self.changed.notify_all();
+        let (state, _) = self
+            .changed
+            .wait_timeout_while(state, ATTACH_INPUT_DRAIN_TIMEOUT, |state| {
+                !state.snapshot_capture_released
+            })
+            .unwrap();
+        assert!(
+            state.snapshot_capture_released,
+            "timed out waiting to release snapshot capture"
+        );
+    }
+
+    fn release_snapshot_capture(&self) {
+        self.state.lock().unwrap().snapshot_capture_released = true;
+        self.changed.notify_all();
+    }
+
+    fn arm_snapshot_reconciled(&self) {
+        self.state.lock().unwrap().snapshot_reconciled_armed = true;
+    }
+
+    fn pause_snapshot_reconciled(&self) {
+        let mut state = self.state.lock().unwrap();
+        if !state.snapshot_reconciled_armed {
+            return;
+        }
+        state.snapshot_reconciled_waiting = true;
+        self.changed.notify_all();
+        let (state, _) = self
+            .changed
+            .wait_timeout_while(state, ATTACH_INPUT_DRAIN_TIMEOUT, |state| {
+                !state.snapshot_reconciled_released
+            })
+            .unwrap();
+        assert!(
+            state.snapshot_reconciled_released,
+            "timed out waiting to release reconciled snapshot"
+        );
+    }
+
+    fn release_snapshot_reconciled(&self) {
+        self.state.lock().unwrap().snapshot_reconciled_released = true;
+        self.changed.notify_all();
+    }
+}
+
+#[cfg(test)]
+struct InputWriteCompletion(Arc<InputWriteTestSync>);
+
+#[cfg(test)]
+impl Drop for InputWriteCompletion {
+    fn drop(&mut self) {
+        self.0.mark_completed();
+    }
 }
 
 #[derive(Default)]
@@ -571,19 +696,142 @@ fn write_pty_bytes_cancellable(
     bytes: &[u8],
     closed: &AtomicBool,
 ) -> Result<usize, ControlErrorBody> {
+    #[cfg(test)]
+    let _completion = {
+        runtime.input_write_sync.mark_waiting();
+        InputWriteCompletion(Arc::clone(&runtime.input_write_sync))
+    };
+    let deadline = Instant::now() + ATTACH_INPUT_DRAIN_TIMEOUT;
+    let _writer = loop {
+        if closed.load(Ordering::SeqCst) {
+            return Ok(0);
+        }
+        match runtime.writer.try_lock() {
+            Ok(writer) => break writer,
+            Err(TryLockError::Poisoned(_)) => panic!("pty writer poisoned"),
+            Err(TryLockError::WouldBlock) => {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    closed.store(true, Ordering::SeqCst);
+                    return Err(attach_input_drain_timeout());
+                }
+                thread::sleep(remaining.min(ATTACH_STREAM_POLL));
+            }
+        }
+    };
+    let fd = runtime
+        .master
+        .lock()
+        .expect("pty master poisoned")
+        .as_raw_fd()
+        .ok_or_else(|| {
+            ControlErrorBody::new(
+                ControlErrorCode::WorkerUnavailable,
+                "PTY master does not expose a raw file descriptor",
+            )
+        })?;
+    let _nonblocking = PtyNonblockingGuard::activate(fd).map_err(io_error)?;
+    #[cfg(test)]
+    runtime.input_write_sync.mark_active();
     let mut bytes_sent = 0;
     for chunk in bytes.chunks(ATTACH_INPUT_WRITE_CHUNK) {
-        if closed.load(Ordering::SeqCst) {
-            break;
+        let mut pending = chunk;
+        while !pending.is_empty() {
+            if closed.load(Ordering::SeqCst) {
+                return Ok(bytes_sent);
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                closed.store(true, Ordering::SeqCst);
+                return Err(attach_input_drain_timeout());
+            }
+
+            let mut poll_fd = libc::pollfd {
+                fd,
+                events: libc::POLLOUT,
+                revents: 0,
+            };
+            let poll_timeout = remaining.min(ATTACH_STREAM_POLL).as_millis().max(1) as i32;
+            // SAFETY: poll_fd points to one initialized descriptor for this call.
+            let ready = unsafe { libc::poll(&mut poll_fd, 1, poll_timeout) };
+            if ready < 0 {
+                let error = io::Error::last_os_error();
+                if error.kind() == io::ErrorKind::Interrupted {
+                    continue;
+                }
+                return Err(io_error(error));
+            }
+            if ready == 0 {
+                continue;
+            }
+            if poll_fd.revents & (libc::POLLERR | libc::POLLHUP | libc::POLLNVAL) != 0 {
+                return Err(io_error(io::Error::other(
+                    "PTY input descriptor became unavailable",
+                )));
+            }
+
+            // SAFETY: pending is a valid byte slice and fd remains owned by runtime.
+            let written =
+                unsafe { libc::write(fd, pending.as_ptr().cast::<libc::c_void>(), pending.len()) };
+            if written < 0 {
+                let error = io::Error::last_os_error();
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::Interrupted | io::ErrorKind::WouldBlock
+                ) {
+                    continue;
+                }
+                return Err(io_error(error));
+            }
+            if written == 0 {
+                return Err(io_error(io::Error::new(
+                    io::ErrorKind::WriteZero,
+                    "PTY input write made no progress",
+                )));
+            }
+            let written = written as usize;
+            bytes_sent += written;
+            pending = &pending[written..];
         }
-        {
-            let mut writer = runtime.writer.lock().expect("pty writer poisoned");
-            writer.write_all(chunk).map_err(io_error)?;
-            writer.flush().map_err(io_error)?;
-        }
-        bytes_sent += chunk.len();
     }
     Ok(bytes_sent)
+}
+
+fn attach_input_drain_timeout() -> ControlErrorBody {
+    ControlErrorBody::new(
+        ControlErrorCode::WorkerUnavailable,
+        format!(
+            "PTY input did not drain within {}ms",
+            ATTACH_INPUT_DRAIN_TIMEOUT.as_millis()
+        ),
+    )
+}
+
+struct PtyNonblockingGuard {
+    fd: libc::c_int,
+    original_flags: libc::c_int,
+}
+
+impl PtyNonblockingGuard {
+    fn activate(fd: libc::c_int) -> io::Result<Self> {
+        // SAFETY: fd is the live PTY master descriptor retained by ControlRuntime.
+        let original_flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+        if original_flags < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: F_SETFL updates only the file status flags for the live descriptor.
+        if unsafe { libc::fcntl(fd, libc::F_SETFL, original_flags | libc::O_NONBLOCK) } < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(Self { fd, original_flags })
+    }
+}
+
+impl Drop for PtyNonblockingGuard {
+    fn drop(&mut self) {
+        // SAFETY: ControlRuntime retains the master for the guard's full lifetime.
+        let _ = unsafe { libc::fcntl(self.fd, libc::F_SETFL, self.original_flags) };
+    }
 }
 
 fn resize_pty(
@@ -730,7 +978,6 @@ fn handle_observe_attach(
     writer_stream.set_write_timeout(Some(ATTACH_STREAM_WRITE_TIMEOUT))?;
     let writer = Arc::new(Mutex::new(writer_stream));
     let (sender, receiver) = mpsc::sync_channel(ATTACH_OBSERVER_QUEUE_CAPACITY);
-    let pending_lag_notice = Arc::new(Mutex::new(None));
     let replay_cutoff = {
         let mut state = runtime.state.lock().expect("control state poisoned");
         let live_start_offset = file_len(&runtime.paths.pty_log);
@@ -738,7 +985,6 @@ fn handle_observe_attach(
             stream_id: params.stream_id.clone(),
             sender,
             shutdown: stream.try_clone()?,
-            pending_lag_notice: Arc::clone(&pending_lag_notice),
             accepted_frame_types: params.negotiated_frame_types(),
             dropped_bytes: 0,
             dropped_from_offset: None,
@@ -746,6 +992,8 @@ fn handle_observe_attach(
             current_pty_log_offset: live_start_offset,
             lag_pending: false,
             live_start_offset,
+            snapshot_replay_pending: params.negotiated_initial_replay()
+                == Some(AttachInitialReplay::ScreenSnapshot),
         });
         live_start_offset
     };
@@ -756,11 +1004,12 @@ fn handle_observe_attach(
 
     let closed = Arc::new(AtomicBool::new(false));
     let (input_sender, input_receiver) = mpsc::sync_channel(ATTACH_INPUT_QUEUE_CAPACITY);
+    let input_shutdown = stream.try_clone()?;
     let input_writer_runtime = Arc::clone(&runtime);
     let input_writer = Arc::clone(&writer);
     let input_writer_closed = Arc::clone(&closed);
     let (input_drained_sender, input_drained_receiver) = mpsc::channel();
-    thread::spawn(move || {
+    let mut input_writer_handle = Some(thread::spawn(move || {
         write_attach_input_loop(
             input_writer_runtime,
             input_writer,
@@ -768,13 +1017,13 @@ fn handle_observe_attach(
             input_writer_closed,
         );
         let _ = input_drained_sender.send(());
-    });
+    }));
     let input_runtime = Arc::clone(&runtime);
     let input_writer = Arc::clone(&writer);
     let input_params = params.clone();
     let input_closed = Arc::clone(&closed);
     let (done_sender, done_receiver) = mpsc::channel();
-    thread::spawn(move || {
+    let input_reader_handle = thread::spawn(move || {
         read_attach_input_loop(
             stream,
             input_runtime,
@@ -786,54 +1035,57 @@ fn handle_observe_attach(
         let _ = done_sender.send(());
     });
 
-    write_initial_replay(&writer, &runtime, &params, replay_cutoff, &closed)?;
-
-    loop {
-        if write_pending_lag_notice(&writer, &params, &pending_lag_notice).is_err() {
-            break;
+    let mut reconciled_outputs = VecDeque::new();
+    let (mut first_error, live_start_offset) =
+        match write_initial_replay(&writer, &runtime, &params, replay_cutoff, &closed) {
+            Ok(snapshot_offset) => {
+                if params.negotiated_initial_replay() == Some(AttachInitialReplay::ScreenSnapshot) {
+                    let (notice, outputs) = reconcile_snapshot_observer(
+                        &runtime,
+                        &params.stream_id,
+                        snapshot_offset.unwrap_or(replay_cutoff),
+                        &receiver,
+                    );
+                    reconciled_outputs = outputs;
+                    if let Some(notice) = notice {
+                        persist_attach_lag_event(&runtime.paths, &params.stream_id, &notice);
+                    }
+                    #[cfg(test)]
+                    runtime.input_write_sync.pause_snapshot_reconciled();
+                }
+                (
+                    None,
+                    snapshot_offset.unwrap_or(replay_cutoff).max(replay_cutoff),
+                )
+            }
+            Err(error) => (Some(error), replay_cutoff),
+        };
+    let mut input_finished = false;
+    while first_error.is_none() {
+        if let Some(notice) =
+            take_observer_lag_notice(&runtime.state, &params.stream_id, live_start_offset)
+        {
+            if let Err(error) = write_lag_notice(&writer, &params, notice) {
+                first_error = Some(error);
+                break;
+            }
         }
         if done_receiver.try_recv().is_ok() {
-            match input_drained_receiver.recv_timeout(ATTACH_INPUT_DRAIN_TIMEOUT) {
-                Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => {}
-                Err(mpsc::RecvTimeoutError::Timeout) => {
-                    closed.store(true, Ordering::SeqCst);
-                    let _ = write_attach_error_locked(
-                        &writer,
-                        ControlErrorBody::new(
-                            ControlErrorCode::WorkerUnavailable,
-                            format!(
-                                "attach input writer did not drain within {}ms; closing attach stream",
-                                ATTACH_INPUT_DRAIN_TIMEOUT.as_millis()
-                            ),
-                        ),
-                    );
-                }
-            }
+            input_finished = true;
             break;
         }
-        match receiver.recv_timeout(ATTACH_STREAM_POLL) {
-            Ok(AttachObserverMessage::Output(output)) => {
+        let output = match reconciled_outputs.pop_front() {
+            Some(output) => Ok(output),
+            None => receiver.recv_timeout(ATTACH_STREAM_POLL),
+        };
+        match output {
+            Ok(output) => {
+                let Some(output) = trim_attach_output(&output, live_start_offset) else {
+                    continue;
+                };
                 let frame = attach_live_output_frame(&params, output.bytes);
-                if write_attach_frame_locked(&writer, &frame).is_err() {
-                    break;
-                }
-            }
-            Ok(AttachObserverMessage::Lag(notice)) => {
-                if params
-                    .negotiated_frame_types()
-                    .contains(&AttachFrameType::StreamLagged)
-                {
-                    let frame = AttachStreamFrame::StreamLagged {
-                        dropped_bytes: notice.dropped_bytes,
-                        dropped_from_offset: notice.dropped_from_offset,
-                        dropped_to_offset: notice.dropped_to_offset,
-                        current_pty_log_offset: notice.current_pty_log_offset,
-                        reason: AttachStreamLagReason::ObserverBackpressure,
-                        recover: "request_screen_or_reattach_raw_replay".to_string(),
-                    };
-                    if write_attach_frame_locked(&writer, &frame).is_err() {
-                        break;
-                    }
+                if let Err(error) = write_attach_frame_locked(&writer, &frame) {
+                    first_error = Some(error);
                 }
             }
             Err(mpsc::RecvTimeoutError::Timeout) => continue,
@@ -841,15 +1093,86 @@ fn handle_observe_attach(
         }
     }
 
+    if !input_finished {
+        closed.store(true, Ordering::SeqCst);
+    }
+    let _ = input_shutdown.shutdown(Shutdown::Read);
+    let _ = input_reader_handle.join();
+    match input_drained_receiver.recv_timeout(ATTACH_INPUT_DRAIN_TIMEOUT) {
+        Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => {}
+        Err(mpsc::RecvTimeoutError::Timeout) => {
+            closed.store(true, Ordering::SeqCst);
+            let _ = write_attach_error_locked(
+                &writer,
+                ControlErrorBody::new(
+                    ControlErrorCode::WorkerUnavailable,
+                    format!(
+                        "attach input writer did not drain within {}ms; closing attach stream",
+                        ATTACH_INPUT_DRAIN_TIMEOUT.as_millis()
+                    ),
+                ),
+            );
+        }
+    }
+    if let Some(input_writer_handle) = input_writer_handle.take() {
+        let _ = input_writer_handle.join();
+    }
+
     cleanup.release();
     let _ = write_attach_frame_locked(&writer, &AttachStreamFrame::Closed);
+    if let Some(error) = first_error {
+        return Err(error);
+    }
     Ok(())
 }
 
-fn write_pending_lag_notice(
+fn reconcile_snapshot_observer(
+    runtime: &ControlRuntime,
+    stream_id: &str,
+    covered_offset: u64,
+    receiver: &mpsc::Receiver<AttachOutput>,
+) -> (Option<AttachLagNotice>, VecDeque<AttachOutput>) {
+    let mut state = runtime.state.lock().expect("control state poisoned");
+    let Some(observer) = state
+        .observers
+        .iter_mut()
+        .find(|observer| observer.stream_id == stream_id)
+    else {
+        return (None, VecDeque::new());
+    };
+    let notice = observer.reconcile_snapshot_frontier(covered_offset);
+    let mut outputs = VecDeque::new();
+    while let Ok(output) = receiver.try_recv() {
+        if let Some(output) = trim_attach_output(&output, covered_offset) {
+            outputs.push_back(output);
+        }
+    }
+    observer.snapshot_replay_pending = false;
+    (notice, outputs)
+}
+
+fn take_observer_lag_notice(
+    state: &Arc<Mutex<ControlState>>,
+    stream_id: &str,
+    live_start_offset: u64,
+) -> Option<AttachLagNotice> {
+    let mut state = state.lock().expect("control state poisoned");
+    let observer = state
+        .observers
+        .iter_mut()
+        .find(|observer| observer.stream_id == stream_id)?;
+    if !observer.lag_pending {
+        return None;
+    }
+    let notice = observer.lag_notice();
+    observer.clear_lag();
+    trim_attach_lag_notice(notice, live_start_offset)
+}
+
+fn write_lag_notice(
     writer: &Arc<Mutex<UnixStream>>,
     params: &WorkerAttachRequest,
-    pending_lag_notice: &Arc<Mutex<Option<AttachLagNotice>>>,
+    notice: AttachLagNotice,
 ) -> MillmuxResult<()> {
     if !params
         .negotiated_frame_types()
@@ -857,13 +1180,6 @@ fn write_pending_lag_notice(
     {
         return Ok(());
     }
-    let notice = pending_lag_notice
-        .lock()
-        .ok()
-        .and_then(|mut pending| pending.take());
-    let Some(notice) = notice else {
-        return Ok(());
-    };
     let frame = AttachStreamFrame::StreamLagged {
         dropped_bytes: notice.dropped_bytes,
         dropped_from_offset: notice.dropped_from_offset,
@@ -920,21 +1236,23 @@ fn write_initial_replay(
     params: &WorkerAttachRequest,
     replay_cutoff: u64,
     closed: &AtomicBool,
-) -> MillmuxResult<()> {
+) -> MillmuxResult<Option<u64>> {
     if closed.load(Ordering::SeqCst) {
-        return Ok(());
+        return Ok(None);
     }
     if params.negotiated_attach_protocol_version().is_some() {
         return write_negotiated_initial_replay(writer, runtime, params, replay_cutoff, closed);
     }
     write_legacy_initial_replay(
         writer,
-        &runtime.paths,
+        runtime,
+        params,
         params.replay,
         params.requested_terminal_size,
         replay_cutoff,
         closed,
     )
+    .map(|()| None)
 }
 
 fn write_negotiated_initial_replay(
@@ -943,28 +1261,40 @@ fn write_negotiated_initial_replay(
     params: &WorkerAttachRequest,
     replay_cutoff: u64,
     closed: &AtomicBool,
-) -> MillmuxResult<()> {
+) -> MillmuxResult<Option<u64>> {
     match params.negotiated_initial_replay() {
-        None | Some(AttachInitialReplay::None) => Ok(()),
+        None | Some(AttachInitialReplay::None) => Ok(None),
         Some(AttachInitialReplay::LineScrollback) => {
-            write_line_scrollback(writer, &runtime.paths, closed)
+            write_line_scrollback(writer, &runtime.paths, closed).map(|()| None)
         }
-        Some(AttachInitialReplay::RawReplay) => write_raw_initial_replay(
-            writer,
-            &runtime.paths,
-            AttachReplayMode::RawReplay,
-            params.requested_terminal_size,
-            replay_cutoff,
-            closed,
-        ),
+        Some(AttachInitialReplay::RawReplay) => {
+            write_raw_initial_replay(
+                writer,
+                runtime,
+                params,
+                AttachReplayMode::RawReplay,
+                params.requested_terminal_size,
+                replay_cutoff,
+                closed,
+            )?;
+            Ok(None)
+        }
         Some(AttachInitialReplay::ScreenSnapshot) => {
             if closed.load(Ordering::SeqCst) {
-                return Ok(());
+                return Ok(None);
             }
-            let frame =
-                screen_snapshot_initial_replay_frame(runtime, params.requested_terminal_size);
+            let (frame, suffix, covered_offset) = screen_snapshot_initial_replay_frame(
+                runtime,
+                params.requested_terminal_size,
+                params
+                    .negotiated_frame_types()
+                    .contains(&AttachFrameType::RawOutput),
+            );
             write_attach_frame_locked(writer, &frame)?;
-            Ok(())
+            if !suffix.is_empty() {
+                write_attach_frame_locked(writer, &AttachStreamFrame::raw_output(suffix))?;
+            }
+            Ok(covered_offset)
         }
     }
 }
@@ -972,19 +1302,57 @@ fn write_negotiated_initial_replay(
 fn screen_snapshot_initial_replay_frame(
     runtime: &ControlRuntime,
     requested_terminal_size: Option<TerminalDimensions>,
-) -> AttachStreamFrame {
-    let snapshot = match runtime.terminal_state.lock() {
-        Ok(terminal_state) => terminal_state.screen_snapshot(),
+    accepts_raw_output: bool,
+) -> (AttachStreamFrame, Vec<u8>, Option<u64>) {
+    #[cfg(test)]
+    runtime.input_write_sync.pause_snapshot_capture();
+    let (snapshot, suffix, covered_offset) = match runtime.terminal_state.lock() {
+        Ok(terminal_state) => match terminal_state.screen_snapshot_replay() {
+            Some(replay) => replay,
+            None => {
+                return (
+                    AttachStreamFrame::SnapshotUnavailable {
+                        reason: SnapshotUnavailableReason::StaleSnapshot,
+                        details: Some(serde_json::json!({
+                            "message": "structured snapshot parser frontier is outside retained raw replay"
+                        })),
+                    },
+                    Vec::new(),
+                    None,
+                );
+            }
+        },
         Err(_) => {
-            return AttachStreamFrame::SnapshotUnavailable {
-                reason: SnapshotUnavailableReason::InternalError,
-                details: Some(serde_json::json!({
-                    "message": "terminal state lock poisoned"
-                })),
-            };
+            return (
+                AttachStreamFrame::SnapshotUnavailable {
+                    reason: SnapshotUnavailableReason::InternalError,
+                    details: Some(serde_json::json!({
+                        "message": "terminal state lock poisoned"
+                    })),
+                },
+                Vec::new(),
+                None,
+            );
         }
     };
-    screen_snapshot_frame(snapshot, requested_terminal_size)
+    if !suffix.is_empty() && !accepts_raw_output {
+        return (
+            AttachStreamFrame::SnapshotUnavailable {
+                reason: SnapshotUnavailableReason::StaleSnapshot,
+                details: Some(serde_json::json!({
+                    "message": "structured snapshot parser continuation requires raw output replay"
+                })),
+            },
+            Vec::new(),
+            None,
+        );
+    }
+    let frame = screen_snapshot_frame(snapshot, requested_terminal_size);
+    if matches!(frame, AttachStreamFrame::ScreenSnapshot { .. }) {
+        (frame, suffix, Some(covered_offset))
+    } else {
+        (frame, Vec::new(), None)
+    }
 }
 
 fn screen_snapshot_frame(
@@ -1016,7 +1384,8 @@ fn screen_snapshot_frame(
 
 fn write_legacy_initial_replay(
     writer: &Arc<Mutex<UnixStream>>,
-    paths: &SessionPaths,
+    runtime: &ControlRuntime,
+    params: &WorkerAttachRequest,
     replay: AttachReplayMode,
     requested_terminal_size: Option<TerminalDimensions>,
     replay_cutoff: u64,
@@ -1024,12 +1393,13 @@ fn write_legacy_initial_replay(
 ) -> MillmuxResult<()> {
     match replay {
         AttachReplayMode::LineScrollback => {
-            write_line_scrollback(writer, paths, closed)?;
+            write_line_scrollback(writer, &runtime.paths, closed)?;
         }
         AttachReplayMode::RawReplay | AttachReplayMode::TerminalSnapshot => {
             write_raw_initial_replay(
                 writer,
-                paths,
+                runtime,
+                params,
                 replay,
                 requested_terminal_size,
                 replay_cutoff,
@@ -1057,7 +1427,8 @@ fn write_line_scrollback(
 
 fn write_raw_initial_replay(
     writer: &Arc<Mutex<UnixStream>>,
-    paths: &SessionPaths,
+    runtime: &ControlRuntime,
+    params: &WorkerAttachRequest,
     replay: AttachReplayMode,
     requested_terminal_size: Option<TerminalDimensions>,
     replay_cutoff: u64,
@@ -1066,29 +1437,89 @@ fn write_raw_initial_replay(
     if closed.load(Ordering::SeqCst) {
         return Ok(());
     }
-    if let Some(restored) = restore_terminal_replay_bytes(
+    if replay == AttachReplayMode::TerminalSnapshot {
+        return write_persisted_terminal_snapshot_replay(
+            writer,
+            &runtime.paths,
+            requested_terminal_size,
+            replay_cutoff,
+            closed,
+        );
+    }
+    let replay_bytes = runtime
+        .terminal_state
+        .lock()
+        .ok()
+        .and_then(|terminal_state| terminal_state.raw_replay_through(replay_cutoff));
+    let Some((bytes, rows, cols)) = replay_bytes else {
+        return write_raw_replay_unavailable(
+            writer,
+            params,
+            SnapshotUnavailableReason::StaleSnapshot,
+            "live terminal replay does not cover the attach cutoff",
+        );
+    };
+    if !replay_matches_requested_size(replay, requested_terminal_size, rows, cols) {
+        return write_raw_replay_unavailable(
+            writer,
+            params,
+            SnapshotUnavailableReason::SizeMismatch,
+            "live terminal replay size does not match the requested terminal",
+        );
+    }
+    if closed.load(Ordering::SeqCst) {
+        return Ok(());
+    }
+    if !bytes.is_empty() || params.negotiated_attach_protocol_version().is_some() {
+        write_attach_frame_locked(writer, &AttachStreamFrame::raw_output(bytes))?;
+    }
+    Ok(())
+}
+
+fn write_persisted_terminal_snapshot_replay(
+    writer: &Arc<Mutex<UnixStream>>,
+    paths: &SessionPaths,
+    requested_terminal_size: Option<TerminalDimensions>,
+    replay_cutoff: u64,
+    closed: &AtomicBool,
+) -> MillmuxResult<()> {
+    let Some(restored) = restore_terminal_replay_bytes(
         &paths.terminal_snapshot,
         &paths.raw_replay_ring,
         replay_cutoff,
     )
-    .unwrap_or(None)
+    .unwrap_or(None) else {
+        return Ok(());
+    };
+    if !replay_matches_requested_size(
+        AttachReplayMode::TerminalSnapshot,
+        requested_terminal_size,
+        restored.metadata.rows,
+        restored.metadata.cols,
+    ) || restored.bytes.is_empty()
+        || closed.load(Ordering::SeqCst)
     {
-        if !replay_matches_requested_size(
-            replay,
-            requested_terminal_size,
-            restored.metadata.rows,
-            restored.metadata.cols,
-        ) || restored.bytes.is_empty()
-        {
-            return Ok(());
-        }
-        if closed.load(Ordering::SeqCst) {
-            return Ok(());
-        }
-        let frame = AttachStreamFrame::raw_output(restored.bytes);
-        write_attach_frame_locked(writer, &frame)?;
+        return Ok(());
     }
-    Ok(())
+    write_attach_frame_locked(writer, &AttachStreamFrame::raw_output(restored.bytes))
+}
+
+fn write_raw_replay_unavailable(
+    writer: &Arc<Mutex<UnixStream>>,
+    params: &WorkerAttachRequest,
+    reason: SnapshotUnavailableReason,
+    message: &str,
+) -> MillmuxResult<()> {
+    if params.client_accepts_frame_type(AttachFrameType::SnapshotUnavailable) {
+        return write_attach_frame_locked(
+            writer,
+            &AttachStreamFrame::SnapshotUnavailable {
+                reason,
+                details: Some(serde_json::json!({ "message": message })),
+            },
+        );
+    }
+    Err(MillmuxError::Internal(message.to_string()))
 }
 
 fn replay_matches_requested_size(
@@ -1144,7 +1575,6 @@ fn read_attach_input_loop(
     closed: Arc<AtomicBool>,
 ) {
     let mut reader = BufReader::new(stream);
-    let mut accepted_input_bytes = 0_usize;
     loop {
         let mut line = String::new();
         match reader.read_line(&mut line) {
@@ -1160,7 +1590,6 @@ fn read_attach_input_loop(
                     &params,
                     &input_sender,
                     &closed,
-                    &mut accepted_input_bytes,
                 ) {
                     break;
                 }
@@ -1180,6 +1609,9 @@ fn write_attach_input_loop(
     closed: Arc<AtomicBool>,
 ) {
     for command in input_receiver {
+        if closed.load(Ordering::SeqCst) {
+            break;
+        }
         let result = match command {
             AttachInputCommand::Input(bytes) => {
                 write_pty_bytes_cancellable(&runtime, &bytes, &closed)
@@ -1188,10 +1620,6 @@ fn write_attach_input_loop(
             AttachInputCommand::Resize { rows, cols } => {
                 resize_pty(&runtime, WorkerResizeRequest { rows, cols })
                     .map(|_| WorkerSendResponse { bytes_sent: 0 })
-            }
-            AttachInputCommand::Close => {
-                closed.store(true, Ordering::SeqCst);
-                break;
             }
         };
         if let Err(error) = result {
@@ -1207,8 +1635,10 @@ fn handle_attach_input_line(
     params: &WorkerAttachRequest,
     input_sender: &SyncSender<AttachInputCommand>,
     closed: &AtomicBool,
-    accepted_input_bytes: &mut usize,
 ) -> bool {
+    if closed.load(Ordering::SeqCst) {
+        return true;
+    }
     let frame = match AttachStreamFrame::from_json_line(line) {
         Ok(frame) => frame,
         Err(error) => {
@@ -1234,7 +1664,7 @@ fn handle_attach_input_line(
                 let _ = write_attach_error_locked(writer, error);
                 return false;
             }
-            if queue_attach_input_bytes(writer, input_sender, accepted_input_bytes, bytes) {
+            if queue_attach_input_bytes(writer, input_sender, closed, bytes) {
                 return true;
             }
             false
@@ -1248,8 +1678,7 @@ fn handle_attach_input_line(
                 let _ = write_attach_error_locked(writer, error);
                 return false;
             }
-            if queue_attach_input_bytes(writer, input_sender, accepted_input_bytes, data.into_vec())
-            {
+            if queue_attach_input_bytes(writer, input_sender, closed, data.into_vec()) {
                 return true;
             }
             false
@@ -1279,15 +1708,7 @@ fn handle_attach_input_line(
             }
             false
         }
-        AttachStreamFrame::Close => {
-            match input_sender.try_send(AttachInputCommand::Close) {
-                Ok(()) => {}
-                Err(TrySendError::Full(_)) | Err(TrySendError::Disconnected(_)) => {
-                    closed.store(true, Ordering::SeqCst);
-                }
-            }
-            true
-        }
+        AttachStreamFrame::Close => true,
         _ => false,
     }
 }
@@ -1328,7 +1749,7 @@ fn validate_raw_input_allowed(
 fn queue_attach_input_bytes(
     writer: &Arc<Mutex<UnixStream>>,
     input_sender: &SyncSender<AttachInputCommand>,
-    accepted_input_bytes: &mut usize,
+    closed: &AtomicBool,
     bytes: Vec<u8>,
 ) -> bool {
     let input_len = bytes.len();
@@ -1345,44 +1766,40 @@ fn queue_attach_input_bytes(
         );
         return false;
     }
-    if accepted_input_bytes.saturating_add(input_len) > ATTACH_INPUT_MAX_TOTAL_BYTES {
-        let _ = write_attach_error_locked(
-            writer,
-            ControlErrorBody::new(
-                ControlErrorCode::InvalidRequest,
-                format!(
-                    "attach input stream would exceed {} accepted bytes",
-                    ATTACH_INPUT_MAX_TOTAL_BYTES
-                ),
-            ),
-        );
-        return false;
-    }
-
-    match input_sender.try_send(AttachInputCommand::Input(bytes)) {
-        Ok(()) => {
-            *accepted_input_bytes += input_len;
-            false
-        }
-        Err(TrySendError::Full(_)) => {
-            let _ = write_attach_error_locked(
-                writer,
-                ControlErrorBody::new(
-                    ControlErrorCode::WorkerUnavailable,
-                    "attach input queue is full",
-                ),
-            );
-            false
-        }
-        Err(TrySendError::Disconnected(_)) => {
-            let _ = write_attach_error_locked(
-                writer,
-                ControlErrorBody::new(
-                    ControlErrorCode::WorkerUnavailable,
-                    "attach input writer is unavailable",
-                ),
-            );
-            true
+    let deadline = Instant::now() + ATTACH_INPUT_DRAIN_TIMEOUT;
+    let mut command = AttachInputCommand::Input(bytes);
+    loop {
+        match input_sender.try_send(command) {
+            Ok(()) => return false,
+            Err(TrySendError::Full(pending)) => {
+                command = pending;
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    closed.store(true, Ordering::SeqCst);
+                    let _ = write_attach_error_locked(
+                        writer,
+                        ControlErrorBody::new(
+                            ControlErrorCode::WorkerUnavailable,
+                            format!(
+                                "attach input queue did not drain within {}ms",
+                                ATTACH_INPUT_DRAIN_TIMEOUT.as_millis()
+                            ),
+                        ),
+                    );
+                    return true;
+                }
+                thread::sleep(remaining.min(ATTACH_STREAM_POLL));
+            }
+            Err(TrySendError::Disconnected(_)) => {
+                let _ = write_attach_error_locked(
+                    writer,
+                    ControlErrorBody::new(
+                        ControlErrorCode::WorkerUnavailable,
+                        "attach input writer is unavailable",
+                    ),
+                );
+                return true;
+            }
         }
     }
 }
@@ -1452,7 +1869,10 @@ fn core_error(error: MillmuxError) -> ControlErrorBody {
 
 #[cfg(test)]
 mod tests {
-    use std::io::{BufRead, BufReader};
+    use std::{
+        io::{BufRead, BufReader, Read},
+        os::fd::AsRawFd,
+    };
 
     use millrace_sessions_core::{
         ids::SessionId,
@@ -1461,7 +1881,7 @@ mod tests {
         state::{ProcessState, SpawnMode, WorkerMeta},
         storage::append_raw_pty_log,
     };
-    use portable_pty::{native_pty_system, PtySize};
+    use portable_pty::{native_pty_system, CommandBuilder, PtySize};
 
     use super::*;
 
@@ -1530,7 +1950,6 @@ mod tests {
             stream_id: "quiet".to_string(),
             sender,
             shutdown,
-            pending_lag_notice: Arc::new(Mutex::new(None)),
             accepted_frame_types: Vec::new(),
             dropped_bytes: 0,
             dropped_from_offset: None,
@@ -1538,6 +1957,7 @@ mod tests {
             current_pty_log_offset: 0,
             lag_pending: false,
             live_start_offset: 0,
+            snapshot_replay_pending: false,
         });
 
         state.release_attach("quiet");
@@ -1568,7 +1988,7 @@ mod tests {
     }
 
     #[test]
-    fn broadcast_output_records_lag_and_best_effort_notice_for_slow_observer() {
+    fn broadcast_output_delivers_one_lag_notice_for_one_dropped_interval() {
         let temp = tempfile::tempdir().unwrap();
         let state_paths = StatePaths::new(temp.path().join("state"));
         let session_id = SessionId::new();
@@ -1603,7 +2023,6 @@ mod tests {
             stream_id: "stream-slow".to_string(),
             sender,
             shutdown,
-            pending_lag_notice: Arc::new(Mutex::new(None)),
             accepted_frame_types: vec![AttachFrameType::StreamLagged],
             dropped_bytes: 0,
             dropped_from_offset: None,
@@ -1611,6 +2030,7 @@ mod tests {
             current_pty_log_offset: 0,
             lag_pending: false,
             live_start_offset: 0,
+            snapshot_replay_pending: false,
         });
         let handle = WorkerControlHandle {
             state: Arc::clone(&state),
@@ -1631,15 +2051,11 @@ mod tests {
 
         let _ = receiver.try_recv().expect("slow observer queue is full");
         handle.broadcast_output(b"z", 65, 66);
-        let messages = receiver.try_iter().collect::<Vec<_>>();
-        assert!(messages.iter().any(|message| {
-            matches!(
-                message,
-                AttachObserverMessage::Lag(notice)
-                    if notice.dropped_bytes > 0
-                        && notice.current_pty_log_offset >= notice.dropped_to_offset
-            )
-        }));
+        let notice = take_observer_lag_notice(&state, "stream-slow", 0)
+            .expect("dropped interval has one delivery owner");
+        assert!(notice.dropped_bytes > 0);
+        assert!(notice.current_pty_log_offset >= notice.dropped_to_offset);
+        assert!(take_observer_lag_notice(&state, "stream-slow", 0).is_none());
     }
 
     #[test]
@@ -1670,6 +2086,66 @@ mod tests {
             None,
             24,
             80
+        ));
+    }
+
+    #[test]
+    fn worker_raw_replay_uses_live_cutoff_and_reports_unavailable_coverage() {
+        let temp = tempfile::tempdir().unwrap();
+        let runtime = attach_test_runtime(&temp, 3, 20);
+        runtime
+            .terminal_state
+            .lock()
+            .unwrap()
+            .process_output(b"abc");
+        let mut params = raw_worker_attach_request("raw-live-replay", true);
+        params.initial_replay = Some(AttachInitialReplay::RawReplay);
+        params
+            .accepted_frame_types
+            .push(AttachFrameType::SnapshotUnavailable);
+        let closed = AtomicBool::new(false);
+        let (mut client, server) = UnixStream::pair().unwrap();
+        let writer = Arc::new(Mutex::new(server));
+
+        write_raw_initial_replay(
+            &writer,
+            &runtime,
+            &params,
+            AttachReplayMode::RawReplay,
+            None,
+            2,
+            &closed,
+        )
+        .unwrap();
+        let frame =
+            AttachStreamFrame::from_json_line(read_json_line_bytewise(&mut client).trim_end())
+                .unwrap();
+        assert!(matches!(
+            frame,
+            AttachStreamFrame::RawOutput { data } if data.as_slice() == b"ab"
+        ));
+
+        let (mut client, server) = UnixStream::pair().unwrap();
+        let writer = Arc::new(Mutex::new(server));
+        write_raw_initial_replay(
+            &writer,
+            &runtime,
+            &params,
+            AttachReplayMode::RawReplay,
+            None,
+            4,
+            &closed,
+        )
+        .unwrap();
+        let frame =
+            AttachStreamFrame::from_json_line(read_json_line_bytewise(&mut client).trim_end())
+                .unwrap();
+        assert!(matches!(
+            frame,
+            AttachStreamFrame::SnapshotUnavailable {
+                reason: SnapshotUnavailableReason::StaleSnapshot,
+                ..
+            }
         ));
     }
 
@@ -1707,6 +2183,7 @@ mod tests {
             child_pid: None,
             child_pgid: None,
             state: Arc::new(Mutex::new(ControlState::default())),
+            input_write_sync: Arc::new(InputWriteTestSync::default()),
         };
 
         assert!(!attach_resize_required(
@@ -1801,6 +2278,7 @@ mod tests {
             child_pid: None,
             child_pgid: None,
             state: Arc::new(Mutex::new(ControlState::default())),
+            input_write_sync: Arc::new(InputWriteTestSync::default()),
         });
         let (mut client, server) = UnixStream::pair().unwrap();
         let mut attach_request = raw_worker_attach_request("raw-observer", true);
@@ -1865,6 +2343,171 @@ mod tests {
                     && snapshot.cells[0][0].symbol == "r"
         ));
         assert!(!matches!(&frame, AttachStreamFrame::RawOutput { .. }));
+    }
+
+    #[test]
+    fn worker_snapshot_frontier_discards_covered_queue_without_false_lag() {
+        let temp = tempfile::tempdir().unwrap();
+        let runtime = attach_test_runtime(&temp, 3, 20);
+        let covered_offset = ATTACH_OBSERVER_QUEUE_CAPACITY as u64;
+        *runtime.terminal_state.lock().unwrap() =
+            TerminalStateBuffer::new(3, 20, 128, covered_offset);
+        runtime.input_write_sync.arm_snapshot_capture();
+        runtime.input_write_sync.arm_snapshot_reconciled();
+        let (mut client, server) = UnixStream::pair().unwrap();
+        let mut attach_request = raw_worker_attach_request("snapshot-boundary", true);
+        attach_request.requested_terminal_size = Some(TerminalDimensions { rows: 3, cols: 20 });
+        attach_request.initial_replay = Some(AttachInitialReplay::ScreenSnapshot);
+        attach_request.accepted_frame_types.extend([
+            AttachFrameType::ScreenSnapshot,
+            AttachFrameType::SnapshotUnavailable,
+        ]);
+        let request = WorkerControlRequest::with_params(
+            "observe-snapshot-boundary",
+            WorkerControlMethod::ObserveAttach,
+            &attach_request,
+        )
+        .unwrap();
+        client
+            .write_all(request.to_json_line().unwrap().as_bytes())
+            .unwrap();
+        let handler_runtime = Arc::clone(&runtime);
+        let handle = thread::spawn(move || handle_connection(server, handler_runtime));
+
+        let response = read_json_line_bytewise(&mut client);
+        assert!(
+            WorkerControlResponse::from_json_line(response.trim_end())
+                .unwrap()
+                .ok
+        );
+        runtime
+            .input_write_sync
+            .wait_for("snapshot capture", |state| state.snapshot_capture_waiting);
+
+        let control = WorkerControlHandle {
+            state: Arc::clone(&runtime.state),
+            paths: runtime.paths.clone(),
+        };
+        for index in 0..covered_offset {
+            control.broadcast_output(b"x", index, index + 1);
+        }
+        runtime.input_write_sync.release_snapshot_capture();
+
+        runtime
+            .input_write_sync
+            .wait_for("snapshot reconciliation", |state| {
+                state.snapshot_reconciled_waiting
+            });
+        runtime
+            .terminal_state
+            .lock()
+            .unwrap()
+            .process_output(b"live");
+        control.broadcast_output(b"live", covered_offset, covered_offset + 4);
+        runtime.input_write_sync.release_snapshot_reconciled();
+
+        let snapshot_frame =
+            AttachStreamFrame::from_json_line(read_json_line_bytewise(&mut client).trim_end())
+                .unwrap();
+        assert!(matches!(
+            snapshot_frame,
+            AttachStreamFrame::ScreenSnapshot { snapshot }
+                if snapshot.source.pty_log_offset == covered_offset
+        ));
+
+        let live_frame =
+            AttachStreamFrame::from_json_line(read_json_line_bytewise(&mut client).trim_end())
+                .unwrap();
+        assert!(matches!(
+            live_frame,
+            AttachStreamFrame::RawOutput { data } if data.as_slice() == b"live"
+        ));
+        assert!(!fs::read_to_string(&runtime.paths.events_jsonl)
+            .unwrap_or_default()
+            .contains("attach observer lagged"));
+
+        client
+            .write_all(AttachStreamFrame::Close.to_json_line().unwrap().as_bytes())
+            .unwrap();
+        handle.join().unwrap().unwrap();
+    }
+
+    #[test]
+    fn worker_snapshot_replay_sends_incomplete_parser_suffix_before_live_output() {
+        let temp = tempfile::tempdir().unwrap();
+        let runtime = attach_test_runtime(&temp, 3, 20);
+        runtime.terminal_state.lock().unwrap().process_output(b"e");
+        runtime
+            .terminal_state
+            .lock()
+            .unwrap()
+            .process_output(&"界".as_bytes()[..2]);
+        let (mut client, server) = UnixStream::pair().unwrap();
+        let mut attach_request = raw_worker_attach_request("snapshot-suffix", true);
+        attach_request.requested_terminal_size = Some(TerminalDimensions { rows: 3, cols: 20 });
+        attach_request.initial_replay = Some(AttachInitialReplay::ScreenSnapshot);
+        attach_request.accepted_frame_types.extend([
+            AttachFrameType::ScreenSnapshot,
+            AttachFrameType::SnapshotUnavailable,
+        ]);
+        let request = WorkerControlRequest::with_params(
+            "observe-snapshot-suffix",
+            WorkerControlMethod::ObserveAttach,
+            &attach_request,
+        )
+        .unwrap();
+        client
+            .write_all(request.to_json_line().unwrap().as_bytes())
+            .unwrap();
+        let handler_runtime = Arc::clone(&runtime);
+        let handle = thread::spawn(move || handle_connection(server, handler_runtime));
+
+        let response = read_json_line_bytewise(&mut client);
+        assert!(
+            WorkerControlResponse::from_json_line(response.trim_end())
+                .unwrap()
+                .ok
+        );
+        let snapshot_frame =
+            AttachStreamFrame::from_json_line(read_json_line_bytewise(&mut client).trim_end())
+                .unwrap();
+        assert!(matches!(
+            snapshot_frame,
+            AttachStreamFrame::ScreenSnapshot { snapshot }
+                if snapshot.source.pty_log_offset == 1
+        ));
+        let suffix_frame =
+            AttachStreamFrame::from_json_line(read_json_line_bytewise(&mut client).trim_end())
+                .unwrap();
+        assert!(matches!(
+            suffix_frame,
+            AttachStreamFrame::RawOutput { data }
+                if data.as_slice() == &"界".as_bytes()[..2]
+        ));
+
+        runtime
+            .terminal_state
+            .lock()
+            .unwrap()
+            .process_output(&"界".as_bytes()[2..]);
+        WorkerControlHandle {
+            state: Arc::clone(&runtime.state),
+            paths: runtime.paths.clone(),
+        }
+        .broadcast_output(&"界".as_bytes()[2..], 3, 4);
+        let live_frame =
+            AttachStreamFrame::from_json_line(read_json_line_bytewise(&mut client).trim_end())
+                .unwrap();
+        assert!(matches!(
+            live_frame,
+            AttachStreamFrame::RawOutput { data }
+                if data.as_slice() == &"界".as_bytes()[2..]
+        ));
+
+        client
+            .write_all(AttachStreamFrame::Close.to_json_line().unwrap().as_bytes())
+            .unwrap();
+        handle.join().unwrap().unwrap();
     }
 
     #[test]
@@ -1955,6 +2598,362 @@ mod tests {
         validate_raw_input_allowed(&state, &request).unwrap();
     }
 
+    #[test]
+    fn raw_input_queue_delivers_more_than_one_kibibyte_under_slow_progress() {
+        let (stream, _peer) = UnixStream::pair().unwrap();
+        let writer = Arc::new(Mutex::new(stream));
+        let (sender, receiver) = mpsc::sync_channel(1);
+        let closed = AtomicBool::new(false);
+        let payload = (0..4096)
+            .map(|index| (index % 251) as u8)
+            .collect::<Vec<_>>();
+        let expected = payload.clone();
+        let consumer = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(40));
+            let mut received = Vec::new();
+            for command in receiver {
+                if let AttachInputCommand::Input(bytes) = command {
+                    received.extend(bytes);
+                }
+            }
+            received
+        });
+
+        for chunk in payload.chunks(ATTACH_INPUT_MAX_BYTES) {
+            assert!(!queue_attach_input_bytes(
+                &writer,
+                &sender,
+                &closed,
+                chunk.to_vec()
+            ));
+        }
+        drop(sender);
+
+        assert_eq!(consumer.join().unwrap(), expected);
+        assert!(!closed.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn cancelled_writer_waiting_for_pty_mutex_allows_replacement_owner() {
+        let temp = tempfile::tempdir().unwrap();
+        let runtime = attach_test_runtime(&temp, 24, 80);
+        runtime
+            .state
+            .lock()
+            .unwrap()
+            .acquire_attach("blocked", false)
+            .unwrap();
+        let pty_writer = runtime.writer.lock().unwrap();
+        let closed = Arc::new(AtomicBool::new(false));
+        let write_runtime = Arc::clone(&runtime);
+        let write_closed = Arc::clone(&closed);
+        let (done_sender, done_receiver) = mpsc::channel();
+        let writer = thread::spawn(move || {
+            let result = write_pty_bytes_cancellable(&write_runtime, b"blocked", &write_closed);
+            done_sender.send(result).unwrap();
+        });
+
+        runtime
+            .input_write_sync
+            .wait_for("mutex contention", |state| state.waiting);
+        closed.store(true, Ordering::SeqCst);
+        assert_eq!(
+            done_receiver
+                .recv_timeout(Duration::from_millis(250))
+                .expect("cancelled mutex waiter exits promptly")
+                .unwrap(),
+            0
+        );
+        writer.join().unwrap();
+        runtime
+            .input_write_sync
+            .wait_for("completion", |state| state.completed);
+        drop(pty_writer);
+
+        let mut state = runtime.state.lock().unwrap();
+        state.release_attach("blocked");
+        assert!(
+            state
+                .acquire_attach("replacement", false)
+                .unwrap()
+                .input_owner
+        );
+    }
+
+    #[test]
+    fn initial_replay_write_failure_joins_input_before_authority_release() {
+        let temp = tempfile::tempdir().unwrap();
+        let runtime = attach_test_runtime(&temp, 100, 100);
+        let (mut client, server) = UnixStream::pair().unwrap();
+        set_socket_send_buffer(&server, 1024);
+        let mut attach_request = raw_worker_attach_request("replay-failure", false);
+        attach_request.requested_terminal_size = Some(TerminalDimensions {
+            rows: 100,
+            cols: 100,
+        });
+        attach_request.initial_replay = Some(AttachInitialReplay::ScreenSnapshot);
+        attach_request.accepted_frame_types.extend([
+            AttachFrameType::ScreenSnapshot,
+            AttachFrameType::SnapshotUnavailable,
+        ]);
+        let request = WorkerControlRequest::with_params(
+            "observe-replay-failure",
+            WorkerControlMethod::ObserveAttach,
+            &attach_request,
+        )
+        .unwrap();
+        client
+            .write_all(request.to_json_line().unwrap().as_bytes())
+            .unwrap();
+        let handler_runtime = Arc::clone(&runtime);
+        let handle = thread::spawn(move || handle_connection(server, handler_runtime));
+
+        let response = read_json_line_bytewise(&mut client);
+        assert!(
+            WorkerControlResponse::from_json_line(response.trim_end())
+                .unwrap()
+                .ok
+        );
+        let pty_writer = runtime.writer.lock().unwrap();
+        client
+            .write_all(
+                AttachStreamFrame::raw_input(b"queued".to_vec())
+                    .to_json_line()
+                    .unwrap()
+                    .as_bytes(),
+            )
+            .unwrap();
+        runtime
+            .input_write_sync
+            .wait_for("replay-failure mutex contention", |state| state.waiting);
+        client.shutdown(Shutdown::Read).unwrap();
+
+        assert!(handle.join().unwrap().is_err());
+        runtime
+            .input_write_sync
+            .wait_for("replay-failure completion", |state| state.completed);
+        assert!(runtime.state.lock().unwrap().input_owner.is_none());
+        assert!(
+            runtime
+                .state
+                .lock()
+                .unwrap()
+                .acquire_attach("replacement", false)
+                .unwrap()
+                .input_owner
+        );
+        drop(pty_writer);
+    }
+
+    #[test]
+    fn live_output_write_failure_joins_input_before_authority_release() {
+        let temp = tempfile::tempdir().unwrap();
+        let runtime = attach_test_runtime(&temp, 24, 80);
+        let (mut client, server) = UnixStream::pair().unwrap();
+        let attach_request = raw_worker_attach_request("output-failure", false);
+        let request = WorkerControlRequest::with_params(
+            "observe-output-failure",
+            WorkerControlMethod::ObserveAttach,
+            &attach_request,
+        )
+        .unwrap();
+        client
+            .write_all(request.to_json_line().unwrap().as_bytes())
+            .unwrap();
+        let handler_runtime = Arc::clone(&runtime);
+        let handle = thread::spawn(move || handle_connection(server, handler_runtime));
+
+        let response = read_json_line_bytewise(&mut client);
+        assert!(
+            WorkerControlResponse::from_json_line(response.trim_end())
+                .unwrap()
+                .ok
+        );
+        let pty_writer = runtime.writer.lock().unwrap();
+        client
+            .write_all(
+                AttachStreamFrame::raw_input(b"queued".to_vec())
+                    .to_json_line()
+                    .unwrap()
+                    .as_bytes(),
+            )
+            .unwrap();
+        runtime
+            .input_write_sync
+            .wait_for("output-failure mutex contention", |state| state.waiting);
+        client.shutdown(Shutdown::Read).unwrap();
+        WorkerControlHandle {
+            state: Arc::clone(&runtime.state),
+            paths: runtime.paths.clone(),
+        }
+        .broadcast_output(b"unread", 0, 6);
+
+        assert!(handle.join().unwrap().is_err());
+        runtime
+            .input_write_sync
+            .wait_for("output-failure completion", |state| state.completed);
+        assert!(runtime.state.lock().unwrap().input_owner.is_none());
+        assert!(
+            runtime
+                .state
+                .lock()
+                .unwrap()
+                .acquire_attach("replacement", false)
+                .unwrap()
+                .input_owner
+        );
+        drop(pty_writer);
+    }
+
+    #[test]
+    fn pty_nonblocking_guard_restores_master_flags() {
+        let pair = portable_pty::native_pty_system()
+            .openpty(PtySize {
+                rows: 24,
+                cols: 80,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
+            .unwrap();
+        let fd = pair.master.as_raw_fd().expect("native PTY master fd");
+        // SAFETY: fd is owned by pair.master for the duration of the test.
+        let original = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+        assert!(original >= 0);
+
+        {
+            let _guard = PtyNonblockingGuard::activate(fd).unwrap();
+            // SAFETY: fd remains owned by pair.master.
+            let active = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+            assert_ne!(active & libc::O_NONBLOCK, 0);
+        }
+
+        // SAFETY: fd remains owned by pair.master.
+        let restored = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+        assert_eq!(restored, original);
+    }
+
+    #[test]
+    fn cancelled_stalled_writer_skips_queued_resize_before_replacement_owner() {
+        let temp = tempfile::tempdir().unwrap();
+        let gate = temp.path().join("resume");
+        let output = temp.path().join("input.bin");
+        let pair = native_pty_system()
+            .openpty(PtySize {
+                rows: 24,
+                cols: 80,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
+            .unwrap();
+        let mut command = CommandBuilder::new("sh");
+        command.args([
+            "-c",
+            "stty raw -echo; while [ ! -e \"$GATE\" ]; do sleep 0.01; done; cat > \"$OUTPUT\"",
+        ]);
+        command.env("GATE", gate.as_os_str());
+        command.env("OUTPUT", output.as_os_str());
+        let mut child = pair.slave.spawn_command(command).unwrap();
+
+        let state_paths = StatePaths::new(temp.path().join("state"));
+        let session_paths = state_paths.session_paths(SessionId::new());
+        fs::create_dir_all(&session_paths.root).unwrap();
+        let runtime = Arc::new(ControlRuntime {
+            paths: session_paths,
+            writer: Arc::new(Mutex::new(Box::new(Vec::new()))),
+            master: Arc::new(Mutex::new(pair.master)),
+            terminal_state: Arc::new(Mutex::new(TerminalStateBuffer::new(24, 80, 128, 0))),
+            child_pid: None,
+            child_pgid: None,
+            state: Arc::new(Mutex::new(ControlState::default())),
+            input_write_sync: Arc::new(InputWriteTestSync::default()),
+        });
+        runtime
+            .state
+            .lock()
+            .unwrap()
+            .acquire_attach("stalled", false)
+            .unwrap();
+
+        let closed = Arc::new(AtomicBool::new(false));
+        let (sender, receiver) = mpsc::channel();
+        for _ in 0..512 {
+            sender
+                .send(AttachInputCommand::Input(vec![
+                    b'x';
+                    ATTACH_INPUT_MAX_BYTES
+                ]))
+                .unwrap();
+        }
+        sender
+            .send(AttachInputCommand::Resize { rows: 51, cols: 91 })
+            .unwrap();
+        let writer_runtime = Arc::clone(&runtime);
+        let writer_closed = Arc::clone(&closed);
+        let (done_sender, done_receiver) = mpsc::channel();
+        let writer = thread::spawn(move || {
+            write_attach_input_loop(
+                writer_runtime,
+                Arc::new(Mutex::new(UnixStream::pair().unwrap().0)),
+                receiver,
+                writer_closed,
+            );
+            done_sender.send(()).unwrap();
+        });
+
+        runtime
+            .input_write_sync
+            .wait_for("active PTY write", |state| state.active);
+        closed.store(true, Ordering::SeqCst);
+        drop(sender);
+        done_receiver
+            .recv_timeout(ATTACH_INPUT_DRAIN_TIMEOUT)
+            .expect("cancelled PTY writer exits within its drain bound");
+        writer.join().unwrap();
+        runtime
+            .input_write_sync
+            .wait_for("stalled-writer completion", |state| state.completed);
+        assert_eq!(runtime.master.lock().unwrap().get_size().unwrap().rows, 24);
+        assert_eq!(runtime.master.lock().unwrap().get_size().unwrap().cols, 80);
+
+        {
+            let mut state = runtime.state.lock().unwrap();
+            state.release_attach("stalled");
+            assert!(
+                state
+                    .acquire_attach("replacement", false)
+                    .unwrap()
+                    .input_owner
+            );
+        }
+        fs::write(&gate, b"resume").unwrap();
+        let replacement_closed = Arc::new(AtomicBool::new(false));
+        let (replacement_sender, replacement_receiver) = mpsc::channel();
+        replacement_sender
+            .send(AttachInputCommand::Input(vec![b'R']))
+            .unwrap();
+        drop(replacement_sender);
+        write_attach_input_loop(
+            Arc::clone(&runtime),
+            Arc::new(Mutex::new(UnixStream::pair().unwrap().0)),
+            replacement_receiver,
+            replacement_closed,
+        );
+
+        let deadline = Instant::now() + ATTACH_INPUT_DRAIN_TIMEOUT;
+        loop {
+            if fs::read(&output).is_ok_and(|bytes| bytes.contains(&b'R')) {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "replacement byte was not delivered"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+
     fn raw_worker_attach_request(stream_id: &str, read_only: bool) -> WorkerAttachRequest {
         WorkerAttachRequest {
             stream_id: stream_id.to_string(),
@@ -1968,5 +2967,80 @@ mod tests {
             stream_encoding: Some(AttachStreamEncoding::RawBytes),
             initial_replay: Some(AttachInitialReplay::None),
         }
+    }
+
+    fn attach_test_runtime(temp: &tempfile::TempDir, rows: u16, cols: u16) -> Arc<ControlRuntime> {
+        let state_paths = StatePaths::new(temp.path().join("state"));
+        let session_id = SessionId::new();
+        let session_paths = state_paths.session_paths(session_id);
+        fs::create_dir_all(&session_paths.root).unwrap();
+        write_json_atomic(
+            &session_paths.worker_json,
+            &WorkerMeta {
+                session_id,
+                pid: std::process::id(),
+                child_pid: None,
+                child_pgid: None,
+                spawn_mode: SpawnMode::Pty,
+                process_state: ProcessState::Running,
+                started_at: "2026-07-08T00:00:00Z".to_string(),
+                ended_at: None,
+                stop_requested_at: None,
+                stop_reason: None,
+                exit_code: None,
+                exit_signal: None,
+                attached_clients: 0,
+                input_owner: None,
+                updated_at: "2026-07-08T00:00:00Z".to_string(),
+            },
+        )
+        .unwrap();
+        Arc::new(ControlRuntime {
+            paths: session_paths,
+            writer: Arc::new(Mutex::new(Box::new(Vec::new()))),
+            master: Arc::new(Mutex::new(
+                native_pty_system()
+                    .openpty(PtySize {
+                        rows,
+                        cols,
+                        pixel_width: 0,
+                        pixel_height: 0,
+                    })
+                    .unwrap()
+                    .master,
+            )),
+            terminal_state: Arc::new(Mutex::new(TerminalStateBuffer::new(rows, cols, 128, 0))),
+            child_pid: None,
+            child_pgid: None,
+            state: Arc::new(Mutex::new(ControlState::default())),
+            input_write_sync: Arc::new(InputWriteTestSync::default()),
+        })
+    }
+
+    fn read_json_line_bytewise(stream: &mut UnixStream) -> String {
+        let mut bytes = Vec::new();
+        let mut byte = [0_u8; 1];
+        loop {
+            stream.read_exact(&mut byte).unwrap();
+            bytes.push(byte[0]);
+            if byte[0] == b'\n' {
+                return String::from_utf8(bytes).unwrap();
+            }
+        }
+    }
+
+    fn set_socket_send_buffer(stream: &UnixStream, bytes: libc::c_int) {
+        let value = bytes;
+        // SAFETY: value points to one initialized integer for this socket option call.
+        let result = unsafe {
+            libc::setsockopt(
+                stream.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_SNDBUF,
+                (&value as *const libc::c_int).cast::<libc::c_void>(),
+                std::mem::size_of_val(&value) as libc::socklen_t,
+            )
+        };
+        assert_eq!(result, 0, "failed to constrain worker socket send buffer");
     }
 }

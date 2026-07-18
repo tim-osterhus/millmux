@@ -1,21 +1,21 @@
 use std::{
     collections::BTreeMap,
     env,
-    io::{self, IsTerminal, Stdout, Write},
+    fs::{File, OpenOptions},
+    io::{self, IsTerminal, Write},
+    os::{fd::AsRawFd, unix::fs::OpenOptionsExt},
     path::{Path, PathBuf},
+    sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
 
 use crossterm::{
-    cursor::MoveTo,
+    cursor::{Hide, Show},
     event::{
         self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEvent, KeyModifiers,
     },
-    execute,
-    terminal::{
-        disable_raw_mode, enable_raw_mode, Clear, ClearType, EnterAlternateScreen,
-        LeaveAlternateScreen,
-    },
+    terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
+    Command, QueueableCommand,
 };
 use millrace_sessions_core::{
     error::MillmuxError,
@@ -25,12 +25,13 @@ use millrace_sessions_core::{
     protocol::{
         AttachFrameType, AttachInitialReplay, AttachReplayMode, AttachStreamEncoding,
         AttachStreamFrame, AttentionReadRequest, ControlErrorCode, SessionAttachRequest,
-        SessionListRequest, SessionLogsRequest, SessionSelector, SessionStartRequest,
-        TerminalDimensions, UiContextGetRequest, UiContextSetRequest, M2_ATTACH_PROTOCOL_VERSION,
+        SessionInspectRequest, SessionListRequest, SessionLogsRequest, SessionSelector,
+        SessionStartRequest, SessionSummary, TerminalDimensions, UiContextGetRequest,
+        UiContextSetRequest, M2_ATTACH_PROTOCOL_VERSION,
     },
     state::{
-        AttentionKind, MonitorProfile, ProcessState, SessionRole, SpawnMode, UiContext, UiEvent,
-        UiEventKind,
+        AttentionKind, LivenessState, MonitorProfile, ProcessState, SessionRole, SpawnMode,
+        UiContext, UiEvent, UiEventKind, WorkerMeta,
     },
 };
 use millrace_sessions_tui::{
@@ -42,7 +43,12 @@ use ratatui::{backend::CrosstermBackend, Terminal};
 use thiserror::Error;
 
 use crate::{
-    client::{AttachConnection, ClientError, SessionControlClient},
+    attach::{
+        close_attach_stream, close_attach_stream_without_output, managed_output_write_timeout,
+        prepare_managed_raw_attach, record_managed_raw_test_phase, AttachError,
+        ManagedRawAttachEvent, ManagedRawAttachExit,
+    },
+    client::{AttachConnection, AttachReader, AttachWriter, ClientError, SessionControlClient},
     commands::{CockpitArgs, CommandError},
     launch_env::{current_launch_env, merge_current_launch_env, resolve_argv_executable},
     output::render_log_line_text,
@@ -55,10 +61,12 @@ const REFRESH_INTERVAL: Duration = Duration::from_millis(300);
 const REDRAW_INTERVAL: Duration = Duration::from_millis(33);
 const ATTACH_POLL_INTERVAL: Duration = Duration::from_millis(5);
 const ATTACH_DRAIN_INTERVAL: Duration = Duration::from_millis(1);
+const MAX_ATTACH_INPUT_FRAME_BYTES: usize = 512;
 const SNAPSHOT_SEED_TIMEOUT: Duration = Duration::from_millis(3_000);
 const SNAPSHOT_SEED_FRAME_WAIT: Duration = Duration::from_millis(1_000);
 const SNAPSHOT_SEED_OUTPUT_QUIET: Duration = Duration::from_millis(75);
 const SNAPSHOT_SEED_RETRY_INTERVAL: Duration = Duration::from_millis(25);
+const RAW_REPLAY_ATTEMPTS: usize = 3;
 const TERMINAL_SCROLLBACK: usize = 4000;
 const CONTEXT_FILE_ENV: &str = "MILLMUX_CONTEXT_FILE";
 const AGENT_SESSION_ID_ENV: &str = "MILLMUX_AGENT_SESSION_ID";
@@ -230,14 +238,15 @@ async fn load_prior_ui_context(
 async fn discover_daemons(
     client: &SessionControlClient,
 ) -> Result<Vec<millrace_sessions_core::protocol::SessionSummary>, CockpitError> {
-    Ok(client
+    let sessions = client
         .list(&SessionListRequest {
             role: Some(SessionRole::MillraceDaemon),
             workspace: None,
             include_archived: false,
         })
         .await?
-        .sessions)
+        .sessions;
+    Ok(sessions)
 }
 
 async fn discover_workspace_sessions(
@@ -254,7 +263,7 @@ async fn discover_workspace_sessions(
         .sessions
         .into_iter()
         .filter(|session| session_scoped_to_workspace(session, workspace))
-        .collect();
+        .collect::<Vec<_>>();
     Ok(sessions)
 }
 
@@ -421,8 +430,9 @@ async fn seed_agent_terminal_from_attach(
     let (rows, cols) = (24, 80);
     let mut emulator = TerminalEmulator::new(rows, cols, TERMINAL_SCROLLBACK);
     let deadline = Instant::now() + SNAPSHOT_SEED_TIMEOUT;
-    while Instant::now() < deadline && !agent_terminal_seeded(app) {
-        let Some(connection) = open_seed_agent_attach(client, agent_session_id, deadline).await?
+    while Instant::now() < deadline {
+        let Some(connection) =
+            open_seed_agent_attach(client, agent_session_id, rows, cols, deadline).await?
         else {
             return Ok(());
         };
@@ -446,12 +456,24 @@ async fn drain_seed_agent_attach(
 ) -> Result<bool, CockpitError> {
     let (_, mut reader, mut writer) = connection.split();
     let mut last_frame_at = None;
+    let mut snapshot_suffix_pending = false;
 
     while Instant::now() < deadline {
         let remaining = deadline.saturating_duration_since(Instant::now());
-        let wait = seed_frame_wait(app, last_frame_at).min(remaining);
+        let ready = agent_terminal_seeded(app, snapshot_suffix_pending);
+        let wait = seed_frame_wait(ready, last_frame_at).min(remaining);
         match tokio::time::timeout(wait, reader.next_frame()).await {
             Ok(Ok(Some(frame))) => {
+                match &frame {
+                    AttachStreamFrame::ScreenSnapshot { snapshot } => {
+                        snapshot_suffix_pending =
+                            snapshot.source.pty_log_offset < snapshot.source.raw_replay_end_offset;
+                    }
+                    AttachStreamFrame::RawOutput { .. } if snapshot_suffix_pending => {
+                        snapshot_suffix_pending = false;
+                    }
+                    _ => {}
+                }
                 if !apply_agent_attach_frame(frame, emulator, app) {
                     break;
                 }
@@ -467,11 +489,11 @@ async fn drain_seed_agent_attach(
     }
 
     let _ = writer.write_frame(&AttachStreamFrame::Close).await;
-    Ok(agent_terminal_seeded(app))
+    Ok(agent_terminal_seeded(app, snapshot_suffix_pending))
 }
 
-fn seed_frame_wait(app: &AppModel, last_frame_at: Option<Instant>) -> Duration {
-    if agent_terminal_seeded(app) {
+fn seed_frame_wait(ready: bool, last_frame_at: Option<Instant>) -> Duration {
+    if ready {
         let Some(last_frame_at) = last_frame_at else {
             return Duration::ZERO;
         };
@@ -482,21 +504,33 @@ fn seed_frame_wait(app: &AppModel, last_frame_at: Option<Instant>) -> Duration {
     SNAPSHOT_SEED_FRAME_WAIT
 }
 
-fn agent_terminal_seeded(app: &AppModel) -> bool {
-    app.agent_terminal
-        .as_ref()
-        .is_some_and(|terminal| !terminal.initializing)
+fn agent_terminal_seeded(app: &AppModel, snapshot_suffix_pending: bool) -> bool {
+    !snapshot_suffix_pending
+        && app.agent_terminal.as_ref().is_some_and(|terminal| {
+            !terminal.initializing
+                && terminal
+                    .snapshot
+                    .cells
+                    .iter()
+                    .flatten()
+                    .any(|cell| cell.occupied)
+        })
 }
 
 async fn open_seed_agent_attach(
     client: &SessionControlClient,
     session_id: SessionId,
+    rows: u16,
+    cols: u16,
     deadline: Instant,
 ) -> Result<Option<AttachConnection>, CockpitError> {
     loop {
-        match client
-            .attach(&agent_raw_replay_attach_request(session_id, true))
-            .await
+        match attach_before_deadline(
+            client,
+            &agent_attach_request(session_id, true, rows, cols),
+            deadline,
+        )
+        .await
         {
             Ok(connection) => return Ok(Some(connection)),
             Err(ClientError::Control(error))
@@ -562,8 +596,12 @@ async fn run_interactive_cockpit(
     let Some(mut attached_session_id) = app.active_attach_session_id() else {
         return Err(CockpitError::NoAgentFound);
     };
-    let mut terminal = TerminalSession::enter()?;
-    let size = terminal.terminal.size()?;
+    let terminal = Arc::new(Mutex::new(TerminalSession::enter()?));
+    let size = terminal
+        .lock()
+        .expect("cockpit terminal lock poisoned")
+        .terminal
+        .size()?;
     let (rows, cols) = app
         .agent_terminal_size_for(size.width, size.height)
         .unwrap_or((16, 72));
@@ -575,7 +613,11 @@ async fn run_interactive_cockpit(
     let mut last_refresh = Instant::now();
     let mut redraw = RedrawGate::new(Instant::now());
     let mut last_size = (rows, cols);
-    terminal.terminal.draw(|frame| render_app(frame, &app))?;
+    terminal
+        .lock()
+        .expect("cockpit terminal lock poisoned")
+        .terminal
+        .draw(|frame| render_app(frame, &app))?;
 
     loop {
         match tokio::time::timeout(ATTACH_POLL_INTERVAL, attach.reader.next_frame()).await {
@@ -609,7 +651,14 @@ async fn run_interactive_cockpit(
             }
             Ok(Ok(None)) => {
                 app.set_host_reconnecting(1, "agent attach stream closed");
-                match reopen_agent_attach(&client, attached_session_id, last_size, &mut app).await {
+                match reopen_agent_preview_after_loss(
+                    &client,
+                    attached_session_id,
+                    last_size,
+                    &mut app,
+                )
+                .await
+                {
                     Ok(new_attach) => {
                         attach = new_attach;
                         app.set_host_connected();
@@ -624,7 +673,14 @@ async fn run_interactive_cockpit(
             }
             Ok(Err(error)) => {
                 app.set_host_reconnecting(1, error.to_string());
-                match reopen_agent_attach(&client, attached_session_id, last_size, &mut app).await {
+                match reopen_agent_preview_after_loss(
+                    &client,
+                    attached_session_id,
+                    last_size,
+                    &mut app,
+                )
+                .await
+                {
                     Ok(new_attach) => {
                         attach = new_attach;
                         app.set_host_connected();
@@ -640,13 +696,14 @@ async fn run_interactive_cockpit(
             Err(_) => {}
         }
 
+        let mut key_action_completed = false;
         if event::poll(redraw.event_wait())? {
             match event::read()? {
                 Event::Key(event) => {
                     let should_exit = handle_cockpit_key(
                         &client,
                         &mut app,
-                        &mut terminal,
+                        &terminal,
                         CockpitAttachState {
                             attach: &mut attach,
                             emulator: &mut emulator,
@@ -660,6 +717,7 @@ async fn run_interactive_cockpit(
                     if should_exit {
                         break;
                     }
+                    key_action_completed = true;
                 }
                 Event::Paste(text) => {
                     handle_cockpit_paste(&client, &mut app, &mut attach, attached_session_id, text)
@@ -669,7 +727,7 @@ async fn run_interactive_cockpit(
                 Event::Resize(_, _) => {
                     let resized = sync_agent_geometry_from_terminal(
                         &mut app,
-                        &mut terminal,
+                        &terminal,
                         &mut attach,
                         &mut emulator,
                         &mut last_size,
@@ -683,12 +741,16 @@ async fn run_interactive_cockpit(
             }
         }
 
+        if key_action_completed {
+            draw_cockpit_if_due(&terminal, &app, &mut redraw)?;
+        }
+
         if last_refresh.elapsed() >= REFRESH_INTERVAL {
             refresh_daemon_sessions(&client, &mut app).await?;
             refresh_logs(&client, &mut app).await?;
             if sync_agent_geometry_from_terminal(
                 &mut app,
-                &mut terminal,
+                &terminal,
                 &mut attach,
                 &mut emulator,
                 &mut last_size,
@@ -701,14 +763,11 @@ async fn run_interactive_cockpit(
             redraw.mark_dirty();
         }
 
-        let now = Instant::now();
-        if redraw.should_draw(now) {
-            terminal.terminal.draw(|frame| render_app(frame, &app))?;
-            redraw.mark_drawn(now);
-        }
+        draw_cockpit_if_due(&terminal, &app, &mut redraw)?;
     }
 
     let _ = attach.writer.write_frame(&AttachStreamFrame::Close).await;
+    record_managed_raw_test_phase("preview_close_sent");
     record_ui_event(
         &client,
         &app,
@@ -735,7 +794,7 @@ async fn open_agent_attach(
 ) -> Result<OpenedAgentAttach, CockpitError> {
     let deadline = Instant::now() + SNAPSHOT_SEED_TIMEOUT;
     loop {
-        match try_open_agent_attach(client, session_id, rows, cols).await {
+        match try_open_agent_attach(client, session_id, rows, cols, deadline).await {
             Ok(attach) => return Ok(attach),
             Err(error) if should_retry_agent_attach(&error, deadline) => {
                 tokio::time::sleep(SNAPSHOT_SEED_RETRY_INTERVAL).await;
@@ -750,14 +809,18 @@ async fn try_open_agent_attach(
     session_id: SessionId,
     rows: u16,
     cols: u16,
+    deadline: Instant,
 ) -> Result<OpenedAgentAttach, ClientError> {
     let request = agent_attach_request(session_id, false, rows, cols);
-    match client.attach(&request).await {
+    match attach_before_deadline(client, &request, deadline).await {
         Ok(connection) => Ok(opened_agent_attach(connection, false)),
         Err(ClientError::Control(error)) if error.code == ControlErrorCode::InputOwnerConflict => {
-            let connection = client
-                .attach(&agent_attach_request(session_id, true, rows, cols))
-                .await?;
+            let connection = attach_before_deadline(
+                client,
+                &agent_attach_request(session_id, true, rows, cols),
+                deadline,
+            )
+            .await?;
             Ok(opened_agent_attach(connection, true))
         }
         Err(error) => Err(error),
@@ -770,26 +833,62 @@ fn agent_attach_request(
     rows: u16,
     cols: u16,
 ) -> SessionAttachRequest {
+    agent_attach_request_with_replay(
+        session_id,
+        read_only,
+        rows,
+        cols,
+        AttachReplayMode::TerminalSnapshot,
+    )
+}
+
+fn agent_attach_request_with_replay(
+    session_id: SessionId,
+    read_only: bool,
+    rows: u16,
+    cols: u16,
+    replay: AttachReplayMode,
+) -> SessionAttachRequest {
+    let mut accepted_frame_types = vec![
+        AttachFrameType::RawOutput,
+        AttachFrameType::StreamLagged,
+        AttachFrameType::SnapshotUnavailable,
+        AttachFrameType::ScreenSnapshot,
+    ];
+    if !read_only {
+        accepted_frame_types.insert(1, AttachFrameType::RawInput);
+    }
     SessionAttachRequest {
         selector: SessionSelector::Id { session_id },
         read_only,
-        replay: AttachReplayMode::TerminalSnapshot,
+        replay,
         requested_terminal_size: Some(TerminalDimensions::new(rows, cols)),
-        client_protocol_version: None,
-        accepted_frame_types: Vec::new(),
-        stream_encoding: None,
-        initial_replay: None,
+        client_protocol_version: Some(M2_ATTACH_PROTOCOL_VERSION),
+        accepted_frame_types,
+        stream_encoding: Some(AttachStreamEncoding::RawBytes),
+        initial_replay: Some(match replay {
+            AttachReplayMode::None => AttachInitialReplay::None,
+            AttachReplayMode::TerminalSnapshot => AttachInitialReplay::ScreenSnapshot,
+            AttachReplayMode::LineScrollback | AttachReplayMode::RawReplay => {
+                AttachInitialReplay::RawReplay
+            }
+        }),
     }
 }
 
-fn agent_raw_replay_attach_request(session_id: SessionId, read_only: bool) -> SessionAttachRequest {
+fn managed_raw_attach_request(session_id: SessionId, rows: u16, cols: u16) -> SessionAttachRequest {
     SessionAttachRequest {
         selector: SessionSelector::Id { session_id },
-        read_only,
+        read_only: false,
         replay: AttachReplayMode::RawReplay,
-        requested_terminal_size: None,
+        requested_terminal_size: Some(TerminalDimensions::new(rows, cols)),
         client_protocol_version: Some(M2_ATTACH_PROTOCOL_VERSION),
-        accepted_frame_types: vec![AttachFrameType::RawOutput],
+        accepted_frame_types: vec![
+            AttachFrameType::RawOutput,
+            AttachFrameType::RawInput,
+            AttachFrameType::StreamLagged,
+            AttachFrameType::SnapshotUnavailable,
+        ],
         stream_encoding: Some(AttachStreamEncoding::RawBytes),
         initial_replay: Some(AttachInitialReplay::RawReplay),
     }
@@ -807,13 +906,511 @@ async fn reopen_agent_attach(
     Ok(attach)
 }
 
+async fn reopen_agent_attach_with_snapshot(
+    client: &SessionControlClient,
+    session_id: SessionId,
+    rows: u16,
+    cols: u16,
+    emulator: &mut TerminalEmulator,
+    deadline: Instant,
+    interrupt: &mut tokio::signal::unix::Signal,
+) -> Result<OpenedAgentAttach, CockpitError> {
+    let request = agent_attach_request(session_id, false, rows, cols);
+    for attempt in 0..RAW_REPLAY_ATTEMPTS {
+        let connection =
+            open_exclusive_attach_interruptible(client, &request, deadline, interrupt).await?;
+        let mut attach = opened_agent_attach(connection, false);
+        let frame = await_managed_transition(
+            async {
+                #[cfg(debug_assertions)]
+                if env::var_os("MILLMUX_TEST_MANAGED_RAW_RETURN_PREVIEW_STALL").is_some() {
+                    record_managed_raw_test_phase("return_preview_recovery_waiting");
+                    std::future::pending::<()>().await;
+                }
+                attach
+                    .reader
+                    .next_frame()
+                    .await
+                    .map_err(|error| error.to_string())
+            },
+            deadline,
+            interrupt,
+            "return preview recovery",
+        )
+        .await
+        .map_err(CockpitError::Transition)?
+        .ok_or_else(|| {
+            CockpitError::Transition(
+                "return preview closed before its terminal snapshot".to_string(),
+            )
+        })?;
+        #[cfg(debug_assertions)]
+        let frame = if env::var_os("MILLMUX_TEST_MANAGED_RAW_SNAPSHOT_UNAVAILABLE").is_some() {
+            AttachStreamFrame::SnapshotUnavailable {
+                reason: millrace_sessions_core::protocol::SnapshotUnavailableReason::StaleSnapshot,
+                details: None,
+            }
+        } else {
+            frame
+        };
+
+        match frame {
+            AttachStreamFrame::ScreenSnapshot { snapshot } => {
+                snapshot.validate_for_wire().map_err(|error| {
+                    CockpitError::Transition(format!(
+                        "return preview supplied an invalid terminal snapshot: {error:?}"
+                    ))
+                })?;
+                if snapshot.rows != rows || snapshot.cols != cols {
+                    close_attach_stream_interruptible(
+                        &mut attach.reader,
+                        &mut attach.writer,
+                        deadline,
+                        interrupt,
+                        "mismatched return preview close",
+                    )
+                    .await?;
+                    if attempt + 1 < RAW_REPLAY_ATTEMPTS {
+                        wait_for_attach_retry(interrupt, deadline).await?;
+                        continue;
+                    }
+                    return Err(CockpitError::Transition(format!(
+                        "return preview snapshot size {}x{} did not match {}x{}",
+                        snapshot.rows, snapshot.cols, rows, cols
+                    )));
+                }
+                emulator.adopt_screen_snapshot(&snapshot);
+                return Ok(attach);
+            }
+            AttachStreamFrame::SnapshotUnavailable { reason, .. } => {
+                close_attach_stream_interruptible(
+                    &mut attach.reader,
+                    &mut attach.writer,
+                    deadline,
+                    interrupt,
+                    "unavailable return preview close",
+                )
+                .await?;
+                if attempt + 1 < RAW_REPLAY_ATTEMPTS {
+                    wait_for_attach_retry(interrupt, deadline).await?;
+                    continue;
+                }
+                return Err(CockpitError::Transition(format!(
+                    "return preview terminal snapshot is unavailable: {reason:?}"
+                )));
+            }
+            AttachStreamFrame::StreamLagged { .. } => {
+                let _ = attach.writer.shutdown().await;
+                return Err(CockpitError::Transition(
+                    "return preview lagged before its terminal snapshot".to_string(),
+                ));
+            }
+            frame => {
+                let _ = attach.writer.shutdown().await;
+                return Err(CockpitError::Transition(format!(
+                    "return preview supplied an incompatible initial frame: {frame:?}"
+                )));
+            }
+        }
+    }
+    unreachable!("snapshot retry loop returns on its final attempt")
+}
+
+async fn close_attach_stream_interruptible(
+    reader: &mut AttachReader,
+    writer: &mut AttachWriter,
+    deadline: Instant,
+    interrupt: &mut tokio::signal::unix::Signal,
+    stage: &str,
+) -> Result<(), CockpitError> {
+    await_managed_transition(
+        async {
+            close_attach_stream_without_output(reader, writer)
+                .await
+                .map_err(|error| error.to_string())
+        },
+        deadline,
+        interrupt,
+        stage,
+    )
+    .await
+    .map_err(CockpitError::Transition)
+}
+
+fn raw_replay_retry_allowed(attempt: usize, error: &AttachError) -> bool {
+    attempt + 1 < RAW_REPLAY_ATTEMPTS && matches!(error, AttachError::SnapshotUnavailable(_))
+}
+
+fn spawn_managed_raw_waiter(
+    operation: &crate::attach::ManagedRawAttachOperation,
+) -> tokio::task::JoinHandle<Result<ManagedRawAttachExit, AttachError>> {
+    let waiter = operation.waiter();
+    tokio::spawn(async move {
+        let mut interrupt =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
+        waiter.run(&mut interrupt).await
+    })
+}
+
+async fn run_managed_raw_attach_with_replay_retry(
+    client: SessionControlClient,
+    request: SessionAttachRequest,
+    deadline: Instant,
+    terminal_cleanup: Arc<Mutex<Option<tokio::sync::oneshot::Receiver<()>>>>,
+) -> Result<ManagedRawAttachExit, AttachError> {
+    let mut interrupt = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
+    for attempt in 0..RAW_REPLAY_ATTEMPTS {
+        let connection =
+            open_exclusive_attach_interruptible(&client, &request, deadline, &mut interrupt)
+                .await?;
+        let mut operation = prepare_managed_raw_attach(connection, &request).await?;
+        *terminal_cleanup
+            .lock()
+            .expect("managed terminal cleanup lock poisoned") =
+            Some(operation.take_terminal_cleanup_receiver());
+        let caller = spawn_managed_raw_waiter(&operation);
+        let result = match caller.await {
+            Ok(result) => result,
+            Err(error) if error.is_panic() => {
+                let cleanup = operation.cancel_and_join().await;
+                drop(operation);
+                cleanup?;
+                std::panic::resume_unwind(error.into_panic());
+            }
+            Err(error) => {
+                let cleanup = operation.cancel_and_join().await;
+                cleanup?;
+                Err(AttachError::Stream(format!(
+                    "managed raw caller task failed: {error}"
+                )))
+            }
+        };
+        drop(operation);
+        if let Err(error) = &result {
+            if raw_replay_retry_allowed(attempt, error) {
+                wait_for_attach_retry(&mut interrupt, deadline).await?;
+                continue;
+            }
+        }
+        return result;
+    }
+    unreachable!("managed raw retry loop returns on its final attempt")
+}
+
+struct ManagedRawTransitionOutcome {
+    result: Result<ManagedRawAttachExit, AttachError>,
+    resume: Result<(), CockpitError>,
+}
+
+struct SuspendedManagedRawTransition {
+    body_abort: tokio::task::AbortHandle,
+    cleanup_owner: Option<tokio::task::JoinHandle<ManagedRawTransitionOutcome>>,
+}
+
+impl SuspendedManagedRawTransition {
+    fn spawn(
+        suspension: TerminalSuspension,
+        client: SessionControlClient,
+        request: SessionAttachRequest,
+        deadline: Instant,
+    ) -> Self {
+        let terminal_cleanup = Arc::new(Mutex::new(None));
+        let body_cleanup = Arc::clone(&terminal_cleanup);
+        let body = tokio::spawn(async move {
+            run_managed_raw_attach_with_replay_retry(client, request, deadline, body_cleanup).await
+        });
+        let body_abort = body.abort_handle();
+        let cleanup_owner = tokio::spawn(async move {
+            let joined = body.await;
+            let terminal_cleanup = terminal_cleanup
+                .lock()
+                .expect("managed terminal cleanup lock poisoned")
+                .take();
+            if let Some(terminal_cleanup) = terminal_cleanup {
+                let _ = terminal_cleanup.await;
+            }
+            record_managed_raw_test_phase("terminal_resume_started");
+            let resume = suspension.resume();
+            record_managed_raw_test_phase("terminal_resume_complete");
+            let result = match joined {
+                Ok(result) => result,
+                Err(error) if error.is_cancelled() => Err(AttachError::Cancelled),
+                Err(error) if error.is_panic() => std::panic::resume_unwind(error.into_panic()),
+                Err(error) => Err(AttachError::Stream(format!(
+                    "managed raw transition task failed: {error}"
+                ))),
+            };
+            ManagedRawTransitionOutcome { result, resume }
+        });
+        Self {
+            body_abort,
+            cleanup_owner: Some(cleanup_owner),
+        }
+    }
+
+    async fn join(&mut self) -> ManagedRawTransitionOutcome {
+        let joined = self
+            .cleanup_owner
+            .take()
+            .expect("managed transition cleanup owner already joined")
+            .await;
+        match joined {
+            Ok(outcome) => outcome,
+            Err(error) if error.is_panic() => std::panic::resume_unwind(error.into_panic()),
+            Err(error) => ManagedRawTransitionOutcome {
+                result: Err(AttachError::Stream(format!(
+                    "managed raw cleanup owner failed: {error}"
+                ))),
+                resume: Err(CockpitError::Transition(
+                    "managed raw cleanup owner could not restore the terminal".to_string(),
+                )),
+            },
+        }
+    }
+}
+
+impl Drop for SuspendedManagedRawTransition {
+    fn drop(&mut self) {
+        self.body_abort.abort();
+    }
+}
+
+#[cfg(debug_assertions)]
+async fn wait_for_managed_raw_test_phase(phase: &str, deadline: Instant) -> bool {
+    let Some(path) = env::var_os("MILLMUX_TEST_MANAGED_RAW_PHASE_FILE") else {
+        return false;
+    };
+    while Instant::now() < deadline {
+        if std::fs::read_to_string(&path)
+            .is_ok_and(|contents| contents.lines().any(|line| line == phase))
+        {
+            return true;
+        }
+        tokio::time::sleep(ATTACH_DRAIN_INTERVAL).await;
+    }
+    false
+}
+
+async fn attach_before_deadline(
+    client: &SessionControlClient,
+    request: &SessionAttachRequest,
+    deadline: Instant,
+) -> Result<AttachConnection, ClientError> {
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    if remaining.is_zero() {
+        return Err(attach_response_timeout());
+    }
+    tokio::time::timeout(remaining, client.attach(request))
+        .await
+        .map_err(|_| attach_response_timeout())?
+}
+
+async fn open_exclusive_attach_interruptible(
+    client: &SessionControlClient,
+    request: &SessionAttachRequest,
+    deadline: Instant,
+    interrupt: &mut tokio::signal::unix::Signal,
+) -> Result<AttachConnection, AttachError> {
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(AttachError::Client(attach_response_timeout()));
+        }
+        let attempt = async {
+            #[cfg(debug_assertions)]
+            if env::var_os("MILLMUX_TEST_MANAGED_RAW_ATTACH_RESPONSE_STALL").is_some() {
+                env::remove_var("MILLMUX_TEST_MANAGED_RAW_ATTACH_RESPONSE_STALL");
+                record_managed_raw_test_phase("raw_attach_negotiation_waiting");
+                std::future::pending::<()>().await;
+            }
+            client.attach(request).await
+        };
+        let result = tokio::select! {
+            signal = interrupt.recv() => {
+                return if signal.is_some() {
+                    Err(AttachError::Cancelled)
+                } else {
+                    Err(AttachError::Stream("SIGINT listener closed".to_string()))
+                };
+            }
+            result = tokio::time::timeout(remaining, attempt) => {
+                result.map_err(|_| AttachError::Client(attach_response_timeout()))?
+            }
+        };
+        match result {
+            Ok(connection) if connection.result.stream.input_owner => return Ok(connection),
+            Ok(_) => {
+                return Err(AttachError::Client(ClientError::Protocol(
+                    "exclusive attach negotiation did not grant input ownership".to_string(),
+                )));
+            }
+            Err(ClientError::Control(error))
+                if error.code == ControlErrorCode::InputOwnerConflict
+                    && Instant::now() < deadline =>
+            {
+                wait_for_attach_retry(interrupt, deadline).await?;
+            }
+            Err(error) => return Err(AttachError::Client(error)),
+        }
+    }
+}
+
+async fn wait_for_attach_retry(
+    interrupt: &mut tokio::signal::unix::Signal,
+    deadline: Instant,
+) -> Result<(), AttachError> {
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    if remaining.is_zero() {
+        return Err(AttachError::Client(attach_response_timeout()));
+    }
+    tokio::select! {
+        signal = interrupt.recv() => {
+            if signal.is_some() {
+                Err(AttachError::Cancelled)
+            } else {
+                Err(AttachError::Stream("SIGINT listener closed".to_string()))
+            }
+        }
+        () = tokio::time::sleep(remaining.min(SNAPSHOT_SEED_RETRY_INTERVAL)) => Ok(()),
+    }
+}
+
+fn attach_response_timeout() -> ClientError {
+    ClientError::Io(io::Error::new(
+        io::ErrorKind::TimedOut,
+        format!(
+            "attach response timed out after {}ms",
+            SNAPSHOT_SEED_TIMEOUT.as_millis()
+        ),
+    ))
+}
+async fn reopen_agent_preview_after_loss(
+    client: &SessionControlClient,
+    session_id: SessionId,
+    terminal_size: (u16, u16),
+    app: &mut AppModel,
+) -> Result<OpenedAgentAttach, CockpitError> {
+    reopen_agent_attach(client, session_id, terminal_size, app).await
+}
+
 fn opened_agent_attach(connection: AttachConnection, read_only: bool) -> OpenedAgentAttach {
     let (result, reader, writer) = connection.split();
     OpenedAgentAttach {
         reader,
         writer,
         read_only: read_only || !result.stream.input_owner,
+        raw_input: result.confirms_raw_input(),
+        stream_id: result.stream.stream_id,
     }
+}
+
+async fn validate_managed_raw_attach_fresh(
+    client: &SessionControlClient,
+    session_id: SessionId,
+    attach: &OpenedAgentAttach,
+) -> Result<(), String> {
+    #[cfg(debug_assertions)]
+    if env::var_os("MILLMUX_TEST_MANAGED_RAW_STATUS_RESPONSE_STALL").is_some() {
+        record_managed_raw_test_phase("raw_fresh_status_waiting");
+        std::future::pending::<()>().await;
+    }
+    let response = client
+        .status(&SessionInspectRequest {
+            selector: SessionSelector::Id { session_id },
+        })
+        .await
+        .map_err(|error| format!("host_inspect_failed: {error}"))?;
+
+    #[cfg(debug_assertions)]
+    if env::var_os("MILLMUX_TEST_MANAGED_RAW_STATUS_ERROR").is_some() {
+        return Err("host_inspect_failed: injected validation error".to_string());
+    }
+
+    validate_managed_raw_host_state(
+        &response.session,
+        response.worker.as_ref(),
+        session_id,
+        &attach.stream_id,
+        attach.read_only,
+    )
+    .map_err(str::to_string)
+}
+
+async fn await_managed_transition<T, F>(
+    future: F,
+    deadline: Instant,
+    interrupt: &mut tokio::signal::unix::Signal,
+    stage: &str,
+) -> Result<T, String>
+where
+    F: std::future::Future<Output = Result<T, String>>,
+{
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    if remaining.is_zero() {
+        return Err(format!("{stage} timed out before managed raw attach"));
+    }
+    tokio::select! {
+        result = future => result,
+        () = tokio::time::sleep(remaining) => {
+            Err(format!("{stage} timed out before managed raw attach"))
+        }
+        signal = interrupt.recv() => {
+            if signal.is_some() {
+                #[cfg(debug_assertions)]
+                if stage == "fresh status" {
+                    record_managed_raw_test_phase("raw_fresh_status_cancelled");
+                }
+                Err(format!("{stage} cancelled by external SIGINT"))
+            } else {
+                Err(format!("{stage} SIGINT listener closed"))
+            }
+        }
+    }
+}
+
+fn validate_managed_raw_host_state(
+    session: &SessionSummary,
+    worker: Option<&WorkerMeta>,
+    expected_session_id: SessionId,
+    expected_stream_id: &str,
+    preview_read_only: bool,
+) -> Result<(), &'static str> {
+    if preview_read_only {
+        return Err("preview_read_only");
+    }
+    if session.session_id != expected_session_id {
+        return Err("host_session_mismatch");
+    }
+    if session.process_state != ProcessState::Running {
+        return Err("host_session_not_running");
+    }
+    if session.spawn_mode != SpawnMode::Pty {
+        return Err("host_session_not_pty");
+    }
+    if !session.capabilities.attach || !session.capabilities.raw_attach {
+        return Err("host_raw_attach_unavailable");
+    }
+    if session.liveness.worker != LivenessState::Alive {
+        return Err("host_worker_not_alive");
+    }
+    if session.liveness.child != LivenessState::Alive {
+        return Err("host_child_not_alive");
+    }
+    if session.attached_clients == 0 || session.input_owner.as_deref() != Some(expected_stream_id) {
+        return Err("host_input_owner_changed");
+    }
+
+    let worker = worker.ok_or("host_worker_missing")?;
+    if worker.session_id != expected_session_id
+        || worker.spawn_mode != SpawnMode::Pty
+        || worker.process_state != ProcessState::Running
+    {
+        return Err("host_worker_mismatch");
+    }
+    if worker.attached_clients == 0 || worker.input_owner.as_deref() != Some(expected_stream_id) {
+        return Err("host_worker_input_owner_changed");
+    }
+    Ok(())
 }
 
 fn should_retry_agent_attach(error: &ClientError, deadline: Instant) -> bool {
@@ -837,12 +1434,16 @@ async fn sync_agent_attach_size(
 
 async fn sync_agent_geometry_from_terminal(
     app: &mut AppModel,
-    terminal: &mut TerminalSession,
+    terminal: &Arc<Mutex<TerminalSession>>,
     attach: &mut OpenedAgentAttach,
     emulator: &mut TerminalEmulator,
     last_size: &mut (u16, u16),
 ) -> Result<bool, CockpitError> {
-    let size = terminal.terminal.size()?;
+    let size = terminal
+        .lock()
+        .expect("cockpit terminal lock poisoned")
+        .terminal
+        .size()?;
     let Some((rows, cols)) = app.agent_terminal_size_for(size.width, size.height) else {
         return Ok(false);
     };
@@ -875,6 +1476,250 @@ async fn switch_agent_attach(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
+async fn enter_managed_raw_attach(
+    client: &SessionControlClient,
+    app: &mut AppModel,
+    terminal: &Arc<Mutex<TerminalSession>>,
+    attach: &mut OpenedAgentAttach,
+    emulator: &mut TerminalEmulator,
+    session_id: SessionId,
+    pane_size: (u16, u16),
+    deadline: Instant,
+    interrupt: &mut tokio::signal::unix::Signal,
+) -> Result<(), CockpitError> {
+    app.status_message = "raw attach: Ctrl-] d returns to cockpit".to_string();
+    #[cfg(debug_assertions)]
+    if env::var_os("MILLMUX_TEST_MANAGED_RAW_ENTER_EVENT_ERROR").is_some() {
+        app.status_message =
+            "raw attach rejected before terminal suspension: injected entry event error"
+                .to_string();
+        return Ok(());
+    }
+    let persist_entry = async {
+        record_ui_event(
+            client,
+            app,
+            UiEventKind::RawInputModeEntered,
+            "managed raw attach entered",
+            bound_fields("session_id", Some(session_id)),
+        )
+        .await
+        .map_err(|error| format!("entry event: {error}"))
+    };
+    if let Err(error) =
+        await_managed_transition(persist_entry, deadline, interrupt, "entry persistence").await
+    {
+        app.status_message = format!("raw attach rejected before terminal suspension: {error}");
+        return Ok(());
+    }
+
+    let mut transition_errors = Vec::new();
+    let mut preview_closed = false;
+    let preview_close = await_managed_transition(
+        async {
+            close_attach_stream(
+                &mut attach.reader,
+                &mut attach.writer,
+                &mut |event| match event {
+                    ManagedRawAttachEvent::Output { bytes } => {
+                        emulator.process(bytes);
+                        Ok(())
+                    }
+                },
+            )
+            .await
+            .map_err(|error| error.to_string())
+        },
+        deadline,
+        interrupt,
+        "preview close",
+    )
+    .await;
+    match preview_close {
+        Ok(()) => preview_closed = true,
+        Err(error) => {
+            transition_errors.push(format!("preview close: {error}"));
+            if let Err(error) = attach.writer.shutdown().await {
+                transition_errors.push(format!("preview transport release: {error}"));
+            }
+        }
+    }
+
+    let mut raw_result = None;
+    let mut resume_failed = false;
+    if preview_closed {
+        let outer_size = terminal
+            .lock()
+            .expect("cockpit terminal lock poisoned")
+            .terminal
+            .size();
+        match outer_size {
+            Ok(outer_size) => {
+                let request =
+                    managed_raw_attach_request(session_id, outer_size.height, outer_size.width);
+                match TerminalSession::suspend(terminal) {
+                    Ok(suspension) => {
+                        let mut transition = SuspendedManagedRawTransition::spawn(
+                            suspension,
+                            client.clone(),
+                            request,
+                            deadline,
+                        );
+                        #[cfg(debug_assertions)]
+                        let drop_transition = env::var_os("MILLMUX_TEST_MANAGED_RAW_ABORT_OUTER")
+                            .is_some()
+                            && wait_for_managed_raw_test_phase("raw_loop_entered", deadline).await;
+                        #[cfg(not(debug_assertions))]
+                        let drop_transition = false;
+                        if drop_transition {
+                            #[cfg(debug_assertions)]
+                            {
+                                drop(transition);
+                                record_managed_raw_test_phase("raw_outer_transition_dropped");
+                                if !wait_for_managed_raw_test_phase(
+                                    "terminal_resume_complete",
+                                    deadline,
+                                )
+                                .await
+                                {
+                                    transition_errors.push(
+                                        "managed raw cleanup did not restore the terminal before the transition deadline"
+                                            .to_string(),
+                                    );
+                                }
+                                resume_failed = !terminal
+                                    .lock()
+                                    .expect("cockpit terminal lock poisoned")
+                                    .cockpit_display_active;
+                                raw_result = Some(Err(AttachError::Cancelled));
+                                record_managed_raw_test_phase(
+                                    "raw_outer_transition_cleanup_joined",
+                                );
+                            }
+                        } else {
+                            let outcome = transition.join().await;
+                            if let Err(error) = outcome.resume {
+                                resume_failed = true;
+                                transition_errors.push(format!("terminal resume: {error}"));
+                            }
+                            raw_result = Some(outcome.result);
+                        }
+                    }
+                    Err(error) => {
+                        resume_failed = true;
+                        transition_errors.push(format!("terminal suspend: {error}"));
+                    }
+                }
+            }
+            Err(error) => transition_errors.push(format!("terminal size: {error}")),
+        }
+    }
+
+    if raw_result.is_some() {
+        *interrupt = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
+    }
+
+    let return_size = terminal
+        .lock()
+        .expect("cockpit terminal lock poisoned")
+        .terminal
+        .size()
+        .ok()
+        .and_then(|size| app.agent_terminal_size_for(size.width, size.height))
+        .unwrap_or(pane_size);
+    let recovery_deadline = Instant::now() + SNAPSHOT_SEED_TIMEOUT;
+    let mut preview_restored = false;
+    match reopen_agent_attach_with_snapshot(
+        client,
+        session_id,
+        return_size.0,
+        return_size.1,
+        emulator,
+        recovery_deadline,
+        interrupt,
+    )
+    .await
+    {
+        Ok(next_attach) => {
+            app.resize_agent_terminal(return_size.0, return_size.1);
+            app.update_agent_terminal_view(emulator.snapshot(), emulator.is_following());
+            *attach = next_attach;
+            apply_agent_input_ownership(app, false);
+            app.set_host_connected();
+            preview_restored = true;
+            record_managed_raw_test_phase("preview_reopened");
+        }
+        Err(error) => {
+            transition_errors.push(format!("terminal snapshot preview reopen: {error}"));
+        }
+    }
+
+    let (mut status, reason) = match raw_result {
+        Some(Ok(ManagedRawAttachExit::LocalDetach)) => (
+            "returned from raw attach".to_string(),
+            "local_detach".to_string(),
+        ),
+        Some(Ok(ManagedRawAttachExit::RemoteClosed)) => (
+            "raw attach closed remotely; cockpit restored".to_string(),
+            "remote_close".to_string(),
+        ),
+        Some(Ok(ManagedRawAttachExit::InputEof)) => (
+            "raw attach input closed; cockpit restored".to_string(),
+            "input_eof".to_string(),
+        ),
+        Some(Err(error)) => (
+            format!("raw attach error; cockpit restored: {error}"),
+            "error".to_string(),
+        ),
+        None => (
+            "raw attach could not start; cockpit restoration attempted".to_string(),
+            "transition_error".to_string(),
+        ),
+    };
+    if !transition_errors.is_empty() {
+        status.push_str("; ");
+        status.push_str(&transition_errors.join("; "));
+    }
+    app.status_message = status;
+    let mut fields = bound_fields("session_id", Some(session_id));
+    fields.insert("reason".to_string(), reason);
+    if let Err(error) = record_ui_event(
+        client,
+        app,
+        UiEventKind::RawInputModeExited,
+        "managed raw attach exited",
+        fields,
+    )
+    .await
+    {
+        if !app.status_message.is_empty() {
+            app.status_message.push_str("; ");
+        }
+        app.status_message.push_str(&format!("exit event: {error}"));
+    }
+
+    if raw_resume_failure_is_fatal(
+        resume_failed,
+        terminal
+            .lock()
+            .expect("cockpit terminal lock poisoned")
+            .cockpit_display_active,
+    ) {
+        return Err(CockpitError::Transition(
+            "cockpit terminal display could not be restored after raw attach".to_string(),
+        ));
+    }
+    if !preview_restored {
+        return Err(CockpitError::Transition(format!(
+            "managed raw return could not restore a coherent terminal snapshot: {}",
+            app.status_message
+        )));
+    }
+
+    Ok(())
+}
+
 fn sync_agent_terminal_to_interactive_size(
     app: &mut AppModel,
     emulator: &mut TerminalEmulator,
@@ -890,6 +1735,8 @@ struct OpenedAgentAttach {
     reader: crate::client::AttachReader,
     writer: crate::client::AttachWriter,
     read_only: bool,
+    raw_input: bool,
+    stream_id: String,
 }
 
 fn apply_agent_input_ownership(app: &mut AppModel, read_only: bool) {
@@ -932,6 +1779,31 @@ impl RedrawGate {
     }
 }
 
+fn draw_cockpit_if_due(
+    terminal: &Arc<Mutex<TerminalSession>>,
+    app: &AppModel,
+    redraw: &mut RedrawGate,
+) -> Result<(), CockpitError> {
+    let now = Instant::now();
+    if redraw.should_draw(now) {
+        terminal
+            .lock()
+            .expect("cockpit terminal lock poisoned")
+            .terminal
+            .draw(|frame| render_app(frame, app))?;
+        redraw.mark_drawn(now);
+    }
+    Ok(())
+}
+
+fn agent_input_frame(raw_input: bool, text: String) -> AttachStreamFrame {
+    if raw_input {
+        AttachStreamFrame::raw_input(text.into_bytes())
+    } else {
+        AttachStreamFrame::Input { text }
+    }
+}
+
 fn apply_agent_attach_frame(
     frame: AttachStreamFrame,
     emulator: &mut TerminalEmulator,
@@ -942,12 +1814,24 @@ fn apply_agent_attach_frame(
             let _ = lines;
         }
         AttachStreamFrame::Output { text } => {
-            emulator.process_text(&text);
+            emulator.process(text.as_bytes());
             app.update_agent_terminal_view(emulator.snapshot(), emulator.is_following());
         }
         AttachStreamFrame::RawOutput { data } => {
             emulator.process(data.as_slice());
             app.update_agent_terminal_view(emulator.snapshot(), emulator.is_following());
+        }
+        AttachStreamFrame::ScreenSnapshot { snapshot } => {
+            if let Err(error) = snapshot.validate_for_wire() {
+                app.set_host_reconnecting(1, format!("{error:?}"));
+                return false;
+            }
+            emulator.adopt_screen_snapshot(&snapshot);
+            app.update_agent_terminal_view(emulator.snapshot(), emulator.is_following());
+        }
+        AttachStreamFrame::StreamLagged { .. } | AttachStreamFrame::SnapshotUnavailable { .. } => {
+            app.set_host_reconnecting(1, "agent attach replay coverage was lost".to_string());
+            return false;
         }
         AttachStreamFrame::Error { error } => {
             if error.code == ControlErrorCode::InputOwnerConflict {
@@ -976,7 +1860,7 @@ struct CockpitAttachState<'a> {
 async fn handle_cockpit_key(
     client: &SessionControlClient,
     app: &mut AppModel,
-    terminal: &mut TerminalSession,
+    terminal: &Arc<Mutex<TerminalSession>>,
     attach_state: CockpitAttachState<'_>,
     event: KeyEvent,
 ) -> Result<bool, CockpitError> {
@@ -1042,6 +1926,8 @@ async fn handle_cockpit_key(
         cockpit_attached_terminal_focused(app, *attach_state.attached_session_id);
     let search_was_active = app.search_mode;
     let viewport_height = terminal
+        .lock()
+        .expect("cockpit terminal lock poisoned")
         .terminal
         .size()
         .ok()
@@ -1053,8 +1939,49 @@ async fn handle_cockpit_key(
     let action = app.handle_key(event, viewport_height);
     match action {
         KeyAction::Detach => return Ok(true),
+        KeyAction::ManagedRawAttach => {
+            match app.managed_raw_attach_target(*attach_state.attached_session_id) {
+                Ok(session_id) => {
+                    let deadline = Instant::now() + SNAPSHOT_SEED_TIMEOUT;
+                    let mut interrupt =
+                        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
+                    let validation = await_managed_transition(
+                        validate_managed_raw_attach_fresh(client, session_id, attach_state.attach),
+                        deadline,
+                        &mut interrupt,
+                        "fresh status",
+                    )
+                    .await;
+                    match validation {
+                        Ok(()) => {
+                            enter_managed_raw_attach(
+                                client,
+                                app,
+                                terminal,
+                                &mut *attach_state.attach,
+                                &mut *attach_state.emulator,
+                                session_id,
+                                attach_state.terminal_size,
+                                deadline,
+                                &mut interrupt,
+                            )
+                            .await?;
+                        }
+                        Err(reason) => {
+                            app.status_message = format!("raw attach rejected: {reason}");
+                        }
+                    }
+                }
+                Err(reason) => {
+                    app.status_message = format!("raw attach rejected: {reason}");
+                }
+            }
+        }
         KeyAction::Redraw => {
-            terminal.recover_display()?;
+            terminal
+                .lock()
+                .expect("cockpit terminal lock poisoned")
+                .recover_display()?;
         }
         KeyAction::SwitchFocus => {
             record_ui_event(
@@ -1163,7 +2090,7 @@ async fn handle_cockpit_key(
                 attach_state
                     .attach
                     .writer
-                    .write_frame(&AttachStreamFrame::Input { text })
+                    .write_frame(&agent_input_frame(attach_state.attach.raw_input, text))
                     .await?;
             } else if !app.focused_attach_matches(*attach_state.attached_session_id) {
                 app.status_message = "input rejected: pane_session_mismatch".to_string();
@@ -1184,15 +2111,14 @@ fn sync_agent_search_from_emulator(
     label: &str,
 ) {
     if app.search_query.is_empty() {
+        emulator.clear_search();
+        app.set_agent_search_not_found(label);
         return;
     }
 
-    if emulator
-        .search_scrollback(app.search_query.as_str(), direction)
-        .is_some()
-    {
+    if let Some(found) = emulator.search_scrollback(app.search_query.as_str(), direction) {
         app.update_agent_terminal_view(emulator.snapshot(), emulator.is_following());
-        app.refresh_agent_search_from_snapshot(label);
+        app.set_agent_search_match(label, &found);
     } else {
         app.set_agent_search_not_found(label);
     }
@@ -1211,10 +2137,12 @@ async fn handle_cockpit_paste(
             byte_count,
             bracketed,
         } => {
-            attach
-                .writer
-                .write_frame(&AttachStreamFrame::Input { text })
-                .await?;
+            for chunk in bounded_attach_input_chunks(&text) {
+                attach
+                    .writer
+                    .write_frame(&agent_input_frame(attach.raw_input, chunk.to_string()))
+                    .await?;
+            }
             app.status_message = "paste sent".to_string();
             record_ui_event(
                 client,
@@ -1249,6 +2177,24 @@ async fn handle_cockpit_paste(
         }
     }
     Ok(())
+}
+
+fn bounded_attach_input_chunks(text: &str) -> Vec<&str> {
+    if text.is_empty() {
+        return vec![text];
+    }
+
+    let mut chunks = Vec::with_capacity(text.len().div_ceil(MAX_ATTACH_INPUT_FRAME_BYTES));
+    let mut start = 0;
+    while start < text.len() {
+        let mut end = (start + MAX_ATTACH_INPUT_FRAME_BYTES).min(text.len());
+        while !text.is_char_boundary(end) {
+            end -= 1;
+        }
+        chunks.push(&text[start..end]);
+        start = end;
+    }
+    chunks
 }
 
 fn handle_daemon_switcher_key(app: &mut AppModel, event: KeyEvent) -> Option<SessionId> {
@@ -1359,6 +2305,14 @@ async fn record_ui_event(
     message: impl Into<String>,
     fields: BTreeMap<String, String>,
 ) -> Result<(), CockpitError> {
+    #[cfg(debug_assertions)]
+    if kind == UiEventKind::RawInputModeEntered
+        && env::var_os("MILLMUX_TEST_MANAGED_RAW_UI_CONTEXT_SET_ERROR").is_some()
+    {
+        return Err(CockpitError::Transition(
+            "injected RawInputModeEntered ui.context.set failure".to_string(),
+        ));
+    }
     let request = UiContextSetRequest {
         context: app.ui_context(),
         events: vec![UiEvent {
@@ -1662,6 +2616,28 @@ mod tests {
             request.requested_terminal_size,
             Some(TerminalDimensions { rows: 31, cols: 99 })
         );
+        assert_eq!(
+            request.client_protocol_version,
+            Some(M2_ATTACH_PROTOCOL_VERSION)
+        );
+        assert_eq!(
+            request.accepted_frame_types,
+            vec![
+                AttachFrameType::RawOutput,
+                AttachFrameType::RawInput,
+                AttachFrameType::StreamLagged,
+                AttachFrameType::SnapshotUnavailable,
+                AttachFrameType::ScreenSnapshot,
+            ]
+        );
+        assert_eq!(
+            request.stream_encoding,
+            Some(AttachStreamEncoding::RawBytes)
+        );
+        assert_eq!(
+            request.initial_replay,
+            Some(AttachInitialReplay::ScreenSnapshot)
+        );
     }
 
     #[test]
@@ -1674,28 +2650,288 @@ mod tests {
             request.requested_terminal_size,
             Some(TerminalDimensions { rows: 18, cols: 72 })
         );
+        assert_eq!(
+            request.accepted_frame_types,
+            vec![
+                AttachFrameType::RawOutput,
+                AttachFrameType::StreamLagged,
+                AttachFrameType::SnapshotUnavailable,
+                AttachFrameType::ScreenSnapshot,
+            ]
+        );
     }
 
     #[test]
-    fn cockpit_snapshot_seed_uses_raw_replay_not_legacy_line_scrollback() {
-        let request = agent_raw_replay_attach_request(SessionId::new(), true);
+    fn cockpit_snapshot_seed_accepts_structured_snapshot_and_raw_suffix() {
+        let request = agent_attach_request(SessionId::new(), true, 24, 80);
 
         assert!(request.read_only);
-        assert_eq!(request.replay, AttachReplayMode::RawReplay);
-        assert_eq!(request.requested_terminal_size, None);
+        assert_eq!(request.replay, AttachReplayMode::TerminalSnapshot);
+        assert_eq!(
+            request.requested_terminal_size,
+            Some(TerminalDimensions { rows: 24, cols: 80 })
+        );
         assert_eq!(
             request.client_protocol_version,
             Some(M2_ATTACH_PROTOCOL_VERSION)
         );
         assert_eq!(
             request.accepted_frame_types,
-            vec![AttachFrameType::RawOutput]
+            vec![
+                AttachFrameType::RawOutput,
+                AttachFrameType::StreamLagged,
+                AttachFrameType::SnapshotUnavailable,
+                AttachFrameType::ScreenSnapshot,
+            ]
+        );
+        assert_eq!(
+            request.stream_encoding,
+            Some(AttachStreamEncoding::RawBytes)
+        );
+        assert_eq!(
+            request.initial_replay,
+            Some(AttachInitialReplay::ScreenSnapshot)
+        );
+    }
+
+    #[test]
+    fn managed_raw_attach_requests_exclusive_raw_bytes_for_the_same_session() {
+        let session_id = SessionId::new();
+        let request = managed_raw_attach_request(session_id, 42, 132);
+
+        assert_eq!(request.selector, SessionSelector::Id { session_id });
+        assert!(!request.read_only);
+        assert_eq!(request.replay, AttachReplayMode::RawReplay);
+        assert_eq!(
+            request.requested_terminal_size,
+            Some(TerminalDimensions {
+                rows: 42,
+                cols: 132
+            })
+        );
+        assert_eq!(
+            request.client_protocol_version,
+            Some(M2_ATTACH_PROTOCOL_VERSION)
+        );
+        assert_eq!(
+            request.accepted_frame_types,
+            vec![
+                AttachFrameType::RawOutput,
+                AttachFrameType::RawInput,
+                AttachFrameType::StreamLagged,
+                AttachFrameType::SnapshotUnavailable,
+            ]
         );
         assert_eq!(
             request.stream_encoding,
             Some(AttachStreamEncoding::RawBytes)
         );
         assert_eq!(request.initial_replay, Some(AttachInitialReplay::RawReplay));
+    }
+
+    #[test]
+    fn managed_raw_return_reopens_preview_with_a_size_matched_snapshot() {
+        let session_id = SessionId::new();
+        let request = agent_attach_request(session_id, false, 38, 42);
+
+        assert_eq!(request.selector, SessionSelector::Id { session_id });
+        assert!(!request.read_only);
+        assert_eq!(request.replay, AttachReplayMode::TerminalSnapshot);
+        assert_eq!(
+            request.requested_terminal_size,
+            Some(TerminalDimensions::new(38, 42))
+        );
+        assert_eq!(
+            request.initial_replay,
+            Some(AttachInitialReplay::ScreenSnapshot)
+        );
+        assert!(request
+            .accepted_frame_types
+            .contains(&AttachFrameType::ScreenSnapshot));
+        assert!(request
+            .accepted_frame_types
+            .contains(&AttachFrameType::RawInput));
+    }
+
+    #[test]
+    fn negotiated_preview_input_uses_raw_bytes() {
+        assert!(matches!(
+            agent_input_frame(true, "\u{00e9}".to_string()),
+            AttachStreamFrame::RawInput { data }
+                if data.as_slice() == "\u{00e9}".as_bytes()
+        ));
+        assert!(matches!(
+            agent_input_frame(false, "input".to_string()),
+            AttachStreamFrame::Input { text } if text == "input"
+        ));
+    }
+
+    #[test]
+    fn failed_raw_resume_or_partial_suspend_is_fatal_when_no_display_remains() {
+        assert!(raw_resume_failure_is_fatal(false, false));
+        assert!(!raw_resume_failure_is_fatal(true, true));
+        assert!(raw_resume_failure_is_fatal(true, false));
+        let partially_left_display_is_usable = cockpit_display_is_usable(
+            TerminalControlState::Inactive,
+            TerminalControlState::Unknown,
+            TerminalControlState::Inactive,
+            TerminalControlState::Active,
+        );
+        assert!(!partially_left_display_is_usable);
+        assert!(raw_resume_failure_is_fatal(
+            true,
+            partially_left_display_is_usable
+        ));
+    }
+
+    #[test]
+    fn managed_raw_fresh_host_state_fails_closed_for_every_authority_change() {
+        let mut session = session_summary("agent", SessionRole::Agent);
+        let session_id = session.session_id;
+        session.attached_clients = 1;
+        session.input_owner = Some("preview-stream".to_string());
+        session.liveness.worker = LivenessState::Alive;
+        session.liveness.child = LivenessState::Alive;
+        let worker = WorkerMeta {
+            session_id,
+            pid: 10,
+            child_pid: Some(11),
+            child_pgid: Some(11),
+            spawn_mode: SpawnMode::Pty,
+            process_state: ProcessState::Running,
+            started_at: "2026-07-10T00:00:00Z".to_string(),
+            ended_at: None,
+            stop_requested_at: None,
+            stop_reason: None,
+            exit_code: None,
+            exit_signal: None,
+            attached_clients: 1,
+            input_owner: Some("preview-stream".to_string()),
+            updated_at: "2026-07-10T00:00:01Z".to_string(),
+        };
+
+        assert_eq!(
+            validate_managed_raw_host_state(
+                &session,
+                Some(&worker),
+                session_id,
+                "preview-stream",
+                false,
+            ),
+            Ok(())
+        );
+        assert_eq!(
+            validate_managed_raw_host_state(
+                &session,
+                Some(&worker),
+                session_id,
+                "preview-stream",
+                true,
+            ),
+            Err("preview_read_only")
+        );
+
+        let mut changed = session.clone();
+        changed.session_id = SessionId::new();
+        assert_eq!(
+            validate_managed_raw_host_state(
+                &changed,
+                Some(&worker),
+                session_id,
+                "preview-stream",
+                false,
+            ),
+            Err("host_session_mismatch")
+        );
+        changed = session.clone();
+        changed.process_state = ProcessState::Exited;
+        assert_eq!(
+            validate_managed_raw_host_state(
+                &changed,
+                Some(&worker),
+                session_id,
+                "preview-stream",
+                false,
+            ),
+            Err("host_session_not_running")
+        );
+        changed = session.clone();
+        changed.spawn_mode = SpawnMode::Pipe;
+        assert_eq!(
+            validate_managed_raw_host_state(
+                &changed,
+                Some(&worker),
+                session_id,
+                "preview-stream",
+                false,
+            ),
+            Err("host_session_not_pty")
+        );
+        changed = session.clone();
+        changed.capabilities.raw_attach = false;
+        assert_eq!(
+            validate_managed_raw_host_state(
+                &changed,
+                Some(&worker),
+                session_id,
+                "preview-stream",
+                false,
+            ),
+            Err("host_raw_attach_unavailable")
+        );
+        changed = session.clone();
+        changed.liveness.worker = LivenessState::Dead;
+        assert_eq!(
+            validate_managed_raw_host_state(
+                &changed,
+                Some(&worker),
+                session_id,
+                "preview-stream",
+                false,
+            ),
+            Err("host_worker_not_alive")
+        );
+        changed = session.clone();
+        changed.liveness.child = LivenessState::Dead;
+        assert_eq!(
+            validate_managed_raw_host_state(
+                &changed,
+                Some(&worker),
+                session_id,
+                "preview-stream",
+                false,
+            ),
+            Err("host_child_not_alive")
+        );
+        changed = session.clone();
+        changed.input_owner = Some("other-stream".to_string());
+        assert_eq!(
+            validate_managed_raw_host_state(
+                &changed,
+                Some(&worker),
+                session_id,
+                "preview-stream",
+                false,
+            ),
+            Err("host_input_owner_changed")
+        );
+        assert_eq!(
+            validate_managed_raw_host_state(&session, None, session_id, "preview-stream", false,),
+            Err("host_worker_missing")
+        );
+
+        let mut changed_worker = worker.clone();
+        changed_worker.input_owner = Some("other-stream".to_string());
+        assert_eq!(
+            validate_managed_raw_host_state(
+                &session,
+                Some(&changed_worker),
+                session_id,
+                "preview-stream",
+                false,
+            ),
+            Err("host_worker_input_owner_changed")
+        );
     }
 
     #[test]
@@ -2121,6 +3357,56 @@ mod tests {
     }
 
     #[test]
+    fn cockpit_backspace_to_empty_clears_search_before_copy() {
+        let mut app = cockpit_input_app(true, false);
+        let mut emulator = TerminalEmulator::new(4, 40, 20);
+        emulator.process_text("before target after\r\n");
+        app.update_agent_terminal_view(emulator.snapshot(), emulator.is_following());
+
+        app.begin_search_mode();
+        app.search_query = "target".to_string();
+        sync_agent_search_from_emulator(
+            &mut app,
+            &mut emulator,
+            TerminalSearchDirection::First,
+            "search",
+        );
+        assert!(emulator.current_search_match().is_some());
+        assert!(app
+            .agent_terminal
+            .as_ref()
+            .and_then(AgentTerminalPane::current_match)
+            .is_some());
+
+        for _ in "target".chars() {
+            assert_eq!(
+                app.handle_key(key(KeyCode::Backspace, KeyModifiers::NONE), 4),
+                KeyAction::SearchBackspace
+            );
+            sync_agent_search_from_emulator(
+                &mut app,
+                &mut emulator,
+                TerminalSearchDirection::First,
+                "search",
+            );
+        }
+
+        assert!(app.search_query.is_empty());
+        assert!(emulator.current_search_match().is_none());
+        assert!(app
+            .agent_terminal
+            .as_ref()
+            .and_then(AgentTerminalPane::current_match)
+            .is_none());
+        assert_eq!(
+            app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE), 4),
+            KeyAction::CopySearchMatch
+        );
+        assert_eq!(app.copy_buffer_text(), None);
+        assert_eq!(app.status_message, "copy: no search match");
+    }
+
+    #[test]
     fn cockpit_reserved_prefix_and_scroll_keys_do_not_become_input_text() {
         let mut app = cockpit_input_app(true, false);
         assert_eq!(
@@ -2145,6 +3431,129 @@ mod tests {
             forwarded_key_text(&mut app, key(KeyCode::Char('G'), KeyModifiers::SHIFT)),
             None
         );
+    }
+
+    #[test]
+    fn partial_terminal_resume_with_paste_still_active_is_not_usable_and_needs_cleanup() {
+        assert!(!cockpit_display_is_usable(
+            TerminalControlState::Active,
+            TerminalControlState::Active,
+            TerminalControlState::Inactive,
+            TerminalControlState::Active,
+        ));
+        assert!(cockpit_terminal_needs_cleanup(
+            TerminalControlState::Inactive,
+            TerminalControlState::Inactive,
+            TerminalControlState::Active,
+            TerminalControlState::Inactive,
+        ));
+    }
+
+    #[test]
+    fn terminal_control_write_failure_after_applied_bytes_remains_unknown_until_reasserted() {
+        let mut writer = FaultWriter::fail_after_write();
+        let mut state = TerminalControlState::Inactive;
+
+        let error = apply_terminal_control(
+            &mut writer,
+            EnterAlternateScreen,
+            &mut state,
+            TerminalControlState::Active,
+        )
+        .expect_err("injected post-write failure");
+
+        assert_eq!(error.kind(), io::ErrorKind::Other);
+        assert_eq!(writer.bytes, b"\x1b[?1049h");
+        assert_eq!(state, TerminalControlState::Unknown);
+        assert!(terminal_control_needs_reassertion(
+            state,
+            TerminalControlState::Active
+        ));
+
+        apply_terminal_control(
+            &mut writer,
+            EnterAlternateScreen,
+            &mut state,
+            TerminalControlState::Active,
+        )
+        .expect("reassert uncertain control");
+        assert_eq!(state, TerminalControlState::Active);
+        assert_eq!(writer.bytes, b"\x1b[?1049h\x1b[?1049h");
+    }
+
+    #[test]
+    fn terminal_control_flush_failure_remains_unknown_until_cleanup_reasserts() {
+        let mut writer = FaultWriter::fail_flush();
+        let mut state = TerminalControlState::Active;
+
+        apply_terminal_control(
+            &mut writer,
+            LeaveAlternateScreen,
+            &mut state,
+            TerminalControlState::Inactive,
+        )
+        .expect_err("injected flush failure");
+
+        assert_eq!(writer.bytes, b"\x1b[?1049l");
+        assert_eq!(state, TerminalControlState::Unknown);
+        assert!(cockpit_terminal_needs_cleanup(
+            TerminalControlState::Inactive,
+            state,
+            TerminalControlState::Inactive,
+            TerminalControlState::Inactive,
+        ));
+
+        apply_terminal_control(
+            &mut writer,
+            LeaveAlternateScreen,
+            &mut state,
+            TerminalControlState::Inactive,
+        )
+        .expect("cleanup reasserts uncertain control");
+        assert_eq!(state, TerminalControlState::Inactive);
+        assert_eq!(writer.bytes, b"\x1b[?1049l\x1b[?1049l");
+    }
+
+    #[derive(Default)]
+    struct FaultWriter {
+        bytes: Vec<u8>,
+        fail_after_write: bool,
+        fail_flush: bool,
+    }
+
+    impl FaultWriter {
+        fn fail_after_write() -> Self {
+            Self {
+                fail_after_write: true,
+                ..Self::default()
+            }
+        }
+
+        fn fail_flush() -> Self {
+            Self {
+                fail_flush: true,
+                ..Self::default()
+            }
+        }
+    }
+
+    impl Write for FaultWriter {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.bytes.extend_from_slice(bytes);
+            if self.fail_after_write {
+                self.fail_after_write = false;
+                return Err(io::Error::other("injected post-write failure"));
+            }
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            if self.fail_flush {
+                self.fail_flush = false;
+                return Err(io::Error::other("injected flush failure"));
+            }
+            Ok(())
+        }
     }
 
     fn forwarded_key_text(app: &mut AppModel, event: KeyEvent) -> Option<String> {
@@ -2213,47 +3622,441 @@ mod tests {
 }
 
 struct TerminalSession {
-    terminal: Terminal<CrosstermBackend<Stdout>>,
-    bracketed_paste_enabled: bool,
+    terminal: Terminal<CrosstermBackend<BoundedTerminalOutput>>,
+    output_deadline: Arc<Mutex<Option<Instant>>>,
+    bracketed_paste_state: TerminalControlState,
+    raw_mode_state: TerminalControlState,
+    alternate_screen_state: TerminalControlState,
+    cursor_hidden_state: TerminalControlState,
+    cockpit_display_active: bool,
+}
+
+struct BoundedTerminalOutput {
+    file: File,
+    operation_deadline: Arc<Mutex<Option<Instant>>>,
+}
+
+impl BoundedTerminalOutput {
+    fn open(operation_deadline: Arc<Mutex<Option<Instant>>>) -> io::Result<Self> {
+        let file = OpenOptions::new()
+            .write(true)
+            .custom_flags(nix::libc::O_NONBLOCK)
+            .open("/dev/stdout")?;
+        Ok(Self {
+            file,
+            operation_deadline,
+        })
+    }
+
+    fn write_deadline(&self) -> Instant {
+        self.operation_deadline
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .unwrap_or_else(|| Instant::now() + managed_output_write_timeout())
+    }
+}
+
+fn begin_terminal_output_operation(deadline: &Arc<Mutex<Option<Instant>>>) {
+    *deadline
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+        Some(Instant::now() + managed_output_write_timeout());
+}
+
+fn finish_terminal_output_operation(deadline: &Arc<Mutex<Option<Instant>>>) {
+    *deadline
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+}
+
+impl Write for BoundedTerminalOutput {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        let deadline = self.write_deadline();
+        loop {
+            match self.file.write(bytes) {
+                Ok(written) => return Ok(written),
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                    let remaining = deadline.saturating_duration_since(Instant::now());
+                    if remaining.is_zero() {
+                        return Err(io::Error::new(
+                            io::ErrorKind::TimedOut,
+                            "terminal output write timed out",
+                        ));
+                    }
+                    let timeout_ms = remaining.as_millis().min(i32::MAX as u128) as i32;
+                    let mut poll_fd = nix::libc::pollfd {
+                        fd: self.file.as_raw_fd(),
+                        events: nix::libc::POLLOUT,
+                        revents: 0,
+                    };
+                    let result = unsafe { nix::libc::poll(&mut poll_fd, 1, timeout_ms.max(1)) };
+                    if result < 0 {
+                        let error = io::Error::last_os_error();
+                        if error.kind() == io::ErrorKind::Interrupted {
+                            continue;
+                        }
+                        return Err(error);
+                    }
+                    if result == 0 {
+                        return Err(io::Error::new(
+                            io::ErrorKind::TimedOut,
+                            "terminal output write timed out",
+                        ));
+                    }
+                    if poll_fd.revents
+                        & (nix::libc::POLLERR | nix::libc::POLLHUP | nix::libc::POLLNVAL)
+                        != 0
+                    {
+                        return Err(io::Error::new(
+                            io::ErrorKind::BrokenPipe,
+                            "terminal output is unavailable",
+                        ));
+                    }
+                }
+                Err(error) => return Err(error),
+            }
+        }
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.file.flush()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TerminalControlState {
+    Inactive,
+    Active,
+    Unknown,
+}
+
+fn cockpit_display_is_usable(
+    raw_mode_state: TerminalControlState,
+    alternate_screen_state: TerminalControlState,
+    bracketed_paste_state: TerminalControlState,
+    cursor_hidden_state: TerminalControlState,
+) -> bool {
+    raw_mode_state == TerminalControlState::Active
+        && alternate_screen_state == TerminalControlState::Active
+        && bracketed_paste_state == TerminalControlState::Active
+        && cursor_hidden_state == TerminalControlState::Active
+}
+
+fn raw_resume_failure_is_fatal(_resume_failed: bool, cockpit_display_active: bool) -> bool {
+    !cockpit_display_active
+}
+
+fn cockpit_terminal_needs_cleanup(
+    raw_mode_state: TerminalControlState,
+    alternate_screen_state: TerminalControlState,
+    bracketed_paste_state: TerminalControlState,
+    cursor_hidden_state: TerminalControlState,
+) -> bool {
+    [
+        raw_mode_state,
+        alternate_screen_state,
+        bracketed_paste_state,
+        cursor_hidden_state,
+    ]
+    .into_iter()
+    .any(|state| state != TerminalControlState::Inactive)
+}
+
+fn terminal_control_needs_reassertion(
+    state: TerminalControlState,
+    target: TerminalControlState,
+) -> bool {
+    state != target
+}
+
+fn apply_terminal_control<W, C>(
+    writer: &mut W,
+    command: C,
+    state: &mut TerminalControlState,
+    target: TerminalControlState,
+) -> io::Result<()>
+where
+    W: Write,
+    C: Command,
+{
+    *state = TerminalControlState::Unknown;
+    writer.queue(command)?;
+    writer.flush()?;
+    *state = target;
+    Ok(())
+}
+
+fn apply_raw_mode(
+    state: &mut TerminalControlState,
+    target: TerminalControlState,
+) -> io::Result<()> {
+    *state = TerminalControlState::Unknown;
+    let result = match target {
+        TerminalControlState::Active => enable_raw_mode(),
+        TerminalControlState::Inactive => disable_raw_mode(),
+        TerminalControlState::Unknown => unreachable!("unknown is not a terminal mode target"),
+    };
+    if result.is_ok() {
+        *state = target;
+    }
+    result
 }
 
 impl TerminalSession {
     fn enter() -> Result<Self, CockpitError> {
-        enable_raw_mode()?;
-        let mut stdout = io::stdout();
-        execute!(stdout, EnterAlternateScreen)?;
-        let bracketed_paste_enabled = execute!(stdout, EnableBracketedPaste).is_ok();
-        let backend = CrosstermBackend::new(stdout);
-        let terminal = Terminal::new(backend)?;
-        Ok(Self {
-            terminal,
-            bracketed_paste_enabled,
+        let output_deadline = Arc::new(Mutex::new(None));
+        let backend =
+            CrosstermBackend::new(BoundedTerminalOutput::open(Arc::clone(&output_deadline))?);
+        let mut session = Self {
+            terminal: Terminal::new(backend)?,
+            output_deadline,
+            bracketed_paste_state: TerminalControlState::Unknown,
+            raw_mode_state: TerminalControlState::Unknown,
+            alternate_screen_state: TerminalControlState::Unknown,
+            cursor_hidden_state: TerminalControlState::Unknown,
+            cockpit_display_active: false,
+        };
+        begin_terminal_output_operation(&session.output_deadline);
+        apply_raw_mode(&mut session.raw_mode_state, TerminalControlState::Active)?;
+        apply_terminal_control(
+            session.terminal.backend_mut(),
+            EnterAlternateScreen,
+            &mut session.alternate_screen_state,
+            TerminalControlState::Active,
+        )?;
+        apply_terminal_control(
+            session.terminal.backend_mut(),
+            EnableBracketedPaste,
+            &mut session.bracketed_paste_state,
+            TerminalControlState::Active,
+        )?;
+        apply_terminal_control(
+            session.terminal.backend_mut(),
+            Hide,
+            &mut session.cursor_hidden_state,
+            TerminalControlState::Active,
+        )?;
+        finish_terminal_output_operation(&session.output_deadline);
+        session.cockpit_display_active = true;
+        Ok(session)
+    }
+
+    fn suspend(session: &Arc<Mutex<Self>>) -> Result<TerminalSuspension, CockpitError> {
+        let mut terminal = session.lock().expect("cockpit terminal lock poisoned");
+        if let Err(error) = terminal.leave_cockpit_display() {
+            let _ = terminal.resume_cockpit_display();
+            return Err(error);
+        }
+        drop(terminal);
+        Ok(TerminalSuspension {
+            session: Arc::clone(session),
+            resumed: false,
         })
     }
 
-    fn recover_display(&mut self) -> Result<(), CockpitError> {
-        execute!(
-            self.terminal.backend_mut(),
-            EnterAlternateScreen,
-            Clear(ClearType::All),
-            MoveTo(0, 0)
-        )?;
-        if self.bracketed_paste_enabled {
-            execute!(self.terminal.backend_mut(), EnableBracketedPaste)?;
+    fn leave_cockpit_display(&mut self) -> Result<(), CockpitError> {
+        let mut first_error = None;
+        begin_terminal_output_operation(&self.output_deadline);
+        if terminal_control_needs_reassertion(self.raw_mode_state, TerminalControlState::Inactive) {
+            if let Err(error) =
+                apply_raw_mode(&mut self.raw_mode_state, TerminalControlState::Inactive)
+            {
+                first_error.get_or_insert(CockpitError::Io(error));
+            }
         }
-        self.terminal.clear()?;
+        if terminal_control_needs_reassertion(
+            self.bracketed_paste_state,
+            TerminalControlState::Inactive,
+        ) {
+            if let Err(error) = apply_terminal_control(
+                self.terminal.backend_mut(),
+                DisableBracketedPaste,
+                &mut self.bracketed_paste_state,
+                TerminalControlState::Inactive,
+            ) {
+                first_error.get_or_insert(CockpitError::Io(error));
+            }
+        }
+        if terminal_control_needs_reassertion(
+            self.alternate_screen_state,
+            TerminalControlState::Inactive,
+        ) {
+            if let Err(error) = apply_terminal_control(
+                self.terminal.backend_mut(),
+                LeaveAlternateScreen,
+                &mut self.alternate_screen_state,
+                TerminalControlState::Inactive,
+            ) {
+                first_error.get_or_insert(CockpitError::Io(error));
+            }
+        }
+        if terminal_control_needs_reassertion(
+            self.cursor_hidden_state,
+            TerminalControlState::Inactive,
+        ) {
+            if let Err(error) = apply_terminal_control(
+                self.terminal.backend_mut(),
+                Show,
+                &mut self.cursor_hidden_state,
+                TerminalControlState::Inactive,
+            ) {
+                first_error.get_or_insert(CockpitError::Io(error));
+            }
+        }
+        finish_terminal_output_operation(&self.output_deadline);
+        self.cockpit_display_active = false;
+        first_error.map_or(Ok(()), Err)
+    }
+
+    fn resume_cockpit_display(&mut self) -> Result<(), CockpitError> {
+        let mut first_error = None;
+        begin_terminal_output_operation(&self.output_deadline);
+        if terminal_control_needs_reassertion(self.raw_mode_state, TerminalControlState::Active) {
+            if let Err(error) =
+                apply_raw_mode(&mut self.raw_mode_state, TerminalControlState::Active)
+            {
+                first_error.get_or_insert(CockpitError::Io(error));
+            }
+        }
+        if terminal_control_needs_reassertion(
+            self.alternate_screen_state,
+            TerminalControlState::Active,
+        ) {
+            if let Err(error) = apply_terminal_control(
+                self.terminal.backend_mut(),
+                EnterAlternateScreen,
+                &mut self.alternate_screen_state,
+                TerminalControlState::Active,
+            ) {
+                first_error.get_or_insert(CockpitError::Io(error));
+            }
+        }
+        if let Err(error) = self.terminal.clear() {
+            first_error.get_or_insert(CockpitError::Io(error));
+        }
+        if terminal_control_needs_reassertion(
+            self.bracketed_paste_state,
+            TerminalControlState::Active,
+        ) {
+            if let Err(error) = apply_terminal_control(
+                self.terminal.backend_mut(),
+                EnableBracketedPaste,
+                &mut self.bracketed_paste_state,
+                TerminalControlState::Active,
+            ) {
+                first_error.get_or_insert(CockpitError::Io(error));
+            }
+        }
+        if terminal_control_needs_reassertion(
+            self.cursor_hidden_state,
+            TerminalControlState::Active,
+        ) {
+            if let Err(error) = apply_terminal_control(
+                self.terminal.backend_mut(),
+                Hide,
+                &mut self.cursor_hidden_state,
+                TerminalControlState::Active,
+            ) {
+                first_error.get_or_insert(CockpitError::Io(error));
+            }
+        }
+        finish_terminal_output_operation(&self.output_deadline);
+        self.cockpit_display_active = first_error.is_none()
+            && cockpit_display_is_usable(
+                self.raw_mode_state,
+                self.alternate_screen_state,
+                self.bracketed_paste_state,
+                self.cursor_hidden_state,
+            );
+        first_error.map_or(Ok(()), Err)
+    }
+
+    fn recover_display(&mut self) -> Result<(), CockpitError> {
+        self.resume_cockpit_display()
+    }
+}
+
+struct TerminalSuspension {
+    session: Arc<Mutex<TerminalSession>>,
+    resumed: bool,
+}
+
+impl TerminalSuspension {
+    fn resume(mut self) -> Result<(), CockpitError> {
+        self.session
+            .lock()
+            .expect("cockpit terminal lock poisoned")
+            .resume_cockpit_display()?;
+        self.resumed = true;
         Ok(())
+    }
+}
+
+impl Drop for TerminalSuspension {
+    fn drop(&mut self) {
+        if !self.resumed {
+            let _ = self
+                .session
+                .lock()
+                .expect("cockpit terminal lock poisoned")
+                .resume_cockpit_display();
+        }
     }
 }
 
 impl Drop for TerminalSession {
     fn drop(&mut self) {
-        if self.bracketed_paste_enabled {
-            let _ = execute!(self.terminal.backend_mut(), DisableBracketedPaste);
+        if self.cockpit_display_active
+            || cockpit_terminal_needs_cleanup(
+                self.raw_mode_state,
+                self.alternate_screen_state,
+                self.bracketed_paste_state,
+                self.cursor_hidden_state,
+            )
+        {
+            begin_terminal_output_operation(&self.output_deadline);
+            if terminal_control_needs_reassertion(
+                self.raw_mode_state,
+                TerminalControlState::Inactive,
+            ) {
+                let _ = apply_raw_mode(&mut self.raw_mode_state, TerminalControlState::Inactive);
+            }
+            if terminal_control_needs_reassertion(
+                self.bracketed_paste_state,
+                TerminalControlState::Inactive,
+            ) {
+                let _ = apply_terminal_control(
+                    self.terminal.backend_mut(),
+                    DisableBracketedPaste,
+                    &mut self.bracketed_paste_state,
+                    TerminalControlState::Inactive,
+                );
+            }
+            if terminal_control_needs_reassertion(
+                self.alternate_screen_state,
+                TerminalControlState::Inactive,
+            ) {
+                let _ = apply_terminal_control(
+                    self.terminal.backend_mut(),
+                    LeaveAlternateScreen,
+                    &mut self.alternate_screen_state,
+                    TerminalControlState::Inactive,
+                );
+            }
+            if terminal_control_needs_reassertion(
+                self.cursor_hidden_state,
+                TerminalControlState::Inactive,
+            ) {
+                let _ = apply_terminal_control(
+                    self.terminal.backend_mut(),
+                    Show,
+                    &mut self.cursor_hidden_state,
+                    TerminalControlState::Inactive,
+                );
+            }
+            finish_terminal_output_operation(&self.output_deadline);
         }
-        let _ = disable_raw_mode();
-        let _ = execute!(self.terminal.backend_mut(), LeaveAlternateScreen);
-        let _ = self.terminal.show_cursor();
     }
 }
 
@@ -2268,9 +4071,13 @@ pub enum CockpitError {
     #[error(transparent)]
     Client(#[from] ClientError),
     #[error(transparent)]
+    Attach(#[from] crate::attach::AttachError),
+    #[error(transparent)]
     Core(#[from] MillmuxError),
     #[error(transparent)]
     Io(#[from] io::Error),
     #[error(transparent)]
     Json(#[from] serde_json::Error),
+    #[error("cockpit transition error: {0}")]
+    Transition(String),
 }

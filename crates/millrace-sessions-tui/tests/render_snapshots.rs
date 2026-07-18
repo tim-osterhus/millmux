@@ -166,7 +166,7 @@ Millracer operator ready                                          daemon ready
 
 
 
- mode=AgentCockpit monitor=Basic host=host connected input=ready view=live status=ready
+ ready status=ready ^]a=raw ^]d=detach/raw-return
 "###);
 }
 
@@ -187,7 +187,7 @@ Millracer operator ready
 
 Daemon Monitor | mon=basic | follow=live
 daemon idle
- mode=AgentCockpit monitor=Basic host=host connected input=ready view=live statu
+ ready status=ready ^]a=raw ^]d=detach/raw-return
 "###);
 }
 
@@ -379,12 +379,22 @@ fn agent_cockpit_prefix_detach_is_not_forwarded_as_agent_input() {
         KeyAction::Prefix
     );
     let pending = snapshot_text(&app, 120, 12);
-    assert!(pending.contains("input=prefix"), "{pending}");
+    assert!(pending.contains("prefix status="), "{pending}");
     assert_eq!(
         app.handle_key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE), 20),
         KeyAction::Detach
     );
     assert!(!app.prefix_pending);
+}
+
+#[test]
+fn agent_cockpit_status_keeps_raw_controls_at_eighty_columns() {
+    let mut app = cockpit_app(AgentCockpitLayout::Bottom);
+    app.status_message = "界e\u{301}\u{1f642}\u{1f469}\u{200d}\u{1f4bb}".repeat(20);
+
+    let rendered = snapshot_text(&app, 80, 12);
+    assert!(rendered.contains("^]a=raw"), "{rendered}");
+    assert!(rendered.contains("^]d=detach/raw-return"), "{rendered}");
 }
 
 #[test]

@@ -82,6 +82,67 @@ fn logging_keeps_partial_utf8_out_of_structured_lines_until_complete() {
 }
 
 #[test]
+fn logging_finalizes_incomplete_utf8_once_in_the_persisted_terminal_snapshot() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut logger =
+        OutputLogger::new(output_logger_config(temp.path(), 10, 1024)).expect("logger");
+
+    logger.record_output(&[0xf0, 0x9f]).expect("partial utf8");
+    logger.flush().expect("first flush");
+    logger.flush().expect("second flush");
+
+    let snapshot: TerminalSnapshot =
+        read_json(temp.path().join("terminal.snapshot.json")).expect("terminal snapshot");
+    let replacement_count = snapshot
+        .screen
+        .iter()
+        .flat_map(|line| line.chars())
+        .filter(|character| *character == '\u{fffd}')
+        .count();
+    assert_eq!(replacement_count, 1);
+}
+
+#[test]
+fn logging_restores_a_persisted_split_csi_without_replaying_the_checkpoint_screen() {
+    let temp = tempfile::tempdir().unwrap();
+    let config = output_logger_config(temp.path(), 10, 1024);
+    let mut logger = OutputLogger::new(config).expect("logger");
+
+    logger.record_output(b"\x1b[2;").expect("split csi");
+    drop(logger);
+
+    let checkpoint: TerminalSnapshot =
+        read_json(temp.path().join("terminal.snapshot.json")).expect("checkpoint");
+    assert_eq!(
+        checkpoint
+            .parser_checkpoint
+            .as_ref()
+            .expect("parser checkpoint")
+            .continuation
+            .vte_resume
+            .bytes,
+        b"\x1b[2;"
+    );
+
+    let mut restored =
+        OutputLogger::new(output_logger_config(temp.path(), 10, 1024)).expect("restored logger");
+    restored
+        .record_output(b"3Hlogger-csi-complete")
+        .expect("complete csi");
+
+    let snapshot: TerminalSnapshot =
+        read_json(temp.path().join("terminal.snapshot.json")).expect("restored snapshot");
+    assert!(
+        snapshot
+            .screen
+            .iter()
+            .any(|line| line.contains("logger-csi-complete")),
+        "{:?}",
+        snapshot.screen
+    );
+}
+
+#[test]
 fn pipe_logging_records_read_chunks_with_stream_offsets_and_sequence() {
     let temp = tempfile::tempdir().unwrap();
     let events_jsonl = temp.path().join("events.jsonl");

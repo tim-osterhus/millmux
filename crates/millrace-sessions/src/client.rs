@@ -31,12 +31,13 @@ use thiserror::Error;
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
     net::{unix::OwnedReadHalf, unix::OwnedWriteHalf, UnixStream},
-    time::{sleep, Instant},
+    time::{sleep, timeout, Instant},
 };
 
 pub const HOST_BIN_ENV: &str = "MILLMUX_HOST_BIN";
 const HOST_BIN_NAME: &str = "millrace-sessiond";
 const HOST_READY_TIMEOUT: Duration = Duration::from_secs(3);
+const ATTACH_STREAM_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 const HOST_READY_POLL: Duration = Duration::from_millis(50);
 
 static REQUEST_COUNTER: AtomicU64 = AtomicU64::new(1);
@@ -309,8 +310,7 @@ impl SessionControlClient {
             ControlRequest::with_params(id.clone(), ControlMethod::SessionAttach, request)?;
         let stream = UnixStream::connect(&self.paths.control_sock).await?;
         let (reader, mut writer) = stream.into_split();
-        writer.write_all(request.to_json_line()?.as_bytes()).await?;
-        writer.flush().await?;
+        write_attach_bytes(&mut writer, request.to_json_line()?.as_bytes()).await?;
 
         let mut reader = BufReader::new(reader);
         let mut line = String::new();
@@ -322,10 +322,9 @@ impl SessionControlClient {
         }
         let response = ControlResponse::from_json_line(&line)?;
         let result = response_result::<SessionAttachResponse>(response, &id)?;
-        let reader = reader.into_inner();
         Ok(AttachConnection {
             result,
-            reader: BufReader::new(reader),
+            reader,
             writer,
         })
     }
@@ -567,11 +566,41 @@ pub struct AttachWriter {
 
 impl AttachWriter {
     pub async fn write_frame(&mut self, frame: &AttachStreamFrame) -> Result<(), ClientError> {
-        self.writer
-            .write_all(frame.to_json_line()?.as_bytes())
-            .await?;
-        self.writer.flush().await?;
+        write_attach_bytes(&mut self.writer, frame.to_json_line()?.as_bytes()).await
+    }
+
+    pub(crate) async fn shutdown(&mut self) -> Result<(), ClientError> {
+        self.writer.shutdown().await?;
         Ok(())
+    }
+}
+
+async fn write_attach_bytes(writer: &mut OwnedWriteHalf, bytes: &[u8]) -> Result<(), ClientError> {
+    write_attach_bytes_with_timeout(writer, bytes, ATTACH_STREAM_WRITE_TIMEOUT).await
+}
+
+async fn write_attach_bytes_with_timeout(
+    writer: &mut OwnedWriteHalf,
+    bytes: &[u8],
+    write_timeout: Duration,
+) -> Result<(), ClientError> {
+    match timeout(write_timeout, async {
+        writer.write_all(bytes).await?;
+        writer.flush().await
+    })
+    .await
+    {
+        Ok(result) => result.map_err(ClientError::Io),
+        Err(_) => {
+            let _ = writer.shutdown().await;
+            Err(ClientError::Io(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                format!(
+                    "attach stream write timed out after {}ms",
+                    write_timeout.as_millis()
+                ),
+            )))
+        }
     }
 }
 
@@ -695,10 +724,16 @@ pub enum ClientError {
 #[cfg(test)]
 mod tests {
     use millrace_sessions_core::{
+        ids::SessionId,
         paths::StatePaths,
-        protocol::{ControlErrorBody, ControlErrorCode},
+        protocol::{
+            AttachFrameType, AttachInitialReplay, AttachReplayMode, AttachStreamEncoding,
+            ControlErrorBody, ControlErrorCode, SessionSelector, M1_PROTOCOL_VERSION,
+            M2_ATTACH_PROTOCOL_VERSION,
+        },
     };
     use serde_json::{json, Value};
+    use tokio::{io::AsyncReadExt, net::UnixListener};
 
     use super::*;
 
@@ -749,5 +784,94 @@ mod tests {
         let client = SessionControlClient::with_paths(paths.clone());
 
         assert_eq!(client.paths.control_sock, paths.control_sock);
+    }
+
+    #[tokio::test]
+    async fn attach_retains_first_frame_buffered_with_response() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = StatePaths::new(temp.path().join("state"));
+        fs::create_dir_all(paths.control_sock.parent().unwrap()).unwrap();
+        let listener = UnixListener::bind(&paths.control_sock).unwrap();
+        let session_id = SessionId::new();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let (reader, mut writer) = stream.into_split();
+            let mut reader = BufReader::new(reader);
+            let mut line = String::new();
+            reader.read_line(&mut line).await.unwrap();
+            let request = ControlRequest::from_json_line(&line).unwrap();
+            let response = ControlResponse::success(
+                request.id,
+                &json!({
+                    "schema_version": M1_PROTOCOL_VERSION,
+                    "protocol_version": M1_PROTOCOL_VERSION,
+                    "session_id": session_id,
+                    "stream": {
+                        "stream_id": "coalesced-attach",
+                        "kind": "attach",
+                        "read_only": true,
+                        "input_owner": false
+                    },
+                    "negotiated_attach_protocol_version": M2_ATTACH_PROTOCOL_VERSION,
+                    "negotiated_stream_encoding": "raw_bytes",
+                    "negotiated_initial_replay": "raw_replay",
+                    "accepted_frame_types": ["raw_output", "snapshot_unavailable"]
+                }),
+            )
+            .unwrap();
+            let frame = AttachStreamFrame::raw_output(b"first-frame".to_vec());
+            let payload = format!(
+                "{}{}",
+                response.to_json_line().unwrap(),
+                frame.to_json_line().unwrap()
+            );
+            writer.write_all(payload.as_bytes()).await.unwrap();
+        });
+
+        let client = SessionControlClient::with_paths(paths);
+        let request = SessionAttachRequest {
+            selector: SessionSelector::Id { session_id },
+            read_only: true,
+            replay: AttachReplayMode::RawReplay,
+            requested_terminal_size: None,
+            client_protocol_version: Some(M2_ATTACH_PROTOCOL_VERSION),
+            accepted_frame_types: vec![
+                AttachFrameType::RawOutput,
+                AttachFrameType::SnapshotUnavailable,
+            ],
+            stream_encoding: Some(AttachStreamEncoding::RawBytes),
+            initial_replay: Some(AttachInitialReplay::RawReplay),
+        };
+        let connection = client.attach(&request).await.unwrap();
+        let (_, mut reader, _) = connection.split();
+
+        assert_eq!(
+            reader.next_frame().await.unwrap(),
+            Some(AttachStreamFrame::raw_output(b"first-frame".to_vec()))
+        );
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn attach_write_timeout_shuts_down_the_write_half() {
+        let (stream, mut peer) = UnixStream::pair().unwrap();
+        let (_reader, mut writer) = stream.into_split();
+        let payload = vec![b'x'; 16 * 1024 * 1024];
+
+        let error =
+            write_attach_bytes_with_timeout(&mut writer, &payload, Duration::from_millis(10))
+                .await
+                .unwrap_err();
+
+        assert!(matches!(
+            error,
+            ClientError::Io(error) if error.kind() == std::io::ErrorKind::TimedOut
+        ));
+        let mut received = Vec::new();
+        timeout(Duration::from_secs(1), peer.read_to_end(&mut received))
+            .await
+            .expect("timed-out attach write must shut down its half")
+            .unwrap();
+        assert!(received.len() < payload.len());
     }
 }

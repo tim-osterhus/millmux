@@ -7,6 +7,7 @@ pub enum KeyAction {
     EnterScrollMode,
     ExitScrollMode,
     Detach,
+    ManagedRawAttach,
     OpenCommandPalette,
     OpenDaemonList,
     ToggleHelp,
@@ -51,6 +52,10 @@ impl PrefixKeymap {
                     KeyAction::ExitScrollMode,
                 ),
                 (KeyChord::plain(KeyCode::Char('d')), KeyAction::Detach),
+                (
+                    KeyChord::plain(KeyCode::Char('a')),
+                    KeyAction::ManagedRawAttach,
+                ),
                 (
                     KeyChord::plain(KeyCode::Char('p')),
                     KeyAction::OpenCommandPalette,
@@ -185,6 +190,10 @@ mod tests {
         assert_eq!(
             keymap.prefix_action(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE)),
             Some(KeyAction::Detach)
+        );
+        assert_eq!(
+            keymap.prefix_action(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE)),
+            Some(KeyAction::ManagedRawAttach)
         );
         assert_eq!(
             keymap.prefix_action(KeyEvent::new(KeyCode::Char('?'), KeyModifiers::NONE)),

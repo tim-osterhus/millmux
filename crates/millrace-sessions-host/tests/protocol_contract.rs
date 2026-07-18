@@ -1253,6 +1253,7 @@ fn seed_terminal_snapshot(
         raw_replay_end_offset: offset,
         captured_at: "2026-07-08T00:00:00Z".to_string(),
         structured_screen: Some(structured_screen_fixture(rows, cols, offset, &screen)),
+        parser_checkpoint: None,
         screen,
     };
     let session_paths = paths.session_paths(session_id);

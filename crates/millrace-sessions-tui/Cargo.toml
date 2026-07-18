@@ -17,10 +17,9 @@ ratatui.workspace = true
 serde.workspace = true
 thiserror.workspace = true
 time.workspace = true
-unicode-segmentation.workspace = true
-unicode-width.workspace = true
 vt100.workspace = true
 
 [dev-dependencies]
 insta.workspace = true
 serde_json.workspace = true
+unicode-width-renderer.workspace = true

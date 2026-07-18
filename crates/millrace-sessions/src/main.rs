@@ -26,8 +26,22 @@ use millrace_sessions_core::protocol::{
 use millrace_sessions_core::state::{ProcessState, SessionRole};
 use thiserror::Error;
 
-#[tokio::main]
-async fn main() {
+fn main() {
+    let mut runtime = if cfg!(debug_assertions)
+        && std::env::var_os("MILLMUX_TEST_CURRENT_THREAD_RUNTIME").is_some()
+    {
+        tokio::runtime::Builder::new_current_thread()
+    } else {
+        tokio::runtime::Builder::new_multi_thread()
+    };
+    runtime
+        .enable_all()
+        .build()
+        .expect("Tokio runtime")
+        .block_on(run_main());
+}
+
+async fn run_main() {
     if let Err(error) = run().await {
         if error.is_broken_pipe() {
             return;

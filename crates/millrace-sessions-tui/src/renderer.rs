@@ -1,4 +1,4 @@
-use millrace_sessions_core::ids::SessionId;
+use millrace_sessions_core::{ids::SessionId, state::UiMode};
 use ratatui::{
     backend::TestBackend,
     buffer::Buffer,
@@ -15,7 +15,8 @@ use crate::{
         AgentCockpitLayout, CommandOutputState, DaemonConsoleLayout, Pane, PaneKind,
         COCKPIT_SESSION_LIST_HEIGHT,
     },
-    terminal::{TerminalCell, TerminalColor},
+    terminal::{TerminalCell, TerminalColor, TerminalSnapshot},
+    width::{cell_symbol_width, terminal_text_width, truncate_terminal_text},
 };
 
 pub fn render_app(frame: &mut ratatui::Frame<'_>, app: &AppModel) {
@@ -40,6 +41,14 @@ pub fn render_to_string(app: &AppModel, width: u16, height: u16) -> String {
         .draw(|frame| render_app(frame, app))
         .expect("test render should not fail");
     buffer_to_string(terminal.backend().buffer())
+}
+
+pub fn render_terminal_snapshot(
+    frame: &mut ratatui::Frame<'_>,
+    area: Rect,
+    snapshot: &TerminalSnapshot,
+) {
+    render_terminal_cells(frame.buffer_mut(), area, &snapshot.cells);
 }
 
 fn render_body(frame: &mut ratatui::Frame<'_>, area: Rect, app: &AppModel) {
@@ -272,33 +281,56 @@ fn render_agent_terminal_view(
     } else {
         "paused"
     };
-    let mut lines = vec![Line::from(vec![Span::styled(
-        format!(
-            "{title} | {input} {view}{screen} cur={},{}{}",
-            terminal.snapshot.cursor_row,
-            terminal.snapshot.cursor_col,
-            focus_suffix(focused)
-        ),
-        Style::default()
-            .fg(Color::Magenta)
-            .add_modifier(Modifier::BOLD),
-    )])];
-    let content_height = area.height.saturating_sub(1);
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(1), Constraint::Min(0)])
+        .split(area);
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![Span::styled(
+            format!(
+                "{title} | {input} {view}{screen} cur={},{}{}",
+                terminal.snapshot.cursor_row,
+                terminal.snapshot.cursor_col,
+                focus_suffix(focused)
+            ),
+            Style::default()
+                .fg(Color::Magenta)
+                .add_modifier(Modifier::BOLD),
+        )])),
+        chunks[0],
+    );
     if terminal.initializing {
-        lines.push(Line::from("agent terminal initializing"));
+        frame.render_widget(Paragraph::new("agent terminal initializing"), chunks[1]);
     } else {
-        for row in terminal
-            .snapshot
-            .cells
-            .iter()
-            .take(usize::from(content_height))
-        {
-            lines.push(Line::from(
-                row.iter().map(cell_span).collect::<Vec<Span<'_>>>(),
-            ));
+        render_terminal_snapshot(frame, chunks[1], &terminal.snapshot);
+    }
+}
+
+fn render_terminal_cells(buffer: &mut Buffer, area: Rect, rows: &[Vec<TerminalCell>]) {
+    for (row_index, row) in rows.iter().take(usize::from(area.height)).enumerate() {
+        for (col_index, terminal_cell) in row.iter().take(usize::from(area.width)).enumerate() {
+            let x = area.x + u16::try_from(col_index).expect("terminal column fits u16");
+            let y = area.y + u16::try_from(row_index).expect("terminal row fits u16");
+            let Some(cell) = buffer.cell_mut((x, y)) else {
+                continue;
+            };
+            let rendered_width = cell_symbol_width(terminal_cell.display_symbol());
+            if !terminal_cell.continuation
+                && rendered_width > 1
+                && col_index + rendered_width > usize::from(area.width)
+            {
+                cell.set_symbol(" ");
+                cell.set_style(terminal_cell_style(terminal_cell));
+                continue;
+            }
+            cell.set_symbol(if terminal_cell.continuation {
+                ""
+            } else {
+                terminal_cell.display_symbol()
+            });
+            cell.set_style(terminal_cell_style(terminal_cell));
         }
     }
-    frame.render_widget(Paragraph::new(lines), area);
 }
 
 fn render_split(frame: &mut ratatui::Frame<'_>, area: Rect, app: &AppModel) {
@@ -693,16 +725,27 @@ fn render_status(frame: &mut ratatui::Frame<'_>, area: Rect, app: &AppModel) {
     } else {
         "ready"
     };
-    let scroll = app.active_view_label();
-    let status = format!(
-        " mode={:?} monitor={:?} host={} input={} view={} status={} ",
-        app.mode,
-        app.monitor_profile,
-        app.host_connection.label(),
-        prefix,
-        scroll,
-        app.status_message
-    );
+    let status = if app.mode == UiMode::AgentCockpit {
+        let controls = " ^]a=raw ^]d=detach/raw-return";
+        let fixed = format!(" {prefix} status=");
+        let available = usize::from(area.width).saturating_sub(
+            terminal_text_width(&fixed).saturating_add(terminal_text_width(controls)),
+        );
+        format!(
+            "{fixed}{}{controls}",
+            truncate_text(&app.status_message, available)
+        )
+    } else {
+        format!(
+            " mode={:?} monitor={:?} host={} input={} view={} status={} ",
+            app.mode,
+            app.monitor_profile,
+            app.host_connection.label(),
+            prefix,
+            app.active_view_label(),
+            app.status_message
+        )
+    };
     frame.render_widget(
         Paragraph::new(status).style(Style::default().bg(Color::Blue).fg(Color::White)),
         area,
@@ -788,7 +831,7 @@ fn attention_label(value: &millrace_sessions_core::state::AttentionState) -> &'s
     }
 }
 
-fn cell_span(cell: &TerminalCell) -> Span<'_> {
+fn terminal_cell_style(cell: &TerminalCell) -> Style {
     let mut style = Style::default()
         .fg(to_ratatui_color(cell.fg))
         .bg(to_ratatui_color(cell.bg));
@@ -807,7 +850,7 @@ fn cell_span(cell: &TerminalCell) -> Span<'_> {
     if cell.style.inverse {
         style = style.add_modifier(Modifier::REVERSED);
     }
-    Span::styled(cell.display_symbol().to_string(), style)
+    style
 }
 
 fn to_ratatui_color(color: TerminalColor) -> Color {
@@ -850,13 +893,7 @@ fn compact_text(value: &str, width: usize) -> String {
 }
 
 fn truncate_text(value: &str, width: usize) -> String {
-    let value = value.replace('\n', " ");
-    if value.chars().count() <= width {
-        return value;
-    }
-    let keep = width.saturating_sub(1);
-    let head = value.chars().take(keep).collect::<String>();
-    format!("{head}~")
+    truncate_terminal_text(value, width)
 }
 
 fn centered(area: Rect, width: u16, height: u16) -> Rect {

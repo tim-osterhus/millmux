@@ -5,9 +5,9 @@ use millrace_sessions_core::{
     ids::{PaneId, SessionId, UiId},
     protocol::SessionSummary,
     state::{
-        AttentionState, LivenessState, MonitorProfile, ProcessState, SessionRole, StatusSummary,
-        StatusSummarySource, UiContext, UiDaemonHealth, UiDaemonRecoveryAction, UiMode,
-        UiPaneContext, UiPaneView, UiPaneViewKind, UiPaneViewMode,
+        AttentionState, LivenessState, MonitorProfile, ProcessState, SessionRole, SpawnMode,
+        StatusSummary, StatusSummarySource, UiContext, UiDaemonHealth, UiDaemonRecoveryAction,
+        UiMode, UiPaneContext, UiPaneView, UiPaneViewKind, UiPaneViewMode,
     },
     workspace::{GitWorktreeIdentity, WorkspaceIdentity},
 };
@@ -19,9 +19,9 @@ use crate::{
     pane::{
         AgentCockpitLayout, AgentTerminalPane, CommandOutput, CommandPalette, ConfirmationPrompt,
         DaemonConsoleLayout, DaemonSwitcherOverlay, HelpOverlay, LineLogPane, Pane, PaneKind,
-        WorkspaceSessionRow, COCKPIT_SESSION_LIST_HEIGHT,
+        SearchMatch, WorkspaceSessionRow, COCKPIT_SESSION_LIST_HEIGHT,
     },
-    terminal::TerminalSnapshot,
+    terminal::{TerminalSearchMatch, TerminalSnapshot},
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -430,6 +430,58 @@ impl AppModel {
         self.focused_attach_session_id() == Some(attached_session_id)
     }
 
+    pub fn managed_raw_attach_target(
+        &self,
+        attached_session_id: SessionId,
+    ) -> Result<SessionId, &'static str> {
+        if self.command_palette.open
+            || self.daemon_switcher.open
+            || self.confirmation.is_some()
+            || self.help_overlay.open
+        {
+            return Err("overlay_active");
+        }
+        if self.scroll_mode || self.search_mode {
+            return Err("terminal_not_live");
+        }
+        let pane = self.active_pane().ok_or("no_focused_pane")?;
+        if pane.stale {
+            return Err("stale_pane");
+        }
+        if pane.view.kind != UiPaneViewKind::SessionTerminal {
+            return Err("focused_pane_not_terminal");
+        }
+        let session_id = pane.view.session_id.ok_or("terminal_unassigned")?;
+        if session_id != attached_session_id || self.agent_session_id != Some(session_id) {
+            return Err("pane_session_mismatch");
+        }
+        let session = self
+            .workspace_sessions
+            .iter()
+            .find(|session| session.session_id == session_id)
+            .ok_or("session_missing")?;
+        if session.spawn_mode != SpawnMode::Pty {
+            return Err("session_not_pty");
+        }
+        if session.process_state != ProcessState::Running {
+            return Err("session_not_running");
+        }
+        if !session.capabilities.attach {
+            return Err("session_not_attachable");
+        }
+        let terminal = self
+            .agent_terminal
+            .as_ref()
+            .ok_or("terminal_not_attached")?;
+        if terminal.initializing {
+            return Err("terminal_initializing");
+        }
+        if terminal.read_only || !terminal.input_owner {
+            return Err("input_not_owned");
+        }
+        Ok(session_id)
+    }
+
     pub fn focus_pane_kind(&mut self, kind: PaneKind) -> bool {
         let Some(index) = self
             .panes
@@ -538,23 +590,30 @@ impl AppModel {
         self.copy_buffer.as_deref()
     }
 
-    pub fn refresh_agent_search_from_snapshot(&mut self, label: &str) {
-        if self.search_query.is_empty() {
-            self.status_message = "search:".to_string();
-            return;
+    pub fn set_agent_search_match(&mut self, label: &str, found: &TerminalSearchMatch) {
+        if let Some(terminal) = &mut self.agent_terminal {
+            terminal.set_search_match(SearchMatch {
+                index: found.physical_row,
+                occurrence: found.occurrence,
+                start_cell: found.start_cell,
+                end_cell: found.end_cell,
+                query: found.query.clone(),
+                line: found.line.clone(),
+                matched_text: found.matched_text.clone(),
+            });
         }
-        let query = self.search_query.clone();
-        let found = self
-            .agent_terminal
-            .as_mut()
-            .and_then(|terminal| terminal.search(query.clone()));
-        self.status_message = match found {
-            Some(found) => format!("{label}: {} line {}", query, found.index + 1),
-            None => format!("{label}: {} not found", query),
-        };
+        self.status_message = format!(
+            "{label}: {} row {} match {}",
+            found.query,
+            found.physical_row + 1,
+            found.occurrence + 1
+        );
     }
 
     pub fn set_agent_search_not_found(&mut self, label: &str) {
+        if let Some(terminal) = &mut self.agent_terminal {
+            terminal.clear_search();
+        }
         if self.search_query.is_empty() {
             self.status_message = "search:".to_string();
         } else {
@@ -591,16 +650,19 @@ impl AppModel {
 
     fn search_active_view(&mut self) {
         if self.search_query.is_empty() {
-            self.status_message = "search:".to_string();
+            self.set_agent_search_not_found("search");
             return;
         }
 
         let query = self.search_query.clone();
         let found = match self.active_view_kind() {
-            Some(UiPaneViewKind::SessionTerminal) if self.active_terminal_is_attached() => self
-                .agent_terminal
-                .as_mut()
-                .and_then(|terminal| terminal.search(query.clone())),
+            Some(UiPaneViewKind::SessionTerminal) if self.active_terminal_is_attached() => {
+                if let Some(terminal) = &mut self.agent_terminal {
+                    terminal.clear_search();
+                }
+                self.status_message = format!("search: {query} indexing history");
+                return;
+            }
             Some(UiPaneViewKind::SessionTerminal) => {
                 self.status_message = "search: terminal not attached".to_string();
                 return;
@@ -625,10 +687,7 @@ impl AppModel {
 
     fn next_search_match(&mut self) {
         let found = match self.active_view_kind() {
-            Some(UiPaneViewKind::SessionTerminal) if self.active_terminal_is_attached() => self
-                .agent_terminal
-                .as_mut()
-                .and_then(AgentTerminalPane::next_match),
+            Some(UiPaneViewKind::SessionTerminal) if self.active_terminal_is_attached() => None,
             Some(UiPaneViewKind::SessionTerminal) => None,
             Some(UiPaneViewKind::DaemonMonitor) => {
                 let result = self.line_log.next_match();
@@ -647,10 +706,7 @@ impl AppModel {
 
     fn previous_search_match(&mut self) {
         let found = match self.active_view_kind() {
-            Some(UiPaneViewKind::SessionTerminal) if self.active_terminal_is_attached() => self
-                .agent_terminal
-                .as_mut()
-                .and_then(AgentTerminalPane::previous_match),
+            Some(UiPaneViewKind::SessionTerminal) if self.active_terminal_is_attached() => None,
             Some(UiPaneViewKind::SessionTerminal) => None,
             Some(UiPaneViewKind::DaemonMonitor) => {
                 let result = self.line_log.previous_match();
@@ -679,7 +735,7 @@ impl AppModel {
         };
         match found {
             Some(found) => {
-                self.copy_buffer = Some(found.line);
+                self.copy_buffer = Some(found.matched_text);
                 self.search_mode = false;
                 self.status_message = "copied search match".to_string();
             }
@@ -1532,6 +1588,7 @@ impl AppModel {
                 }
             }
             KeyAction::Detach
+            | KeyAction::ManagedRawAttach
             | KeyAction::CloseRequested
             | KeyAction::Prefix
             | KeyAction::Input(_)
@@ -2887,10 +2944,15 @@ mod tests {
                 KeyAction::SearchInput(value)
             );
         }
+        let found = terminal
+            .search_scrollback("can you", crate::terminal::TerminalSearchDirection::First)
+            .expect("physical history match");
+        app.update_agent_terminal_view(terminal.snapshot(), terminal.is_following());
+        app.set_agent_search_match("search", &found);
 
         assert_eq!(app.active_view_label(), "search");
         assert!(
-            app.status_message.contains("line"),
+            app.status_message.contains("match"),
             "{}",
             app.status_message
         );
@@ -2898,11 +2960,193 @@ mod tests {
             app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), 4),
             KeyAction::CopySearchMatch
         );
-        assert_eq!(
-            app.copy_buffer_text().map(str::trim_end),
-            Some(">Hey can you see")
-        );
+        assert_eq!(app.copy_buffer_text(), Some("can you"));
         assert!(!app.search_mode);
+    }
+
+    #[test]
+    fn managed_raw_attach_validation_fails_before_suspension_for_every_unsafe_target() {
+        let daemon = summary("daemon");
+        let mut agent = summary("agent");
+        agent.role = SessionRole::Agent;
+        let session_id = agent.session_id;
+        let terminal = crate::terminal::TerminalEmulator::new(4, 40, 20);
+        let app = AppModel::agent_cockpit(
+            UiId::new(),
+            agent,
+            vec![daemon],
+            None,
+            BTreeMap::new(),
+            AgentTerminalPane::with_snapshot(terminal.snapshot(), true, false),
+            AgentCockpitLayout::Right,
+            MonitorProfile::Basic,
+        );
+
+        assert_eq!(app.managed_raw_attach_target(session_id), Ok(session_id));
+
+        let mut unsafe_app = app.clone();
+        unsafe_app.help_overlay.open = true;
+        assert_eq!(
+            unsafe_app.managed_raw_attach_target(session_id),
+            Err("overlay_active")
+        );
+
+        let mut unsafe_app = app.clone();
+        unsafe_app.command_palette.open = true;
+        assert_eq!(
+            unsafe_app.managed_raw_attach_target(session_id),
+            Err("overlay_active")
+        );
+
+        let mut unsafe_app = app.clone();
+        unsafe_app.daemon_switcher.open = true;
+        assert_eq!(
+            unsafe_app.managed_raw_attach_target(session_id),
+            Err("overlay_active")
+        );
+
+        let mut unsafe_app = app.clone();
+        unsafe_app.confirmation = Some(ConfirmationPrompt::new("stop", "agent", "confirm"));
+        assert_eq!(
+            unsafe_app.managed_raw_attach_target(session_id),
+            Err("overlay_active")
+        );
+
+        let mut unsafe_app = app.clone();
+        unsafe_app.scroll_mode = true;
+        assert_eq!(
+            unsafe_app.managed_raw_attach_target(session_id),
+            Err("terminal_not_live")
+        );
+
+        let mut unsafe_app = app.clone();
+        unsafe_app.search_mode = true;
+        assert_eq!(
+            unsafe_app.managed_raw_attach_target(session_id),
+            Err("terminal_not_live")
+        );
+
+        let mut unsafe_app = app.clone();
+        unsafe_app.active_pane_id = None;
+        assert_eq!(
+            unsafe_app.managed_raw_attach_target(session_id),
+            Err("no_focused_pane")
+        );
+
+        let mut unsafe_app = app.clone();
+        unsafe_app.agent_terminal.as_mut().unwrap().set_read_only();
+        assert_eq!(
+            unsafe_app.managed_raw_attach_target(session_id),
+            Err("input_not_owned")
+        );
+
+        let mut unsafe_app = app.clone();
+        unsafe_app.active_pane_id = unsafe_app
+            .panes
+            .iter()
+            .find(|pane| pane.kind == PaneKind::DaemonMonitor)
+            .map(|pane| pane.id);
+        assert_eq!(
+            unsafe_app.managed_raw_attach_target(session_id),
+            Err("focused_pane_not_terminal")
+        );
+
+        let mut unsafe_app = app.clone();
+        unsafe_app
+            .panes
+            .iter_mut()
+            .find(|pane| pane.kind == PaneKind::AgentTerminal)
+            .unwrap()
+            .view
+            .session_id = None;
+        assert_eq!(
+            unsafe_app.managed_raw_attach_target(session_id),
+            Err("terminal_unassigned")
+        );
+
+        let mut unsafe_app = app.clone();
+        unsafe_app
+            .panes
+            .iter_mut()
+            .find(|pane| pane.kind == PaneKind::AgentTerminal)
+            .unwrap()
+            .stale = true;
+        assert_eq!(
+            unsafe_app.managed_raw_attach_target(session_id),
+            Err("stale_pane")
+        );
+
+        let mut unsafe_app = app.clone();
+        unsafe_app
+            .workspace_sessions
+            .iter_mut()
+            .find(|session| session.session_id == session_id)
+            .unwrap()
+            .spawn_mode = SpawnMode::Pipe;
+        assert_eq!(
+            unsafe_app.managed_raw_attach_target(session_id),
+            Err("session_not_pty")
+        );
+
+        let mut unsafe_app = app.clone();
+        unsafe_app
+            .workspace_sessions
+            .iter_mut()
+            .find(|session| session.session_id == session_id)
+            .unwrap()
+            .process_state = ProcessState::Exited;
+        assert_eq!(
+            unsafe_app.managed_raw_attach_target(session_id),
+            Err("session_not_running")
+        );
+
+        let mut unsafe_app = app.clone();
+        unsafe_app
+            .workspace_sessions
+            .iter_mut()
+            .find(|session| session.session_id == session_id)
+            .unwrap()
+            .capabilities
+            .attach = false;
+        assert_eq!(
+            unsafe_app.managed_raw_attach_target(session_id),
+            Err("session_not_attachable")
+        );
+
+        let mut unsafe_app = app.clone();
+        unsafe_app
+            .workspace_sessions
+            .retain(|session| session.session_id != session_id);
+        assert_eq!(
+            unsafe_app.managed_raw_attach_target(session_id),
+            Err("session_missing")
+        );
+
+        let mut unsafe_app = app.clone();
+        unsafe_app.agent_terminal = None;
+        assert_eq!(
+            unsafe_app.managed_raw_attach_target(session_id),
+            Err("terminal_not_attached")
+        );
+
+        let mut unsafe_app = app.clone();
+        unsafe_app.agent_terminal.as_mut().unwrap().initializing = true;
+        assert_eq!(
+            unsafe_app.managed_raw_attach_target(session_id),
+            Err("terminal_initializing")
+        );
+
+        let mut unsafe_app = app.clone();
+        unsafe_app.agent_terminal.as_mut().unwrap().input_owner = false;
+        assert_eq!(
+            unsafe_app.managed_raw_attach_target(session_id),
+            Err("input_not_owned")
+        );
+
+        assert_eq!(
+            app.managed_raw_attach_target(SessionId::new()),
+            Err("pane_session_mismatch")
+        );
     }
 
     #[test]

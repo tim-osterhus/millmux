@@ -251,6 +251,7 @@ pub struct AgentTerminalPane {
     pub read_only: bool,
     pub follow: bool,
     pub active_search: Option<ActiveSearch>,
+    selected_search_match: Option<SearchMatch>,
     pub initializing: bool,
     pub rows: u16,
     pub cols: u16,
@@ -264,6 +265,7 @@ impl AgentTerminalPane {
             read_only,
             follow: true,
             active_search: None,
+            selected_search_match: None,
             initializing: true,
             rows: rows.max(1),
             cols: cols.max(1),
@@ -279,6 +281,7 @@ impl AgentTerminalPane {
             read_only,
             follow: true,
             active_search: None,
+            selected_search_match: None,
             initializing: false,
         }
     }
@@ -292,6 +295,8 @@ impl AgentTerminalPane {
         self.cols = snapshot.cols;
         self.snapshot = snapshot;
         self.follow = follow;
+        self.active_search = None;
+        self.selected_search_match = None;
         self.initializing = false;
     }
 
@@ -321,19 +326,23 @@ impl AgentTerminalPane {
         let query = query.into();
         if query.is_empty() {
             self.active_search = None;
+            self.selected_search_match = None;
             return None;
         }
 
         let lines = self.snapshot.plain_lines();
         let Some(found) = lines.iter().position(|line| line.contains(query.as_str())) else {
             self.active_search = None;
+            self.selected_search_match = None;
             return None;
         };
         self.active_search = Some(ActiveSearch {
             query: query.clone(),
             current_index: found,
         });
-        Some(self.search_match(found, query))
+        let found = self.search_match(found, query);
+        self.selected_search_match = Some(found.clone());
+        Some(found)
     }
 
     pub fn next_match(&mut self) -> Option<SearchMatch> {
@@ -347,7 +356,9 @@ impl AgentTerminalPane {
                     query: search.query.clone(),
                     current_index: index,
                 });
-                return Some(self.search_match(index, search.query));
+                let found = self.search_match(index, search.query);
+                self.selected_search_match = Some(found.clone());
+                return Some(found);
             }
         }
         None
@@ -364,20 +375,39 @@ impl AgentTerminalPane {
                     query: search.query.clone(),
                     current_index: index,
                 });
-                return Some(self.search_match(index, search.query));
+                let found = self.search_match(index, search.query);
+                self.selected_search_match = Some(found.clone());
+                return Some(found);
             }
         }
         None
     }
 
     pub fn current_match(&self) -> Option<SearchMatch> {
+        if let Some(found) = &self.selected_search_match {
+            return Some(found.clone());
+        }
         let search = self.active_search.clone()?;
         Some(self.search_match(search.current_index, search.query))
+    }
+
+    pub fn set_search_match(&mut self, found: SearchMatch) {
+        self.active_search = None;
+        self.selected_search_match = Some(found);
+    }
+
+    pub fn clear_search(&mut self) {
+        self.active_search = None;
+        self.selected_search_match = None;
     }
 
     fn search_match(&self, index: usize, query: String) -> SearchMatch {
         SearchMatch {
             index,
+            occurrence: 0,
+            start_cell: 0,
+            end_cell: 0,
+            matched_text: query.clone(),
             query,
             line: self.snapshot.line_text(index).unwrap_or_default(),
         }
@@ -594,6 +624,10 @@ impl LineLogPane {
     fn search_match(&self, index: usize, query: String) -> SearchMatch {
         SearchMatch {
             index,
+            occurrence: 0,
+            start_cell: 0,
+            end_cell: 0,
+            matched_text: query.clone(),
             query,
             line: self.lines.get(index).cloned().unwrap_or_default(),
         }
@@ -615,8 +649,12 @@ pub struct ActiveSearch {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SearchMatch {
     pub index: usize,
+    pub occurrence: usize,
+    pub start_cell: usize,
+    pub end_cell: usize,
     pub query: String,
     pub line: String,
+    pub matched_text: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -666,7 +704,8 @@ impl Default for HelpOverlay {
                 ("n / N", "next / previous match"),
                 ("Enter", "copy match"),
                 ("Esc", "close search / scroll"),
-                ("Ctrl-] d", "detach"),
+                ("Ctrl-] a", "managed raw attach"),
+                ("Ctrl-] d", "detach cockpit / return from raw"),
                 ("Ctrl-] p", "command palette"),
                 ("Ctrl-] l", "session switcher"),
                 ("Ctrl-] ?", "help"),
@@ -859,6 +898,15 @@ mod tests {
             .entries
             .iter()
             .any(|(key, action)| *key == "Enter" && action.contains("copy")));
+        assert!(help
+            .entries
+            .iter()
+            .any(|(key, action)| { *key == "Ctrl-] a" && action.contains("managed raw attach") }));
+        assert!(help.entries.iter().any(|(key, action)| {
+            *key == "Ctrl-] d"
+                && action.contains("detach cockpit")
+                && action.contains("return from raw")
+        }));
     }
 
     #[test]

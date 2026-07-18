@@ -748,6 +748,7 @@ fn screen_snapshot_attach_frame_uses_flattened_v1_schema() {
             "cells": [[
                 {
                     "symbol": "界",
+                    "occupied": true,
                     "width": 2,
                     "fg": {"type": "indexed", "index": 2},
                     "bg": {"type": "rgb", "r": 10, "g": 20, "b": 30},
@@ -773,6 +774,13 @@ fn screen_snapshot_attach_frame_uses_flattened_v1_schema() {
             "captured_at": "2026-07-08T00:00:00Z"
         })
     );
+}
+
+#[test]
+fn screen_cell_legacy_occupancy_defaults_to_unoccupied() {
+    let cell: ScreenCell = serde_json::from_value(json!({"symbol": " "})).unwrap();
+
+    assert!(!cell.occupied);
 }
 
 #[test]
@@ -836,6 +844,34 @@ fn screen_snapshot_validation_enforces_cell_and_payload_bounds() {
             .unwrap()
             > 4 * 1024 * 1024
     );
+}
+
+#[test]
+fn screen_snapshot_cursor_allows_wrap_pending_but_rejects_out_of_bounds_columns() {
+    let mut snapshot = ScreenSnapshot {
+        schema_version: SCREEN_SNAPSHOT_SCHEMA_VERSION,
+        rows: 1,
+        cols: 3,
+        cursor: ScreenCursor {
+            row: 0,
+            col: 3,
+            visible: Some(true),
+        },
+        alternate_screen: false,
+        cells: vec![vec![ScreenCell::blank(); 3]],
+        source: ScreenSnapshotSource {
+            pty_log_offset: 0,
+            raw_replay_start_offset: 0,
+            raw_replay_end_offset: 0,
+        },
+        captured_at: "2026-07-16T00:00:00Z".to_string(),
+    };
+
+    snapshot
+        .validate_for_wire()
+        .expect("cursor at cols is a valid wrap-pending position");
+    snapshot.cursor.col = 4;
+    assert!(snapshot.validate_for_wire().is_err());
 }
 
 #[test]

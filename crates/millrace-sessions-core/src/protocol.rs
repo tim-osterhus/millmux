@@ -971,6 +971,17 @@ pub struct ScreenSnapshot {
 
 impl ScreenSnapshot {
     pub fn validate_for_wire(&self) -> Result<(), ScreenSnapshotValidationError> {
+        if self.rows == 0 || self.cols == 0 {
+            return Err(ScreenSnapshotValidationError::InvalidShape(
+                "screen_snapshot rows and cols must be greater than zero".to_string(),
+            ));
+        }
+        if self.cursor.row >= self.rows || self.cursor.col > self.cols {
+            return Err(ScreenSnapshotValidationError::InvalidShape(format!(
+                "screen_snapshot cursor ({}, {}) exceeds rows={} cols={} bounds",
+                self.cursor.row, self.cursor.col, self.rows, self.cols
+            )));
+        }
         let cell_count = usize::from(self.rows).saturating_mul(usize::from(self.cols));
         if cell_count > MAX_SCREEN_SNAPSHOT_CELLS {
             return Err(ScreenSnapshotValidationError::TooManyCells {
@@ -1048,6 +1059,8 @@ pub struct ScreenSnapshotSource {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ScreenCell {
     pub symbol: String,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub occupied: bool,
     #[serde(default = "default_screen_cell_width", skip_serializing_if = "is_one")]
     pub width: u8,
     #[serde(default, skip_serializing_if = "ScreenColor::is_default")]
@@ -1064,6 +1077,7 @@ impl ScreenCell {
     pub fn blank() -> Self {
         Self {
             symbol: " ".to_string(),
+            occupied: false,
             width: 1,
             fg: ScreenColor::Default,
             bg: ScreenColor::Default,
@@ -1075,6 +1089,7 @@ impl ScreenCell {
     pub fn default_symbol(symbol: impl Into<String>) -> Self {
         Self {
             symbol: symbol.into(),
+            occupied: true,
             ..Self::blank()
         }
     }

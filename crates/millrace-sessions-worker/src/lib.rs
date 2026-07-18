@@ -8,6 +8,7 @@ use std::{
         Arc, Mutex,
     },
     thread,
+    time::Duration,
 };
 
 use control::{start_control_server, WorkerControlConfig};
@@ -130,6 +131,10 @@ fn run_pty_worker(
                 control.broadcast_output(&buffer[..count], logged.start_offset, logged.end_offset);
             }
             Err(error) if error.kind() == ErrorKind::Interrupted => continue,
+            Err(error) if error.kind() == ErrorKind::WouldBlock => {
+                thread::sleep(Duration::from_millis(1));
+                continue;
+            }
             Err(error) if error.kind() == ErrorKind::UnexpectedEof => break,
             Err(error) if error.raw_os_error() == Some(5) => break,
             Err(error) => return Err(MillmuxError::Io(error)),

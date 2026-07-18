@@ -141,14 +141,21 @@ impl OutputLogger {
     }
 
     pub fn flush(&mut self) -> MillmuxResult<()> {
+        {
+            let mut terminal_state =
+                self.config.terminal_state.lock().map_err(|_| {
+                    MillmuxError::Internal("terminal state lock poisoned".to_string())
+                })?;
+            terminal_state.finish_input();
+        }
         if !self.pending_line.is_empty() {
             let line = std::mem::take(&mut self.pending_line);
             self.record_structured_line(&line)?;
         } else if !self.config.scrollback_snapshot.exists() {
             self.scrollback
                 .persist_snapshot(&self.config.scrollback_snapshot)?;
-            self.persist_terminal_state()?;
         }
+        self.persist_terminal_state()?;
         Ok(())
     }
 
